@@ -149,11 +149,6 @@ def plot_pdp(magnitude_response: np.ndarray,
         tcenter = np.argmax(magnitude_response[0:2 * lfm_config.sweep_length])
     t0 = int(tcenter - window_width * lfm_config.sample_rate / 2)
 
-    # # Quick debug check
-    # peaks, _ = find_peaks(magnitude_response, distance=lfm_config.sweep_length*0.9, height=np.mean(magnitude_response)+10)
-    # diffs = np.diff(peaks)
-    # print(f"Average peak spacing: {np.mean(diffs)}, Expected: {lfm_config.sweep_length}")
-
     # Handle wrap-around if t0 is negative
     if t0 < 0:
         t0 += lfm_config.sweep_length
@@ -208,7 +203,9 @@ def plot_dechirp(stretch_result: np.ndarray,
                  save_path: str = None
 ):
     T = 1 / lfm_config.sweep_frequency
-    k = np.abs(lfm_config.bandwidth / T)
+    k = lfm_config.bandwidth / T
+    if k == 0:
+        raise ValueError("Cannot convert dechirp beat frequency to delay when bandwidth is zero")
     chirp_len = stretch_result.shape[1]
     slow_time_len = stretch_result.shape[0]
     
@@ -218,13 +215,14 @@ def plot_dechirp(stretch_result: np.ndarray,
     f_mask = np.abs(freqs) <= (np.abs(lfm_config.bandwidth / 2))
     freqs = freqs[f_mask]
 
-    time_delays = freqs / k * 1e3  # milliseconds
+    time_delays = -freqs / k * 1e3  # milliseconds
 
     power_db = 10 * np.log10(stretch_result + 1e-12)
     power_db = power_db[:, f_mask]
 
-    if lfm_config.bandwidth > 0:
-        power_db = np.fliplr(power_db)
+    delay_order = np.argsort(time_delays)
+    time_delays = time_delays[delay_order]
+    power_db = power_db[:, delay_order]
 
     plt.figure(figsize=(10, 6))
     plt.pcolormesh(slow_time, time_delays, power_db.T, shading='nearest', cmap='inferno', vmin=vmin, vmax=vmax)
@@ -255,7 +253,8 @@ def plot_delay_doppler_mf(
     fd_max: float = None,
     fd_min: float = None,
     d_max: float = None,
-    d_min: float = None
+    d_min: float = None,
+    interactive: bool = False,
 ):
     """
     MF-based DD:
@@ -308,8 +307,11 @@ def plot_delay_doppler_mf(
 
     # Slow-time window
     w = window_from_arg(slow_len, window_slow)
+    coherent_gain = np.mean(w)
+    if coherent_gain == 0:
+        raise ValueError(f"Slow-time window '{window_slow}' has zero coherent gain")
 
-    x = sweeps * w[:, None]
+    x = sweeps * (w[:, None] / coherent_gain)
 
     PRF = lfm_config.sweep_frequency
     if nfft_doppler is None:
@@ -368,6 +370,8 @@ def plot_delay_doppler_mf(
             os.makedirs(output_dir)
             
         plt.savefig(full_path, dpi=300)
+        if interactive:
+            plt.show()
         plt.close()
     else:
         plt.show()
@@ -386,12 +390,15 @@ def plot_delay_doppler_dechirp(
     fd_min: float = None,
     d_max: float = None,
     d_min: float = None,
+    interactive: bool = False,
 ):
-    B = np.abs(lfm_config.bandwidth)
+    B = lfm_config.bandwidth
     fs = lfm_config.sample_rate
     PRF = lfm_config.sweep_frequency
     T = 1.0 / PRF
     k = B / T
+    if k == 0:
+        raise ValueError("Cannot convert dechirp beat frequency to delay when bandwidth is zero")
 
     if dechirp_spectra.ndim != 2:
         raise ValueError("dechirp_spectra must be 2D: (num_chirps, n_bins)")
@@ -400,7 +407,10 @@ def plot_delay_doppler_dechirp(
 
     # Slow-time window
     w = window_from_arg(slow_len, window_slow)
-    x = dechirp_spectra * w[:, None]
+    coherent_gain = np.mean(w)
+    if coherent_gain == 0:
+        raise ValueError(f"Slow-time window '{window_slow}' has zero coherent gain")
+    x = dechirp_spectra * (w[:, None] / coherent_gain)
 
     # Doppler FFT across slow-time
     if nfft_doppler is None:
@@ -415,12 +425,14 @@ def plot_delay_doppler_dechirp(
     fd = np.fft.fftshift(np.fft.fftfreq(nfft_doppler, d=1.0 / PRF))
 
     power_db = 10.0 * np.log10(np.abs(DD) ** 2 + 1e-12)
-    if lfm_config.bandwidth > 0:
-        power_db = np.fliplr(power_db)
 
     # Convert beat frequency to delay
-    delay_s = fb / k
+    delay_s = -fb / k
     delay_ms = delay_s * 1e3
+
+    delay_order = np.argsort(delay_ms)
+    delay_ms = delay_ms[delay_order]
+    power_db = power_db[:, delay_order]
 
     # Apply delay mask
     d_mask = np.ones_like(delay_ms, dtype=bool)
@@ -463,43 +475,55 @@ def plot_delay_doppler_dechirp(
             os.makedirs(output_dir)
             
         plt.savefig(full_path, dpi=300)
+        if interactive:
+            plt.show()
         plt.close()
     else:
         plt.show()
 
 
 def delay_doppler_process_window(iq_chunk, frame_idx, args, lfm_config, timestamps):
+
+    if args.output is not None and frame_idx is not None:
+        output_file = f"{args.output}/frame_{frame_idx:04d}.png"
+    elif args.output is not None:
+        output_file = args.output
+    else:
+        output_file = None
+
     if args.method == "mf":
         _, _, complex_response = lfm_matched_filtering(iq_chunk, lfm_config)
 
         plot_delay_doppler_mf(
             complex_response=complex_response,
             lfm_config=lfm_config,
-            window_width=args.window_width,
-            title=f"{args.title} | {timestamps}",
-            output_file=f"{args.output}/frame_{frame_idx:04d}.png",
+            window_width=getattr(args, "window_width", getattr(args, "window", None)),
+            title=f"{args.title} | {timestamps}" if timestamps else args.title,
+            output_file=output_file,
             vmin=args.vmin,
             vmax=args.vmax,
+            tcenter=args.window_center,
             window_slow=args.slow_window,
             nfft_doppler=args.nfft_doppler,
             fd_max=args.fd_max,
             fd_min=args.fd_min,
             d_max=args.d_max,
             d_min=args.d_min,
+            interactive=args.interactive,
         )
 
     else:
         _, complex_spectra = dechirp_fft_complex(
             received_signal=iq_chunk,
             lfm_config=lfm_config,
-            window=None if args.dechirp_window == "none" else args.dechirp_window,
+            window=args.dechirp_window,
         )
 
         plot_delay_doppler_dechirp(
             dechirp_spectra=complex_spectra,
             lfm_config=lfm_config,
-            title=f"{args.title} | {timestamps}",
-            output_file=f"{args.output}/frame_{frame_idx:04d}.png",
+            title=f"{args.title} | {timestamps}" if timestamps else args.title,
+            output_file=output_file,
             vmin=args.vmin,
             vmax=args.vmax,
             window_slow=args.slow_window,
@@ -508,6 +532,7 @@ def delay_doppler_process_window(iq_chunk, frame_idx, args, lfm_config, timestam
             fd_min=args.fd_min,
             d_max=args.d_max,
             d_min=args.d_min,
+            interactive=args.interactive,
         )
 
 

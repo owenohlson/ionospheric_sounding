@@ -52,14 +52,19 @@ def main():
                         help="Max delay to display (ms)")
     parser.add_argument("--d-min", type=float, default=None,
                         help="Min delay to display (ms)")
+    parser.add_argument("--interactive", type=bool, default=False, 
+                        help="Whether to display each frame interactively")
 
     # MF-only
     parser.add_argument("--window-width", type=float, default=None, help="MF: fast-time window width (s)")
     parser.add_argument("--window-center", type=float, default=None, help="MF: center time (s) for window")
 
     # Dechirp-only
-    parser.add_argument("--dechirp-window", type=str, default="hamming",
+    parser.add_argument("--dechirp-window", type=str, default="hann",
                         choices=["hamming", "hann", "none"])
+    
+    # FFmpeg parameters
+    parser.add_argument("--framerate", type=int, default=2, help="Frame rate for the output video (frames per second)")
 
     args = parser.parse_args()
 
@@ -141,7 +146,7 @@ def main():
         ffmpeg_cmd = [
             "ffmpeg",
             "-y",  # overwrite output file if it exists
-            "-r", "2",  # frame rate (adjust as needed)
+            "-r", str(args.framerate),  # frame rate (adjust as needed)
             "-start_number", "0",
             "-i", f"{full_output_path}/frame_%04d.png",
             "-c:v", "libx264",

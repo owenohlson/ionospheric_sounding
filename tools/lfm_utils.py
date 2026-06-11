@@ -71,7 +71,10 @@ def dechirp_fft_complex(received_signal: np.ndarray,
 
     reference_chirp = lfm_config.waveform.astype(received_signal.dtype)
 
-    w = window_from_arg(chirp_len, window)
+    w = window_from_arg(chirp_len, window).astype(np.float32, copy=False)
+    coherent_gain = np.mean(w)
+    if coherent_gain == 0:
+        raise ValueError(f"Window '{window}' has zero coherent gain")
 
     out = np.zeros((num_chirps, chirp_len), dtype=np.complex64)
     mag_out = np.zeros((num_chirps, chirp_len), dtype=np.float32)
@@ -80,7 +83,7 @@ def dechirp_fft_complex(received_signal: np.ndarray,
         seg = received_signal[i * chirp_len:(i + 1) * chirp_len]
         beat = seg * np.conj(reference_chirp)
         beat = beat * w
-        out[i, :] = np.fft.fftshift(np.fft.fft(beat))
+        out[i, :] = np.fft.fftshift(np.fft.fft(beat) / coherent_gain)
         mag_out[i, :] = np.abs(out[i, :])**2
 
     return mag_out, out

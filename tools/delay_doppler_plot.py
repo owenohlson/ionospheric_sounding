@@ -1,13 +1,12 @@
 # delay_doppler_plot.py
 
 import argparse
-import numpy as np
 
-from plotting_utils import plot_delay_doppler_mf, plot_delay_doppler_dechirp
-from lfm_utils import LFMWaveform, load_iq_audio, lfm_matched_filtering, dechirp_fft_complex 
+from plotting_utils import delay_doppler_process_window
+from lfm_utils import LFMWaveform, load_iq_audio
 
 import matplotlib
-matplotlib.use('TkAgg')
+matplotlib.use('TkAgg') # Use TkAgg backend for interactive plotting (can be changed to 'Agg' for non-interactive environments)
 
 
 def main():
@@ -39,22 +38,15 @@ def main():
                         help="Max delay to display (ms)")
     parser.add_argument("--d-min", type=float, default=None,
                         help="Min delay to display (ms)")
-    # parser.add_argument("--tx-velocity", type=float, default=None,
-    #                     help="Transmitter velocity (km/s)")
-    # parser.add_argument("--tx-altitude", type=float, default=None,
-    #                     help="Transmitter altitude (km)")
-    # parser.add_argument("--fc", type=float, default=29e6,
-    #                     help="Carrier frequency (Hz) for velocity compensation")
-    # parser.add_argument("--time-offset", type=float, default=0,
-    #                     help="Time offset (s) to apply to the delay model, to align with the closest approach at t=0")
-    # parser.add_argument("--motion-compensation", action="store_true")
+    parser.add_argument("--interactive", type=bool, default=False, 
+                        help="Whether to display the plot interactively")
 
     # MF-only
     parser.add_argument("--window", type=float, default=None, help="MF: fast-time window width (s)")
     parser.add_argument("--window-center", type=float, default=None, help="MF: center time (s) for window")
 
     # Dechirp-only
-    parser.add_argument("--dechirp-window", type=str, default="hamming",
+    parser.add_argument("--dechirp-window", type=str, default="hann",
                         choices=["hamming", "hann", "none"])
 
     args = parser.parse_args()
@@ -73,6 +65,8 @@ def main():
         args.tend = duration
         print(f"No --tend provided, using end time of file: {args.tend:.2f} seconds")
 
+    iq_chunk = iq[int(args.tstart * fs):int(args.tend * fs)]
+
     # Construct LFM waveform for pulse compression
     lfm_config = LFMWaveform(
         sample_rate=fs,
@@ -81,50 +75,13 @@ def main():
     )
             
     # Process and plot delay-Doppler map using the selected method
-    if args.method == "mf":
-        _, _, complex_response = lfm_matched_filtering(iq, lfm_config)
-
-        plot_delay_doppler_mf(
-            complex_response=complex_response,
-            lfm_config=lfm_config,
-            window_width=args.window,
-            title=args.title + " (MF)",
-            output_file=args.output,
-            vmin=args.vmin,
-            vmax=args.vmax,
-            tstart=args.tstart,
-            tend=args.tend,
-            tcenter=args.window_center,
-            window_slow=args.slow_window,
-            nfft_doppler=args.nfft_doppler,
-            fd_max=args.fd_max,
-            fd_min=args.fd_min,
-            d_max=args.d_max,
-            d_min=args.d_min,
-        )
-
-    else:
-        _, complex_spectra = dechirp_fft_complex(
-            received_signal=iq,
-            lfm_config=lfm_config,
-            window=None if args.dechirp_window == "none" else args.dechirp_window,
-        )
-
-        plot_delay_doppler_dechirp(
-            dechirp_spectra=complex_spectra,
-            lfm_config=lfm_config,
-            title=args.title + " (dechirp)",
-            output_file=args.output,
-            vmin=args.vmin,
-            vmax=args.vmax,
-            window_slow=args.slow_window,
-            nfft_doppler=args.nfft_doppler,
-            fd_max=args.fd_max,
-            fd_min=args.fd_min,
-            d_max=args.d_max,
-            d_min=args.d_min,
-        )
-
+    delay_doppler_process_window(
+        iq_chunk=iq_chunk,
+        frame_idx=None,
+        args=args,
+        lfm_config=lfm_config,
+        timestamps=None,
+    )
 
 if __name__ == "__main__":
     main()
