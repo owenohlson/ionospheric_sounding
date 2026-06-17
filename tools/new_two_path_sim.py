@@ -18,7 +18,7 @@ fc = 29.0e6              # Carrier frequency (Hz)
 B = 100.0e3              # bandwidth
 fsweep = 2.0             # sweep rate
 fs = 100.0e3             # sample rate (Hz)
-t_total = 900.0          # total duration of signal (s)
+t_total = 7200.0         # total duration of signal (s)
 noise_floor = 0.01       # Relative noise floor (0.01 ~ -20 dB relative to max signal)
 
 num_sweeps = int(t_total * fsweep)
@@ -50,15 +50,46 @@ path_2_tau_0 = path_1_tau + 0.005  # +5 ms extra delay
 path_2_gain = 0.5
 
 # Desired Doppler
-doppler_mag = 0.25      # Hz
-doppler_period = 240.0  # seconds
+doppler_mag = 0.90      # Hz
+doppler_period = 7000.0  # seconds
 doppler_half_period = doppler_period / 2.0
+delay_lfo = "smooth_triangle"      # "triangle", "smooth_triangle", or "sine"
+smooth_turn_time = 120.0           # seconds, only used by "smooth_triangle"
 
 # For a delayed passband signal, baseband phase is exp(-j 2*pi*fc*tau(t)),
-# so fD(t) = -(fc * d tau/dt).  This delay swing is intentionally tiny for
-# 0.25 Hz at 29 MHz: about +/-0.52 us around the mean delay.
+# so fD(t) = -(fc * d tau/dt).
 delay_rate_mag = doppler_mag / fc
-delay_amplitude = delay_rate_mag * doppler_period / 4.0
+triangle_delay_amplitude = delay_rate_mag * doppler_period / 4.0
+sine_delay_amplitude = doppler_mag * doppler_period / (2.0 * np.pi * fc)
+
+
+def build_smooth_triangle_delay_table(num_points=200_000):
+    """Build one period of a triangle-like delay with rounded Doppler reversals."""
+    lfo_t = np.linspace(0.0, doppler_period, num_points, endpoint=False)
+    raw_fd = np.where(lfo_t < doppler_half_period, doppler_mag, -doppler_mag)
+
+    kernel_len = max(3, int(round(num_points * smooth_turn_time / doppler_period)))
+    if kernel_len % 2 == 0:
+        kernel_len += 1
+    kernel = np.hanning(kernel_len)
+    kernel /= np.sum(kernel)
+
+    pad = kernel_len // 2
+    padded_fd = np.concatenate((raw_fd[-pad:], raw_fd, raw_fd[:pad]))
+    smooth_fd = np.convolve(padded_fd, kernel, mode="valid")
+    smooth_fd -= np.mean(smooth_fd)
+
+    dt = doppler_period / num_points
+    delay_offset = -np.cumsum(smooth_fd) * dt / fc
+    delay_offset -= np.mean(delay_offset)
+
+    return (
+        np.concatenate((lfo_t, [doppler_period])),
+        np.concatenate((delay_offset, [delay_offset[0]])),
+    )
+
+
+smooth_triangle_t, smooth_triangle_delay = build_smooth_triangle_delay_table()
 
 
 def triangle_delay(t):
@@ -67,13 +98,49 @@ def triangle_delay(t):
     tau = np.empty_like(phase_t, dtype=np.float64)
 
     first_half = phase_t < doppler_half_period
-    tau[first_half] = path_2_tau_0 + delay_amplitude - delay_rate_mag * phase_t[first_half]
+    tau[first_half] = path_2_tau_0 + triangle_delay_amplitude - delay_rate_mag * phase_t[first_half]
     tau[~first_half] = (
         path_2_tau_0
-        - delay_amplitude
+        - triangle_delay_amplitude
         + delay_rate_mag * (phase_t[~first_half] - doppler_half_period)
     )
     return tau
+
+
+def sine_delay(t):
+    """Sinusoidal delay with smooth Doppler and peak |fD| = doppler_mag."""
+    omega = 2.0 * np.pi / doppler_period
+    return path_2_tau_0 - sine_delay_amplitude * np.sin(omega * t)
+
+
+def smooth_triangle_delay_func(t):
+    """Triangle-like delay with rounded corners to avoid Doppler discontinuities."""
+    phase_t = np.mod(t, doppler_period)
+    return path_2_tau_0 + np.interp(
+        phase_t,
+        smooth_triangle_t,
+        smooth_triangle_delay,
+    )
+
+
+def path_2_delay(t):
+    if delay_lfo == "triangle":
+        return triangle_delay(t)
+    if delay_lfo == "smooth_triangle":
+        return smooth_triangle_delay_func(t)
+    if delay_lfo == "sine":
+        return sine_delay(t)
+    raise ValueError(f"Unknown delay_lfo='{delay_lfo}'")
+
+
+def selected_delay_amplitude():
+    if delay_lfo == "triangle":
+        return triangle_delay_amplitude
+    if delay_lfo == "smooth_triangle":
+        return np.max(np.abs(smooth_triangle_delay))
+    if delay_lfo == "sine":
+        return sine_delay_amplitude
+    raise ValueError(f"Unknown delay_lfo='{delay_lfo}'")
 
 
 def fractional_delay_lookup(x, sample_pos):
@@ -104,7 +171,7 @@ for start in range(0, len(rx_signal), chunk_size):
     out_idx = np.arange(start, end, dtype=np.float64)
     t_out = out_idx / fs
 
-    tau = triangle_delay(t_out)
+    tau = path_2_delay(t_out)
     sample_pos = (t_out - tau) * fs
     delayed = fractional_delay_lookup(tx_signal, sample_pos)
     carrier_phase = np.exp(-1j * 2.0 * np.pi * fc * tau).astype(np.complex64)
@@ -124,11 +191,11 @@ mx = np.max(np.abs(rx_signal))
 if mx > 0: rx_signal /= mx
 
 output_file = "/Users/owenohlson/Documents/Academics/UVic/ionospheric_sounding/data/new_two_path_sim.wav"
-reference_output_file = "/Users/owenohlson/Documents/Academics/UVic/ionospheric_sounding/data/new_two_path_sim_reference.wav"
+# reference_output_file = "/Users/owenohlson/Documents/Academics/UVic/ionospheric_sounding/data/new_two_path_sim_reference.wav"
 sf.write(output_file, np.column_stack((rx_signal.real, rx_signal.imag)), int(fs))
-sf.write(reference_output_file, np.column_stack((tx_signal.real, tx_signal.imag)), int(fs))
+# sf.write(reference_output_file, np.column_stack((tx_signal.real, tx_signal.imag)), int(fs))
 print(
     f"Simulated two-path channel with {num_sweeps} sweeps, "
-    f"triangle delay {path_2_tau_0 * 1e3:.3f} ms +/- {delay_amplitude * 1e6:.3f} us, "
+    f"{delay_lfo} delay {path_2_tau_0 * 1e3:.3f} ms +/- {selected_delay_amplitude() * 1e6:.3f} us, "
     f"and Doppler shift of +/-{doppler_mag} Hz over a {doppler_period}s period."
 )

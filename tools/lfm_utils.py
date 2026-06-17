@@ -28,8 +28,8 @@ class LFMWaveform:
         return int(self.sample_rate / self.sweep_frequency)
 
 
-def load_iq_audio(filename):
-    data, samplerate = sf.read(filename)
+def load_iq_audio(filename, start: int = 0, stop: int = None):
+    data, samplerate = sf.read(filename, start=start, stop=stop)
     iq = data[:, 0] + 1j * data[:, 1]
     return iq, samplerate
 

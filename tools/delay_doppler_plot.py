@@ -5,10 +5,6 @@ import argparse
 from plotting_utils import delay_doppler_process_window
 from lfm_utils import LFMWaveform, load_iq_audio
 
-import matplotlib
-matplotlib.use('TkAgg') # Use TkAgg backend for interactive plotting (can be changed to 'Agg' for non-interactive environments)
-
-
 def main():
     parser = argparse.ArgumentParser(
         description="Plot a delay-Doppler (delay in milliseconds) map using MF or dechirp.",

@@ -1,6 +1,8 @@
 # pdp_plot.py
 
 import argparse
+import soundfile as sf
+
 from plotting_utils import plot_pdp
 from lfm_utils import LFMWaveform, load_iq_audio, lfm_matched_filtering
 
@@ -33,8 +35,13 @@ def main():
 
     args = parser.parse_args()
 
-    # Load IQ data
-    iq, fs = load_iq_audio(args.input_file)
+    info = sf.info(args.input_file)
+    fs = info.samplerate
+    start_idx = int(args.tstart * fs) if args.tstart is not None else 0
+    end_idx = int(args.tend * fs) if args.tend is not None else info.frames
+
+    # Load only the requested time span; full-file matched filtering is expensive.
+    iq, fs = load_iq_audio(args.input_file, start=start_idx, stop=end_idx)
 
     # Construct LFM waveform config
     lfm_config = LFMWaveform(
@@ -54,8 +61,8 @@ def main():
         output_file=args.output,
         vmin=args.vmin,
         vmax=args.vmax,
-        tstart=args.tstart,
-        tend=args.tend,
+        tstart=None,
+        tend=None,
         navg=args.navg,
         tcenter=args.window_center,
     )

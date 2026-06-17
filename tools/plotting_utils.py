@@ -147,6 +147,8 @@ def plot_pdp(magnitude_response: np.ndarray,
 
     if tcenter is None:
         tcenter = np.argmax(magnitude_response[0:2 * lfm_config.sweep_length])
+    else:
+        tcenter = int(tcenter * lfm_config.sample_rate)
     t0 = int(tcenter - window_width * lfm_config.sample_rate / 2)
 
     # Handle wrap-around if t0 is negative
@@ -200,7 +202,11 @@ def plot_dechirp(stretch_result: np.ndarray,
                  vmin: float = None,
                  vmax: float = None,
                  title: str = "Stretch Processed Range-Time Plot",
-                 save_path: str = None
+                 save_path: str = None,
+                 navg: int = 1,
+                 d_min: float = None,
+                 d_max: float = None,
+                 tstart: float = 0.0,
 ):
     T = 1 / lfm_config.sweep_frequency
     k = lfm_config.bandwidth / T
@@ -223,6 +229,22 @@ def plot_dechirp(stretch_result: np.ndarray,
     delay_order = np.argsort(time_delays)
     time_delays = time_delays[delay_order]
     power_db = power_db[:, delay_order]
+
+    d_mask = np.ones_like(time_delays, dtype=bool)
+    if d_min is not None:
+        d_mask = d_mask & (time_delays >= d_min)
+    if d_max is not None:
+        d_mask = d_mask & (time_delays <= d_max)
+    time_delays = time_delays[d_mask]
+    power_db = power_db[:, d_mask]
+
+    if navg > 1:
+        nrows = (power_db.shape[0] // navg) * navg
+        power_db = power_db[:nrows].reshape(-1, navg, power_db.shape[1]).mean(axis=1)
+        slow_time_len = power_db.shape[0]
+        slow_time = tstart + np.arange(slow_time_len) * navg / lfm_config.sweep_frequency
+    else:
+        slow_time = tstart + np.arange(slow_time_len) / lfm_config.sweep_frequency
 
     plt.figure(figsize=(10, 6))
     plt.pcolormesh(slow_time, time_delays, power_db.T, shading='nearest', cmap='inferno', vmin=vmin, vmax=vmax)
@@ -370,7 +392,7 @@ def plot_delay_doppler_mf(
             os.makedirs(output_dir)
             
         plt.savefig(full_path, dpi=300)
-        if interactive:
+        if interactive == True:
             plt.show()
         plt.close()
     else:
@@ -415,6 +437,8 @@ def plot_delay_doppler_dechirp(
     # Doppler FFT across slow-time
     if nfft_doppler is None:
         nfft_doppler = 1 << int(np.ceil(np.log2(max(slow_len, 1))))
+
+    print(f"Using nfft_doppler={nfft_doppler} for Doppler FFT (slow_len={slow_len})")
 
     DD = np.fft.fftshift(np.fft.fft(x, n=nfft_doppler, axis=0), axes=0)
     
@@ -475,7 +499,7 @@ def plot_delay_doppler_dechirp(
             os.makedirs(output_dir)
             
         plt.savefig(full_path, dpi=300)
-        if interactive:
+        if interactive == True:
             plt.show()
         plt.close()
     else:
