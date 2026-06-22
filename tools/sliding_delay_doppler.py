@@ -33,7 +33,7 @@ def main():
     parser.add_argument("--bandwidth", type=float, default=100e3, help="Chirp bandwidth (Hz)")
 
     # Delay processing method
-    parser.add_argument("--method", type=str, default="mf", choices=["mf", "dechirp"],
+    parser.add_argument("--method", type=str, default="dechirp", choices=["mf", "dechirp"],
                         help="Delay processing method")
 
     # Plotting parameters
