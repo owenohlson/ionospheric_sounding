@@ -7,7 +7,7 @@ import os
 import psutil
 import subprocess
 
-from lfm_utils import LFMWaveform, load_iq_audio
+from lfm_utils import LFMWaveform, load_iq_audio, reference_gate_frequency_from_args
 from plotting_utils import delay_doppler_process_window
 
 
@@ -44,7 +44,7 @@ def main():
     parser.add_argument("--tstart", type=float, default=None)
     parser.add_argument("--tend", type=float, default=None)
     parser.add_argument("--slow-window", type=str, default="hann",
-                        choices=["hann", "hamming", "blackman", "none"])
+                        choices=["hann", "hamming", "blackman", "cheb60", "cheb80", "cheb100", "cheb120", "none"])
     parser.add_argument("--nfft-doppler", type=int, default=None)
     parser.add_argument("--fd-max", type=float, default=None)
     parser.add_argument("--fd-min", type=float, default=None)
@@ -52,6 +52,8 @@ def main():
                         help="Max delay to display (ms)")
     parser.add_argument("--d-min", type=float, default=None,
                         help="Min delay to display (ms)")
+    parser.add_argument("--offset", type=float, default=0.0,
+                        help="Timestamp mode: sweep start offset in seconds after each integer-second boundary")
     parser.add_argument("--interactive", type=bool, default=False, 
                         help="Whether to display each frame interactively")
 
@@ -61,7 +63,15 @@ def main():
 
     # Dechirp-only
     parser.add_argument("--dechirp-window", type=str, default="hann",
-                        choices=["hamming", "hann", "none"])
+                        choices=["hamming", "hann", "cheb60", "cheb80", "cheb100", "cheb120", "none"])
+    parser.add_argument("--reference-gate-frequency", type=float, default=None,
+                        help="Gate the reference chirp at this frequency in Hz")
+    parser.add_argument("--reference-gate-period", type=float, default=None,
+                        help="Gate the reference chirp at this period in seconds; e.g. 0.005 for 5 ms")
+    parser.add_argument("--reference-gate-duty", type=float, default=0.5,
+                        help="Reference gate duty cycle in (0, 1]")
+    parser.add_argument("--reference-gate-phase", type=float, default=0.0,
+                        help="Reference gate phase/time offset in seconds")
     
     # FFmpeg parameters
     parser.add_argument("--framerate", type=int, default=2, help="Frame rate for the output video (frames per second)")
@@ -86,6 +96,9 @@ def main():
         sample_rate=fs,
         sweep_frequency=args.sweep_frequency,
         bandwidth=args.bandwidth,
+        reference_gate_frequency=reference_gate_frequency_from_args(args),
+        reference_gate_duty=args.reference_gate_duty,
+        reference_gate_phase=args.reference_gate_phase,
     )
     
     # Delay-Doppler processing and plotting

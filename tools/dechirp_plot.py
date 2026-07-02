@@ -8,7 +8,7 @@ import numpy as np
 import soundfile as sf
 
 from plotting_utils import plot_dechirp
-from lfm_utils import LFMWaveform, load_iq_audio, dechirp_fft_complex, window_from_arg
+from lfm_utils import LFMWaveform, load_iq_audio, dechirp_fft_complex, window_from_arg, reference_gate_frequency_from_args
 
 
 def plot_dechirp_streaming(
@@ -122,7 +122,16 @@ def main():
     parser.add_argument("--d-min", type=float, default=None, help="Min delay to display (ms)")
     parser.add_argument("--d-max", type=float, default=None, help="Max delay to display (ms)")
     parser.add_argument("--dechirp-window", type=str, default="hann",
-                        choices=["hamming", "hann", "none"], help="Fast-time dechirp FFT window")
+                        choices=["hamming", "hann", "cheb60", "cheb80", "cheb100", "cheb120", "none"],
+                        help="Fast-time dechirp FFT window")
+    parser.add_argument("--reference-gate-frequency", type=float, default=None,
+                        help="Gate the reference chirp at this frequency in Hz")
+    parser.add_argument("--reference-gate-period", type=float, default=None,
+                        help="Gate the reference chirp at this period in seconds; e.g. 0.005 for 5 ms")
+    parser.add_argument("--reference-gate-duty", type=float, default=0.5,
+                        help="Reference gate duty cycle in (0, 1]")
+    parser.add_argument("--reference-gate-phase", type=float, default=0.0,
+                        help="Reference gate phase/time offset in seconds")
     parser.add_argument("--streaming", action="store_true",
                         help="Process one chirp at a time and store only displayed delay bins")
 
@@ -153,6 +162,9 @@ def main():
         sample_rate=fs,
         sweep_frequency=args.sweep_frequency,
         bandwidth=args.bandwidth,
+        reference_gate_frequency=reference_gate_frequency_from_args(args),
+        reference_gate_duty=args.reference_gate_duty,
+        reference_gate_phase=args.reference_gate_phase,
     )
 
     if args.streaming or args.d_min is not None or args.d_max is not None:

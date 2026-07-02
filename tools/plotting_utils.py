@@ -8,6 +8,34 @@ import os
 from lfm_utils import LFMWaveform, dechirp_fft_complex, lfm_matched_filtering, window_from_arg
 
 
+def _timestamp_fractional_second(timestamp) -> float:
+    if timestamp is None:
+        return None
+
+    if hasattr(timestamp, "utc_datetime"):
+        dt = timestamp.utc_datetime
+    else:
+        dt = timestamp
+
+    if hasattr(dt, "microsecond"):
+        return dt.microsecond / 1e6
+
+    return None
+
+
+def _timestamp_sweep_offset_samples(timestamp, lfm_config, sweep_offset=0.0) -> int:
+    frac = _timestamp_fractional_second(timestamp)
+    if frac is None:
+        return 0
+
+    sweep_period = 1.0 / lfm_config.sweep_frequency
+    offset_s = (float(sweep_offset) - frac) % sweep_period
+    offset_samples = int(round(offset_s * lfm_config.sample_rate))
+    if offset_samples >= lfm_config.sweep_length:
+        offset_samples = 0
+    return offset_samples
+
+
 def plot_iq_spectrogram(
         iq: np.ndarray,
         fs: float,
@@ -413,6 +441,7 @@ def plot_delay_doppler_dechirp(
     d_max: float = None,
     d_min: float = None,
     interactive: bool = False,
+    positive_delay_axis: bool = False,
 ):
     B = lfm_config.bandwidth
     fs = lfm_config.sample_rate
@@ -453,6 +482,8 @@ def plot_delay_doppler_dechirp(
     # Convert beat frequency to delay
     delay_s = -fb / k
     delay_ms = delay_s * 1e3
+    if positive_delay_axis:
+        delay_ms = np.mod(delay_ms, T * 1e3)
 
     delay_order = np.argsort(delay_ms)
     delay_ms = delay_ms[delay_order]
@@ -506,7 +537,8 @@ def plot_delay_doppler_dechirp(
         plt.show()
 
 
-def delay_doppler_process_window(iq_chunk, frame_idx, args, lfm_config, timestamps):
+def delay_doppler_process_window(iq_chunk, frame_idx, args, lfm_config, timestamps, start_timestamp=None):
+    interactive = getattr(args, "interactive", False)
 
     if args.output is not None and frame_idx is not None:
         output_file = f"{args.output}/frame_{frame_idx:04d}.png"
@@ -533,14 +565,21 @@ def delay_doppler_process_window(iq_chunk, frame_idx, args, lfm_config, timestam
             fd_min=args.fd_min,
             d_max=args.d_max,
             d_min=args.d_min,
-            interactive=args.interactive,
+            interactive=interactive,
         )
 
     else:
+        start_offset_samples = _timestamp_sweep_offset_samples(
+            start_timestamp,
+            lfm_config,
+            sweep_offset=getattr(args, "offset", 0.0),
+        )
+
         _, complex_spectra = dechirp_fft_complex(
             received_signal=iq_chunk,
             lfm_config=lfm_config,
             window=args.dechirp_window,
+            start_offset_samples=start_offset_samples,
         )
 
         plot_delay_doppler_dechirp(
@@ -556,7 +595,8 @@ def delay_doppler_process_window(iq_chunk, frame_idx, args, lfm_config, timestam
             fd_min=args.fd_min,
             d_max=args.d_max,
             d_min=args.d_min,
-            interactive=args.interactive,
+            interactive=interactive,
+            positive_delay_axis=start_timestamp is not None,
         )
 
 

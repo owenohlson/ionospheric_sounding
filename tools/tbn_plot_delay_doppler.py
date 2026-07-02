@@ -2,7 +2,7 @@
 
 import argparse
 
-from lfm_utils import LFMWaveform, lfm_matched_filtering, dechirp_fft_complex
+from lfm_utils import LFMWaveform, lfm_matched_filtering, dechirp_fft_complex, reference_gate_frequency_from_args
 from tbn_utils import lsl_open_tbn, lsl_print_metadata, lsl_read_block_for_one_stream
 from plotting_utils import plot_delay_doppler_mf, plot_delay_doppler_dechirp
 
@@ -24,7 +24,7 @@ def main():
     parser.add_argument("--bandwidth", type=float, default=100e3, help="Chirp bandwidth (Hz)")
 
     # Delay processing method
-    parser.add_argument("--method", type=str, default="mf", choices=["mf", "dechirp"],
+    parser.add_argument("--method", type=str, default="dechirp", choices=["mf", "dechirp"],
                         help="Delay processing method")
 
     # Plotting parameters
@@ -36,7 +36,7 @@ def main():
     parser.add_argument("--tend", type=float, default=None)
 
     parser.add_argument("--slow-window", type=str, default="hann",
-                        choices=["hann", "hamming", "blackman", "none"])
+                        choices=["hann", "hamming", "blackman", "cheb60", "cheb80", "cheb100", "cheb120", "none"])
     parser.add_argument("--nfft-doppler", type=int, default=None)
     parser.add_argument("--fd-max", type=float, default=None)
     parser.add_argument("--fd-min", type=float, default=None)
@@ -44,14 +44,26 @@ def main():
                         help="Max delay to display (ms)")
     parser.add_argument("--d-min", type=float, default=None,
                         help="Min delay to display (ms)")
+    parser.add_argument("--offset", type=float, default=0.0,
+                        help="Timestamp mode: sweep start offset in seconds after each integer-second boundary")
+    parser.add_argument("--interactive", type=bool, default=False, 
+                        help="Whether to display each frame interactively")
 
     # MF-only
     parser.add_argument("--window-width", type=float, default=None, help="MF: fast-time window width (s)")
     parser.add_argument("--window-center", type=float, default=None, help="MF: center time (s) for window")
 
     # Dechirp-only
-    parser.add_argument("--dechirp-window", type=str, default="hamming",
-                        choices=["hamming", "hann", "none"])
+    parser.add_argument("--dechirp-window", type=str, default="hann",
+                        choices=["hamming", "hann", "blackman", "cheb60", "cheb80", "cheb100", "cheb120", "none"])
+    parser.add_argument("--reference-gate-frequency", type=float, default=None,
+                        help="Gate the reference chirp at this frequency in Hz")
+    parser.add_argument("--reference-gate-period", type=float, default=None,
+                        help="Gate the reference chirp at this period in seconds; e.g. 0.005 for 5 ms")
+    parser.add_argument("--reference-gate-duty", type=float, default=0.5,
+                        help="Reference gate duty cycle in (0, 1]")
+    parser.add_argument("--reference-gate-phase", type=float, default=0.0,
+                        help="Reference gate phase/time offset in seconds")
 
     args = parser.parse_args()
 
@@ -79,10 +91,13 @@ def main():
         sample_rate=fs,
         sweep_frequency=args.sweep_frequency,
         bandwidth=args.bandwidth,
+        reference_gate_frequency=reference_gate_frequency_from_args(args),
+        reference_gate_duty=args.reference_gate_duty,
+        reference_gate_phase=args.reference_gate_phase,
     )
 
     # Read IQ data for the specified time range and antenna stream
-    iq = lsl_read_block_for_one_stream(idf, args.tstart, duration, stand_id=args.stand, pol=args.pol)
+    iq, start_timestamp = lsl_read_block_for_one_stream(idf, args.tstart, duration, stand_id=args.stand, pol=args.pol)
 
     # Process and plot delay-Doppler map using the selected method
     if args.method == "mf":
@@ -105,13 +120,24 @@ def main():
             fd_min=args.fd_min,
             d_max=args.d_max,
             d_min=args.d_min,
+            interactive=args.interactive,
         )
 
     else:
+        start_offset_samples = 0
+        if start_timestamp is not None:
+            frac = start_timestamp.utc_datetime.microsecond / 1e6
+            sweep_period = 1.0 / lfm_config.sweep_frequency
+            offset_s = (args.offset - frac) % sweep_period
+            start_offset_samples = int(round(offset_s * lfm_config.sample_rate))
+            if start_offset_samples >= lfm_config.sweep_length:
+                start_offset_samples = 0
+
         _, complex_spectra = dechirp_fft_complex(
             received_signal=iq,
             lfm_config=lfm_config,
             window=args.dechirp_window,
+            start_offset_samples=start_offset_samples,
         )
 
         plot_delay_doppler_dechirp(
@@ -127,6 +153,8 @@ def main():
             fd_min=args.fd_min,
             d_max=args.d_max,
             d_min=args.d_min,
+            interactive=args.interactive,
+            positive_delay_axis=start_timestamp is not None,
         )
 
 

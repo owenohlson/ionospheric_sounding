@@ -4,6 +4,7 @@ import dataclasses
 
 import numpy as np
 from scipy.signal import oaconvolve, correlation_lags
+from scipy.signal.windows import chebwin
 import soundfile as sf
 
 
@@ -12,6 +13,9 @@ class LFMWaveform:
     bandwidth: float
     sweep_frequency: float
     sample_rate: float
+    reference_gate_frequency: float = None
+    reference_gate_duty: float = 0.5
+    reference_gate_phase: float = 0.0
 
     @property
     def waveform(self):
@@ -21,6 +25,16 @@ class LFMWaveform:
 
         # Complex LFM sweep centered at 0 Hz
         lfm = np.exp(1j * 2 * np.pi * ((-self.bandwidth / 2) * t + (kf / 2) * t ** 2))
+        if self.reference_gate_frequency is not None:
+            if self.reference_gate_frequency <= 0:
+                raise ValueError("reference_gate_frequency must be > 0")
+            if not 0 < self.reference_gate_duty <= 1:
+                raise ValueError("reference_gate_duty must be in the interval (0, 1]")
+
+            gate_period = 1.0 / self.reference_gate_frequency
+            gate_time = (t - self.reference_gate_phase) % gate_period
+            gate = gate_time < (self.reference_gate_duty * gate_period)
+            lfm = lfm * gate.astype(lfm.dtype)
         return lfm
 
     @property
@@ -34,17 +48,35 @@ def load_iq_audio(filename, start: int = 0, stop: int = None):
     return iq, samplerate
 
 
+def reference_gate_frequency_from_args(args):
+    gate_frequency = getattr(args, "reference_gate_frequency", None)
+    gate_period = getattr(args, "reference_gate_period", None)
+
+    if gate_frequency is not None and gate_period is not None:
+        raise ValueError("Use only one of --reference-gate-frequency or --reference-gate-period")
+    if gate_period is not None:
+        if gate_period <= 0:
+            raise ValueError("--reference-gate-period must be > 0")
+        return 1.0 / gate_period
+    return gate_frequency
+
+
 def window_from_arg(len, arg):
     if arg is None or arg.lower() == "none":
         return np.ones(len)
-    if arg.lower() == "bartlett":
+    arg = arg.lower()
+    if arg == "bartlett":
         return np.bartlett(len)
-    if arg.lower() == "blackman":
+    if arg == "blackman":
         return np.blackman(len)
-    if arg.lower() == "hann" or arg.lower() == "hanning":
+    if arg == "hann" or arg == "hanning":
         return np.hanning(len)
-    if arg.lower() == "hamming":
+    if arg == "hamming":
         return np.hamming(len)
+    if arg in ("cheb", "chebwin", "dolph-chebyshev", "cheb100"):
+        return chebwin(len, at=100)
+    if arg in ("cheb60", "cheb80", "cheb120"):
+        return chebwin(len, at=float(arg.removeprefix("cheb")))
     raise ValueError(f"Unknown window type: {arg}")
 
 
@@ -61,12 +93,17 @@ def lfm_matched_filtering(iq, lfm_in: LFMWaveform):
 
 def dechirp_fft_complex(received_signal: np.ndarray,
                         lfm_config: LFMWaveform,
-                        window: str = "hamming") -> np.ndarray:
+                        window: str = "hamming",
+                        start_offset_samples: int = 0) -> np.ndarray:
     """
     Dechirp each chirp-length segment, then FFT it.
     Returns complex FFT spectra: shape (num_chirps, chirp_len)
     """
     chirp_len = len(lfm_config.waveform)
+    if start_offset_samples < 0:
+        raise ValueError("start_offset_samples must be >= 0")
+
+    received_signal = received_signal[start_offset_samples:]
     num_chirps = len(received_signal) // chirp_len
 
     reference_chirp = lfm_config.waveform.astype(received_signal.dtype)

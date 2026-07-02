@@ -4,7 +4,7 @@ import argparse
 import soundfile as sf
 
 from plotting_utils import plot_pdp
-from lfm_utils import LFMWaveform, load_iq_audio, lfm_matched_filtering
+from lfm_utils import LFMWaveform, load_iq_audio, lfm_matched_filtering, reference_gate_frequency_from_args
 
 
 def main():
@@ -31,6 +31,14 @@ def main():
     parser.add_argument("--navg", type=int, default=4, help="Number of sweeps to average before plotting")
     parser.add_argument("--window-center", type=float, default=None,
                         help="The time to center the window around each sweep, automatically calculates if omitted")
+    parser.add_argument("--reference-gate-frequency", type=float, default=None,
+                        help="Gate the reference chirp at this frequency in Hz")
+    parser.add_argument("--reference-gate-period", type=float, default=None,
+                        help="Gate the reference chirp at this period in seconds; e.g. 0.005 for 5 ms")
+    parser.add_argument("--reference-gate-duty", type=float, default=0.5,
+                        help="Reference gate duty cycle in (0, 1]")
+    parser.add_argument("--reference-gate-phase", type=float, default=0.0,
+                        help="Reference gate phase/time offset in seconds")
 
 
     args = parser.parse_args()
@@ -48,6 +56,9 @@ def main():
         sample_rate=fs,
         sweep_frequency=args.sweep_frequency,
         bandwidth=args.bandwidth,
+        reference_gate_frequency=reference_gate_frequency_from_args(args),
+        reference_gate_duty=args.reference_gate_duty,
+        reference_gate_phase=args.reference_gate_phase,
     )
 
     magnitude_response, _, _ = lfm_matched_filtering(iq, lfm_config)

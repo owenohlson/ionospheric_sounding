@@ -9,7 +9,7 @@ import subprocess
 
 from datetime import timedelta
 
-from lfm_utils import LFMWaveform
+from lfm_utils import LFMWaveform, reference_gate_frequency_from_args
 from tbn_utils import lsl_open_tbn, lsl_print_metadata, lsl_read_block_for_one_stream
 from plotting_utils import delay_doppler_process_window
 
@@ -39,7 +39,7 @@ def main():
     parser.add_argument("--bandwidth", type=float, default=100e3, help="Chirp bandwidth (Hz)")
 
     # Delay processing method
-    parser.add_argument("--method", type=str, default="mf", choices=["mf", "dechirp"],
+    parser.add_argument("--method", type=str, default="dechirp", choices=["mf", "dechirp"],
                         help="Delay processing method")
 
     # Plotting parameters
@@ -48,7 +48,7 @@ def main():
     parser.add_argument("--tstart", type=float, default=None)
     parser.add_argument("--tend", type=float, default=None)
     parser.add_argument("--slow-window", type=str, default="hann",
-                        choices=["hann", "hamming", "blackman", "none"])
+                        choices=["hann", "hamming", "blackman", "cheb60", "cheb80", "cheb100", "cheb120", "none"])
     parser.add_argument("--nfft-doppler", type=int, default=None)
     parser.add_argument("--vmin", type=float, default=None)
     parser.add_argument("--vmax", type=float, default=None)
@@ -58,14 +58,30 @@ def main():
                         help="Max delay to display (ms)")
     parser.add_argument("--d-min", type=float, default=None,
                         help="Min delay to display (ms)")
+    parser.add_argument("--offset", type=float, default=0.0,
+                        help="Timestamp mode: sweep start offset in seconds after each integer-second boundary")
+    parser.add_argument("--interactive", type=bool, default=False, 
+                        help="Whether to display each frame interactively")
 
     # MF-only
     parser.add_argument("--window-width", type=float, default=None, help="MF: fast-time window width (s)")
     parser.add_argument("--window-center", type=float, default=None, help="MF: center time (s) for window")
 
     # Dechirp-only
-    parser.add_argument("--dechirp-window", type=str, default="hamming",
-                        choices=["hamming", "hann", "none"])
+    parser.add_argument("--dechirp-window", type=str, default="hann",
+                        choices=["hamming", "hann", "blackman", "cheb60", "cheb80", "cheb100", "cheb120", "none"])
+    parser.add_argument("--reference-gate-frequency", type=float, default=None,
+                        help="Gate the reference chirp at this frequency in Hz")
+    parser.add_argument("--reference-gate-period", type=float, default=None,
+                        help="Gate the reference chirp at this period in seconds; e.g. 0.005 for 5 ms")
+    parser.add_argument("--reference-gate-duty", type=float, default=0.5,
+                        help="Reference gate duty cycle in (0, 1]")
+    parser.add_argument("--reference-gate-phase", type=float, default=0.0,
+                        help="Reference gate phase/time offset in seconds")
+ 
+    # FFmpeg parameters
+    parser.add_argument("--framerate", type=int, default=2, help="Frame rate for the output video (frames per second)")
+
 
     args = parser.parse_args()
 
@@ -91,6 +107,9 @@ def main():
         sample_rate=fs,
         sweep_frequency=args.sweep_frequency,
         bandwidth=args.bandwidth,
+        reference_gate_frequency=reference_gate_frequency_from_args(args),
+        reference_gate_duty=args.reference_gate_duty,
+        reference_gate_phase=args.reference_gate_phase,
     )
     
     # Delay-Doppler processing and plotting
@@ -131,7 +150,8 @@ def main():
             frame_idx,
             args,
             lfm_config,
-            time_range_str
+            time_range_str,
+            start_timestamp=start_timestamp,
         )
 
         # print(f"Finished processing frame {frame_idx+1}/{nframes}", flush=True)
@@ -158,7 +178,7 @@ def main():
         ffmpeg_cmd = [
             "ffmpeg",
             "-y",  # overwrite output file if it exists
-            "-r", "2",  # frame rate (adjust as needed)
+            "-r", str(args.framerate),  # frame rate (adjust as needed)
             "-start_number", "0",
             "-i", f"{full_output_path}/frame_%04d.png",
             "-c:v", "libx264",

@@ -3,7 +3,7 @@
 import argparse
 
 from plotting_utils import plot_micro_doppler
-from lfm_utils import LFMWaveform, load_iq_audio, dechirp_fft_complex
+from lfm_utils import LFMWaveform, load_iq_audio, dechirp_fft_complex, reference_gate_frequency_from_args
 
 
 def main():
@@ -41,7 +41,15 @@ def main():
 
     # Dechirp-only
     parser.add_argument("--dechirp-window", type=str, default="hamming",
-                        choices=["hamming", "hann", "none"])
+                        choices=["hamming", "hann", "cheb60", "cheb80", "cheb100", "cheb120", "none"])
+    parser.add_argument("--reference-gate-frequency", type=float, default=None,
+                        help="Gate the reference chirp at this frequency in Hz")
+    parser.add_argument("--reference-gate-period", type=float, default=None,
+                        help="Gate the reference chirp at this period in seconds; e.g. 0.005 for 5 ms")
+    parser.add_argument("--reference-gate-duty", type=float, default=0.5,
+                        help="Reference gate duty cycle in (0, 1]")
+    parser.add_argument("--reference-gate-phase", type=float, default=0.0,
+                        help="Reference gate phase/time offset in seconds")
 
     args = parser.parse_args()
 
@@ -51,6 +59,9 @@ def main():
         sample_rate=fs,
         sweep_frequency=args.sweep_frequency,
         bandwidth=args.bandwidth,
+        reference_gate_frequency=reference_gate_frequency_from_args(args),
+        reference_gate_duty=args.reference_gate_duty,
+        reference_gate_phase=args.reference_gate_phase,
     )
 
     sweep_duration = 1 / args.sweep_frequency
