@@ -4,6 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.signal import stft
 import os
+import textwrap
 
 from lfm_utils import LFMWaveform, dechirp_fft_complex, lfm_matched_filtering, window_from_arg
 
@@ -165,6 +166,7 @@ def plot_pdp(magnitude_response: np.ndarray,
              tend=None, 
              navg=4, 
              tcenter: float = None,
+             delay_reference_note: str = None,
 ):
     if tstart is not None:
         magnitude_response = magnitude_response[int(tstart * lfm_config.sample_rate):]
@@ -216,7 +218,12 @@ def plot_pdp(magnitude_response: np.ndarray,
     plt.xlabel('Time [s]')
     plt.title(title)
     plt.colorbar(label='Power [dB]')
-    plt.tight_layout()
+    if delay_reference_note:
+        wrapped_note = "\n".join(textwrap.wrap(delay_reference_note, width=115))
+        plt.figtext(0.5, 0.01, wrapped_note, ha='center', va='bottom', fontsize=8)
+        plt.tight_layout(rect=[0, 0.08, 1, 1])
+    else:
+        plt.tight_layout()
     if output_file:
         plt.savefig(output_file, dpi=300)
         plt.show()
@@ -249,7 +256,7 @@ def plot_dechirp(stretch_result: np.ndarray,
     f_mask = np.abs(freqs) <= (np.abs(lfm_config.bandwidth / 2))
     freqs = freqs[f_mask]
 
-    time_delays = -freqs / k * 1e3  # milliseconds
+    time_delays = np.mod(-freqs / k * 1e3, T * 1e3)  # milliseconds
 
     power_db = 10 * np.log10(stretch_result + 1e-12)
     power_db = power_db[:, f_mask]
@@ -285,6 +292,100 @@ def plot_dechirp(stretch_result: np.ndarray,
     if save_path:
         plt.savefig(save_path, dpi=300)
     plt.show()
+    
+
+def plot_dechirp_streaming(
+        iq,
+        lfm_config,
+        vmin=None,
+        vmax=None,
+        title="Stretch-Processed Range-Time Plot",
+        output_file=None,
+        navg=1,
+        d_min=None,
+        d_max=None,
+        dechirp_window="hann",
+        tstart=0.0,
+        start_offset_samples=0,
+):
+    chirp_len = lfm_config.sweep_length
+    if start_offset_samples < 0:
+        raise ValueError("start_offset_samples must be >= 0")
+    iq = iq[start_offset_samples:]
+
+    num_chirps = len(iq) // chirp_len
+    if num_chirps < 1:
+        raise ValueError("Not enough samples for one complete chirp")
+    if navg < 1:
+        raise ValueError("--navg must be >= 1")
+
+    fs = lfm_config.sample_rate
+    prf = lfm_config.sweep_frequency
+    k = lfm_config.bandwidth / (1.0 / prf)
+    if k == 0:
+        raise ValueError("Cannot convert dechirp beat frequency to delay when bandwidth is zero")
+
+    fb = np.fft.fftshift(np.fft.fftfreq(chirp_len, d=1.0 / fs))
+    delay_ms = np.mod(-fb / k * 1e3, (1.0 / prf) * 1e3)
+    delay_order = np.argsort(delay_ms)
+    delay_ms = delay_ms[delay_order]
+
+    d_mask = np.ones_like(delay_ms, dtype=bool)
+    if d_min is not None:
+        d_mask = d_mask & (delay_ms >= d_min)
+    if d_max is not None:
+        d_mask = d_mask & (delay_ms <= d_max)
+    selected_bins = delay_order[d_mask]
+    delay_plot = delay_ms[d_mask]
+    if selected_bins.size == 0:
+        raise ValueError(
+            "No dechirp delay bins selected; check --d-min/--d-max. "
+            f"Available delay range is {delay_ms.min():.3f} to {delay_ms.max():.3f} ms "
+            f"for sweep_frequency={prf:g} Hz "
+            f"(chirp period={(1.0 / prf) * 1e3:.3f} ms)."
+        )
+
+    reference_chirp = lfm_config.waveform.astype(iq.dtype)
+    w = window_from_arg(chirp_len, dechirp_window).astype(np.float32, copy=False)
+    coherent_gain = np.mean(w)
+    if coherent_gain == 0:
+        raise ValueError(f"Window '{dechirp_window}' has zero coherent gain")
+
+    num_groups = num_chirps // navg
+    power = np.empty((num_groups, selected_bins.size), dtype=np.float32)
+
+    for group_idx in range(num_groups):
+        acc = np.zeros(selected_bins.size, dtype=np.float64)
+        for j in range(navg):
+            chirp_idx = group_idx * navg + j
+            start = chirp_idx * chirp_len
+            seg = iq[start:start + chirp_len]
+            beat = seg * np.conj(reference_chirp)
+            spectrum = np.fft.fftshift(np.fft.fft(beat * w) / coherent_gain)
+            acc += np.abs(spectrum[selected_bins]) ** 2
+        power[group_idx] = acc / navg
+
+    power_db = 10.0 * np.log10(power + 1e-12)
+    slow_time = tstart + np.arange(num_groups) * navg / prf
+
+    plt.figure(figsize=(10, 6))
+    plt.pcolormesh(slow_time, delay_plot, power_db.T, shading="nearest",
+                   cmap="inferno", vmin=vmin, vmax=vmax)
+    plt.ylabel("Delay [ms]")
+    plt.xlabel("Time [s]")
+    plt.title(title)
+    plt.colorbar(label="Power [dB]")
+    plt.tight_layout()
+
+    if output_file:
+        full_path = os.path.expanduser(output_file)
+        output_dir = os.path.dirname(full_path)
+        if output_dir and not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        plt.savefig(full_path, dpi=300)
+        plt.close()
+    else:
+        plt.show()
 
 
 def plot_delay_doppler_mf(
@@ -441,7 +542,7 @@ def plot_delay_doppler_dechirp(
     d_max: float = None,
     d_min: float = None,
     interactive: bool = False,
-    positive_delay_axis: bool = False,
+    positive_delay_axis: bool = True,
 ):
     B = lfm_config.bandwidth
     fs = lfm_config.sample_rate
@@ -596,7 +697,7 @@ def delay_doppler_process_window(iq_chunk, frame_idx, args, lfm_config, timestam
             d_max=args.d_max,
             d_min=args.d_min,
             interactive=interactive,
-            positive_delay_axis=start_timestamp is not None,
+            positive_delay_axis=True,
         )
 
 
@@ -686,7 +787,7 @@ def plot_micro_doppler(
     # Beat frequency axis (fftshifted, so index 0 = most negative freq)
     fb_axis = np.fft.fftshift(np.fft.fftfreq(n_bins, d=1.0 / fs))
     fb_peak = fb_axis[peak_bin]
-    delay_peak_ms = (fb_peak / k) * 1e3
+    delay_peak_ms = np.mod(-fb_peak / k * 1e3, T * 1e3)
 
     # ------------------------------------------------------------------
     # 3.  Extract the complex envelope around the peak bin

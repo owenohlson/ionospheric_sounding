@@ -45,8 +45,17 @@ def main():
 
     info = sf.info(args.input_file)
     fs = info.samplerate
-    start_idx = int(args.tstart * fs) if args.tstart is not None else 0
-    end_idx = int(args.tend * fs) if args.tend is not None else info.frames
+
+    if args.tstart is None:
+        args.tstart = 0.0
+        print("No --tstart provided, starting from beginning of file")
+    if args.tend is None:
+        duration = info.frames / fs
+        args.tend = duration
+        print(f"No --tend provided, using end time of file: {args.tend:.2f} seconds")
+
+    start_idx = int(args.tstart * fs)
+    end_idx = int(args.tend * fs)
 
     # Load only the requested time span; full-file matched filtering is expensive.
     iq, fs = load_iq_audio(args.input_file, start=start_idx, stop=end_idx)
@@ -63,6 +72,18 @@ def main():
 
     magnitude_response, _, _ = lfm_matched_filtering(iq, lfm_config)
 
+    if args.window_center is None:
+        delay_reference_note = (
+            "Relative delay 0 ms = auto matched-filter peak/window center; "
+            "no WAV GPS timestamp used, so integer-second offset is unknown."
+        )
+    else:
+        delay_reference_note = (
+            f"Relative delay 0 ms = --window-center {args.window_center * 1e3:.3f} ms "
+            "within each matched-filter sweep; no WAV GPS timestamp used."
+        )
+    print(delay_reference_note)
+
     # Call plotting function
     plot_pdp(
         magnitude_response=magnitude_response,
@@ -76,6 +97,7 @@ def main():
         tend=None,
         navg=args.navg,
         tcenter=args.window_center,
+        delay_reference_note=delay_reference_note,
     )
 
 

@@ -154,7 +154,7 @@ def main():
             d_max=args.d_max,
             d_min=args.d_min,
             interactive=args.interactive,
-            positive_delay_axis=start_timestamp is not None,
+            positive_delay_axis=True,
         )
 
 

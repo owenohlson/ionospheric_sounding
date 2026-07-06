@@ -2,8 +2,8 @@
 
 import argparse
 from tbn_utils import lsl_open_tbn, lsl_print_metadata, lsl_read_block_for_one_stream
-from plotting_utils import plot_pdp
-from lfm_utils import LFMWaveform, lfm_matched_filtering
+from plotting_utils import _timestamp_fractional_second, plot_pdp
+from lfm_utils import LFMWaveform, lfm_matched_filtering, reference_gate_frequency_from_args
 
 
 def main():
@@ -31,6 +31,14 @@ def main():
     parser.add_argument("--tend", type=float, default=None)
     parser.add_argument("--navg", type=int, default=4, help="Number of sweeps to average before plotting")
     parser.add_argument("--window-center", type=float, default=None, help="The time to center the window around each sweep, automatically calculates if omitted")
+    parser.add_argument("--reference-gate-frequency", type=float, default=None,
+                        help="Gate the reference chirp at this frequency in Hz")
+    parser.add_argument("--reference-gate-period", type=float, default=None,
+                        help="Gate the reference chirp at this period in seconds; e.g. 0.005 for 5 ms")
+    parser.add_argument("--reference-gate-duty", type=float, default=0.5,
+                        help="Reference gate duty cycle in (0, 1]")
+    parser.add_argument("--reference-gate-phase", type=float, default=0.0,
+                        help="Reference gate phase/time offset in seconds")
 
     # Output file
     parser.add_argument("--output", default=None, help="output PNG filename (optional)")
@@ -43,11 +51,10 @@ def main():
     lsl_print_metadata(idf)
 
     fs = float(idf.get_info("sample_rate"))
-    fc = float(idf.get_info("freq1"))
 
     if args.tstart is None:
         args.tstart = 0.0
-        print(f"No --tstart provided, starting from beginning of file")
+        print("No --tstart provided, starting from beginning of file")
     if args.tend is None:
         nFramesFile = idf.get_info("nframe")
         args.tend = nFramesFile / fs
@@ -60,15 +67,39 @@ def main():
         sample_rate=fs,
         sweep_frequency=args.sweep_frequency,
         bandwidth=args.bandwidth,
+        reference_gate_frequency=reference_gate_frequency_from_args(args),
+        reference_gate_duty=args.reference_gate_duty,
+        reference_gate_phase=args.reference_gate_phase,
     )
 
-    x = lsl_read_block_for_one_stream(idf, args, stand_id=args.stand, pol=args.pol)
+    iq, start_timestamp = lsl_read_block_for_one_stream(
+        idf,
+        args.tstart,
+        duration,
+        stand_id=args.stand,
+        pol=args.pol,
+    )
 
-    # Comput matched filter
-    magnitude_response, _ = lfm_matched_filtering(x, lfm_config)
+    # Compute matched filter on the requested time span.
+    magnitude_response, _, _ = lfm_matched_filtering(iq, lfm_config)
 
     if args.title is None:
         args.title = f"PDP Plot [fs={round(fs/1000, 3)} kHz, BW={round(args.bandwidth/1e3, 3)} kHz, sweep_freq={round(args.sweep_frequency, 3)} Hz, stand={args.stand}, pol={args.pol}]"
+
+    if args.window_center is None:
+        delay_zero = "Relative delay 0 ms = auto matched-filter peak/window center"
+    else:
+        delay_zero = f"Relative delay 0 ms = --window-center {args.window_center * 1e3:.3f} ms within each matched-filter sweep"
+
+    if start_timestamp is None:
+        delay_reference_note = f"{delay_zero}; TBN read timestamp unavailable, so integer-second offset is unknown."
+    else:
+        frac_s = _timestamp_fractional_second(start_timestamp)
+        delay_reference_note = (
+            f"{delay_zero}; first read sample is {frac_s * 1e3:.3f} ms "
+            "after a GPS integer second."
+        )
+    print(delay_reference_note)
 
     # Call plotting function
     plot_pdp(
@@ -79,10 +110,11 @@ def main():
         output_file=args.output,
         vmin=args.vmin,
         vmax=args.vmax,
-        offset=args.tstart,
-        duration=duration,
+        tstart=None,
+        tend=None,
         navg=args.navg,
         tcenter=args.window_center,
+        delay_reference_note=delay_reference_note,
     )
 
 if __name__ == "__main__":
