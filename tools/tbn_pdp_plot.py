@@ -1,7 +1,7 @@
 # tbn_pdp_plot.py
 
 import argparse
-from tbn_utils import lsl_open_tbn, lsl_print_metadata, lsl_read_block_for_one_stream
+from tbn_utils import lsl_open_tbn, lsl_print_metadata, lsl_read_block_for_one_stream, timestamp_range_note
 from plotting_utils import _timestamp_fractional_second, plot_pdp
 from lfm_utils import LFMWaveform, lfm_matched_filtering, reference_gate_frequency_from_args
 
@@ -79,6 +79,7 @@ def main():
         stand_id=args.stand,
         pol=args.pol,
     )
+    corner_note = timestamp_range_note(start_timestamp, len(iq) / fs)
 
     # Compute matched filter on the requested time span.
     magnitude_response, _, _ = lfm_matched_filtering(iq, lfm_config)
@@ -115,6 +116,7 @@ def main():
         navg=args.navg,
         tcenter=args.window_center,
         delay_reference_note=delay_reference_note,
+        corner_note=corner_note,
     )
 
 if __name__ == "__main__":

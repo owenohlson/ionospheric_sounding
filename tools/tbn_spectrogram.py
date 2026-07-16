@@ -1,7 +1,15 @@
 # tbn_spectrogram.py
 
 import argparse
-from tbn_utils import lsl_open_tbn, lsl_print_metadata, lsl_read_block_for_one_stream, lsl_average_spectrum_all_antpols, plot_averaged_spectrum
+from tbn_utils import (
+    file_timestamp_range_note,
+    lsl_average_spectrum_all_antpols,
+    lsl_open_tbn,
+    lsl_print_metadata,
+    lsl_read_block_for_one_stream,
+    plot_averaged_spectrum,
+    timestamp_range_note,
+)
 from plotting_utils import plot_iq_spectrogram
 
 
@@ -59,10 +67,12 @@ def main():
     if args.plot == "average":
         # One global averaged spectrum across antpols (single output)
         _, freq, spec_avg = lsl_average_spectrum_all_antpols(idf, args)
-        plot_averaged_spectrum(freq, spec_avg, center_freq_hz=fc, out_png=args.output)
+        corner_note = file_timestamp_range_note(idf, args.tstart, args.tend)
+        plot_averaged_spectrum(freq, spec_avg, center_freq_hz=fc, out_png=args.output, corner_note=corner_note)
         return
 
-    x = lsl_read_block_for_one_stream(idf, args.tstart, duration, stand_id=args.stand, pol=args.pol)
+    x, start_timestamp = lsl_read_block_for_one_stream(idf, args.tstart, duration, stand_id=args.stand, pol=args.pol)
+    corner_note = timestamp_range_note(start_timestamp, len(x) / fs)
 
     if args.title is None:
         args.title = f"Spectrogram [fs={round(fs/1000, 3)} kHz, stand={args.stand}, pol={args.pol}, offset={round(args.tstart, 3)}s, duration={round(duration, 3)}s]"
@@ -73,12 +83,13 @@ def main():
         plot_title=args.title,
         vmin=args.vmin,
         vmax=args.vmax,
-        tstart=None,
+        tstart=0.0,
         tend=None,
         window=args.window,
         window_size=args.window_size,
         hop_size=args.hop_size,
         output_file=args.output,
+        corner_note=corner_note,
     )
 
 if __name__ == "__main__":

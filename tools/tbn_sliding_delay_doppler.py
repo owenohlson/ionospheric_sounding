@@ -7,10 +7,8 @@ import os
 import psutil
 import subprocess
 
-from datetime import timedelta
-
 from lfm_utils import LFMWaveform, reference_gate_frequency_from_args
-from tbn_utils import lsl_open_tbn, lsl_print_metadata, lsl_read_block_for_one_stream
+from tbn_utils import lsl_open_tbn, lsl_print_metadata, lsl_read_block_for_one_stream, timestamp_range_note
 from plotting_utils import delay_doppler_process_window
 
 process = psutil.Process(os.getpid())
@@ -137,10 +135,7 @@ def main():
 
         # Convert timestamp to datetime string for plotting
         if start_timestamp is not None:
-            start_time = start_timestamp.utc_datetime
-            end_time = start_time + timedelta(seconds=args.integration_time)
-
-            time_range_str = f"{start_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]} to {end_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}"
+            time_range_str = timestamp_range_note(start_timestamp, args.integration_time)
 
             print(f"Frame {frame_idx+1} timestamps: {time_range_str}", flush=True)
         

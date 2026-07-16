@@ -126,6 +126,57 @@ def dechirp_fft_complex(received_signal: np.ndarray,
     return mag_out, out
 
 
+def dechirp_fft_delay_band_complex(received_signal: np.ndarray,
+                                   lfm_config: LFMWaveform,
+                                   d_min: float,
+                                   d_max: float,
+                                   window: str = "hann",
+                                   start_offset_samples: int = 0):
+    chirp_len = len(lfm_config.waveform)
+    if start_offset_samples < 0:
+        raise ValueError("start_offset_samples must be >= 0")
+    if d_min is None or d_max is None:
+        raise ValueError("Both d_min and d_max are required")
+
+    received_signal = received_signal[start_offset_samples:]
+    num_chirps = len(received_signal) // chirp_len
+
+    fs = lfm_config.sample_rate
+    prf = lfm_config.sweep_frequency
+    T = 1.0 / prf
+    k = lfm_config.bandwidth / T
+    if k == 0:
+        raise ValueError("Cannot convert dechirp beat frequency to delay when bandwidth is zero")
+
+    fb = np.fft.fftshift(np.fft.fftfreq(chirp_len, d=1.0 / fs))
+    delay_ms = np.mod(-fb / k * 1e3, T * 1e3)
+    delay_order = np.argsort(delay_ms)
+    delay_ms = delay_ms[delay_order]
+    d_mask = (delay_ms >= d_min) & (delay_ms <= d_max)
+    selected_bins = delay_order[d_mask]
+    selected_delay_ms = delay_ms[d_mask]
+    if selected_bins.size == 0:
+        raise ValueError(
+            "No delay bins selected; check --d-min/--d-max. "
+            f"Available delay range is {delay_ms.min():.3f} to {delay_ms.max():.3f} ms."
+        )
+
+    reference_chirp = lfm_config.waveform.astype(received_signal.dtype)
+    w = window_from_arg(chirp_len, window).astype(np.float32, copy=False)
+    coherent_gain = np.mean(w)
+    if coherent_gain == 0:
+        raise ValueError(f"Window '{window}' has zero coherent gain")
+
+    out = np.empty((num_chirps, selected_bins.size), dtype=np.complex64)
+    for i in range(num_chirps):
+        seg = received_signal[i * chirp_len:(i + 1) * chirp_len]
+        beat = seg * np.conj(reference_chirp)
+        spectrum = np.fft.fftshift(np.fft.fft(beat * w) / coherent_gain)
+        out[i, :] = spectrum[selected_bins]
+
+    return selected_delay_ms, out
+
+
 # C = 299_792_458.0      # Speed of light (m/s)
 
 # def dechirp(received_signal: np.ndarray,

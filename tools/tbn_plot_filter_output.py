@@ -1,7 +1,7 @@
 # tbn_plot_filter_output.py
 
 import argparse
-from tbn_utils import lsl_open_tbn, lsl_print_metadata, lsl_read_block_for_one_stream
+from tbn_utils import lsl_open_tbn, lsl_print_metadata, lsl_read_block_for_one_stream, timestamp_range_note
 from plotting_utils import plot_matched_filter_output
 from lfm_utils import LFMWaveform, lfm_matched_filtering
 
@@ -58,10 +58,17 @@ def main():
         bandwidth=args.bandwidth,
     )
 
-    x = lsl_read_block_for_one_stream(idf, args, stand_id=args.stand, pol=args.pol)
+    x, start_timestamp = lsl_read_block_for_one_stream(
+        idf,
+        args.tstart,
+        duration,
+        stand_id=args.stand,
+        pol=args.pol,
+    )
+    corner_note = timestamp_range_note(start_timestamp, len(x) / fs)
 
     # Compute matched filter
-    magnitude_response, lags = lfm_matched_filtering(x, lfm_config)
+    magnitude_response, lags, _ = lfm_matched_filtering(x, lfm_config)
 
     if args.title is None:
         args.title = f"MF Output Plot [fs={round(fs/1000, 3)} kHz, fc={round(center_freq/1e6, 3)} MHz, stand={args.stand}, pol={args.pol}, BW={round(args.bandwidth/1e3, 3)} kHz, sweep_freq={round(args.sweep_frequency, 3)} Hz]"
@@ -73,7 +80,8 @@ def main():
         fs=fs,
         title=args.title,
         output_file=args.output,
-        time_units=args.units
+        time_units=args.units,
+        corner_note=corner_note,
     )
 
 if __name__ == "__main__":

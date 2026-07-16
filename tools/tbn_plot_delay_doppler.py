@@ -3,7 +3,7 @@
 import argparse
 
 from lfm_utils import LFMWaveform, lfm_matched_filtering, dechirp_fft_complex, reference_gate_frequency_from_args
-from tbn_utils import lsl_open_tbn, lsl_print_metadata, lsl_read_block_for_one_stream
+from tbn_utils import lsl_open_tbn, lsl_print_metadata, lsl_read_block_for_one_stream, timestamp_range_note
 from plotting_utils import plot_delay_doppler_mf, plot_delay_doppler_dechirp
 
 
@@ -98,6 +98,7 @@ def main():
 
     # Read IQ data for the specified time range and antenna stream
     iq, start_timestamp = lsl_read_block_for_one_stream(idf, args.tstart, duration, stand_id=args.stand, pol=args.pol)
+    corner_note = timestamp_range_note(start_timestamp, len(iq) / fs)
 
     # Process and plot delay-Doppler map using the selected method
     if args.method == "mf":
@@ -121,6 +122,7 @@ def main():
             d_max=args.d_max,
             d_min=args.d_min,
             interactive=args.interactive,
+            corner_note=corner_note,
         )
 
     else:
@@ -155,6 +157,7 @@ def main():
             d_min=args.d_min,
             interactive=args.interactive,
             positive_delay_axis=True,
+            corner_note=corner_note,
         )
 
 

@@ -9,6 +9,63 @@ import textwrap
 from lfm_utils import LFMWaveform, dechirp_fft_complex, lfm_matched_filtering, window_from_arg
 
 
+def _add_corner_note(corner_note: str = None, fig=None):
+    if not corner_note:
+        return
+    if fig is None:
+        fig = plt.gcf()
+    wrapped_note = "\n".join(
+        wrapped_line
+        for line in str(corner_note).splitlines()
+        for wrapped_line in (textwrap.wrap(line, width=52) or [""])
+    )
+    fig.text(
+        0.99,
+        0.01,
+        wrapped_note,
+        ha="right",
+        va="bottom",
+        fontsize=8,
+        bbox={"facecolor": "white", "alpha": 0.72, "edgecolor": "none", "pad": 3},
+    )
+
+
+def _add_lower_left_note(note: str = None, fig=None):
+    if not note:
+        return
+    if fig is None:
+        fig = plt.gcf()
+    fig.text(
+        0.01,
+        0.01,
+        note,
+        ha="left",
+        va="bottom",
+        fontsize=8,
+        bbox={"facecolor": "white", "alpha": 0.72, "edgecolor": "none", "pad": 3},
+    )
+
+
+def _strongest_delay_bin_ms(power, delay_ms):
+    if power.size == 0 or delay_ms.size == 0:
+        return None
+    _, delay_idx = np.unravel_index(np.nanargmax(power), power.shape)
+    return float(delay_ms[delay_idx])
+
+
+def _auto_delay_bounds(delay_ms, power, d_min, d_max, half_width_ms=10.0):
+    strongest_delay_ms = _strongest_delay_bin_ms(power, delay_ms)
+    if d_min is None and d_max is None and strongest_delay_ms is not None:
+        d_min = max(float(np.min(delay_ms)), strongest_delay_ms - half_width_ms)
+        d_max = min(float(np.max(delay_ms)), strongest_delay_ms + half_width_ms)
+        print(
+            f"No --d-min/--d-max provided; auto-centering on strongest delay bin "
+            f"{strongest_delay_ms:.3f} ms with range {d_min:.3f} to {d_max:.3f} ms",
+            flush=True,
+        )
+    return d_min, d_max, strongest_delay_ms
+
+
 def _timestamp_fractional_second(timestamp) -> float:
     if timestamp is None:
         return None
@@ -48,7 +105,8 @@ def plot_iq_spectrogram(
         window: str = "hann",
         window_size: int = 1024,
         hop_size: int = 512,
-        output_file: str = None
+        output_file: str = None,
+        corner_note: str = None,
 ):
     """
     Plots a vertical STFT-based spectrogram of a complex IQ audio file.
@@ -95,6 +153,7 @@ def plot_iq_spectrogram(
 
     # Ticks and layout
     ax.tick_params(axis='both', which='major', labelsize=10)
+    _add_corner_note(corner_note, fig=fig)
     plt.tight_layout()
 
     if output_file:
@@ -113,7 +172,8 @@ def plot_matched_filter_output(
         xlim: tuple = (None, None),
         ylim: tuple = (None, None),
         output_file: str = None,
-        time_units: str = "s"
+        time_units: str = "s",
+        corner_note: str = None,
 
 ):
     """
@@ -146,6 +206,7 @@ def plot_matched_filter_output(
     plt.xlabel(f'Time [{time_units}]')
     plt.ylabel('Power [dB]')
     plt.title(title)
+    _add_corner_note(corner_note)
     plt.tight_layout()
     if output_file:
         plt.savefig(output_file, dpi=300)
@@ -167,6 +228,7 @@ def plot_pdp(magnitude_response: np.ndarray,
              navg=4, 
              tcenter: float = None,
              delay_reference_note: str = None,
+             corner_note: str = None,
 ):
     if tstart is not None:
         magnitude_response = magnitude_response[int(tstart * lfm_config.sample_rate):]
@@ -224,6 +286,7 @@ def plot_pdp(magnitude_response: np.ndarray,
         plt.tight_layout(rect=[0, 0.08, 1, 1])
     else:
         plt.tight_layout()
+    _add_corner_note(corner_note)
     if output_file:
         plt.savefig(output_file, dpi=300)
         plt.show()
@@ -242,6 +305,7 @@ def plot_dechirp(stretch_result: np.ndarray,
                  d_min: float = None,
                  d_max: float = None,
                  tstart: float = 0.0,
+                 corner_note: str = None,
 ):
     T = 1 / lfm_config.sweep_frequency
     k = lfm_config.bandwidth / T
@@ -264,6 +328,13 @@ def plot_dechirp(stretch_result: np.ndarray,
     delay_order = np.argsort(time_delays)
     time_delays = time_delays[delay_order]
     power_db = power_db[:, delay_order]
+    auto_delay_window = d_min is None and d_max is None
+    d_min, d_max, strongest_delay_ms = _auto_delay_bounds(
+        time_delays,
+        power_db,
+        d_min,
+        d_max,
+    )
 
     d_mask = np.ones_like(time_delays, dtype=bool)
     if d_min is not None:
@@ -272,6 +343,8 @@ def plot_dechirp(stretch_result: np.ndarray,
         d_mask = d_mask & (time_delays <= d_max)
     time_delays = time_delays[d_mask]
     power_db = power_db[:, d_mask]
+    if not auto_delay_window:
+        strongest_delay_ms = _strongest_delay_bin_ms(power_db, time_delays)
 
     if navg > 1:
         nrows = (power_db.shape[0] // navg) * navg
@@ -287,6 +360,9 @@ def plot_dechirp(stretch_result: np.ndarray,
     plt.xlabel('Time [s]')
     plt.title(title)
     plt.colorbar(label='Power [dB]')
+    if strongest_delay_ms is not None:
+        _add_lower_left_note(f"Strongest delay bin: {strongest_delay_ms:.3f} ms")
+    _add_corner_note(corner_note)
     plt.tight_layout()
 
     if save_path:
@@ -307,6 +383,7 @@ def plot_dechirp_streaming(
         dechirp_window="hann",
         tstart=0.0,
         start_offset_samples=0,
+        corner_note=None,
 ):
     chirp_len = lfm_config.sweep_length
     if start_offset_samples < 0:
@@ -330,11 +407,20 @@ def plot_dechirp_streaming(
     delay_order = np.argsort(delay_ms)
     delay_ms = delay_ms[delay_order]
 
+    reference_chirp = lfm_config.waveform.astype(iq.dtype)
+    w = window_from_arg(chirp_len, dechirp_window).astype(np.float32, copy=False)
+    coherent_gain = np.mean(w)
+    if coherent_gain == 0:
+        raise ValueError(f"Window '{dechirp_window}' has zero coherent gain")
+
+    num_groups = num_chirps // navg
+    auto_delay_window = d_min is None and d_max is None
     d_mask = np.ones_like(delay_ms, dtype=bool)
-    if d_min is not None:
-        d_mask = d_mask & (delay_ms >= d_min)
-    if d_max is not None:
-        d_mask = d_mask & (delay_ms <= d_max)
+    if not auto_delay_window:
+        if d_min is not None:
+            d_mask = d_mask & (delay_ms >= d_min)
+        if d_max is not None:
+            d_mask = d_mask & (delay_ms <= d_max)
     selected_bins = delay_order[d_mask]
     delay_plot = delay_ms[d_mask]
     if selected_bins.size == 0:
@@ -344,14 +430,6 @@ def plot_dechirp_streaming(
             f"for sweep_frequency={prf:g} Hz "
             f"(chirp period={(1.0 / prf) * 1e3:.3f} ms)."
         )
-
-    reference_chirp = lfm_config.waveform.astype(iq.dtype)
-    w = window_from_arg(chirp_len, dechirp_window).astype(np.float32, copy=False)
-    coherent_gain = np.mean(w)
-    if coherent_gain == 0:
-        raise ValueError(f"Window '{dechirp_window}' has zero coherent gain")
-
-    num_groups = num_chirps // navg
     power = np.empty((num_groups, selected_bins.size), dtype=np.float32)
 
     for group_idx in range(num_groups):
@@ -366,6 +444,27 @@ def plot_dechirp_streaming(
         power[group_idx] = acc / navg
 
     power_db = 10.0 * np.log10(power + 1e-12)
+    d_min, d_max, strongest_delay_ms = _auto_delay_bounds(
+        delay_plot,
+        power_db,
+        d_min,
+        d_max,
+    )
+    if auto_delay_window:
+        d_mask = np.ones_like(delay_plot, dtype=bool)
+        if d_min is not None:
+            d_mask = d_mask & (delay_plot >= d_min)
+        if d_max is not None:
+            d_mask = d_mask & (delay_plot <= d_max)
+        delay_plot = delay_plot[d_mask]
+        power_db = power_db[:, d_mask]
+        if delay_plot.size == 0:
+            raise ValueError(
+                "No dechirp delay bins selected; check --d-min/--d-max. "
+                f"Available delay range is {delay_ms.min():.3f} to {delay_ms.max():.3f} ms "
+                f"for sweep_frequency={prf:g} Hz "
+                f"(chirp period={(1.0 / prf) * 1e3:.3f} ms)."
+            )
     slow_time = tstart + np.arange(num_groups) * navg / prf
 
     plt.figure(figsize=(10, 6))
@@ -375,6 +474,9 @@ def plot_dechirp_streaming(
     plt.xlabel("Time [s]")
     plt.title(title)
     plt.colorbar(label="Power [dB]")
+    if strongest_delay_ms is not None:
+        _add_lower_left_note(f"Strongest delay bin: {strongest_delay_ms:.3f} ms")
+    _add_corner_note(corner_note)
     plt.tight_layout()
 
     if output_file:
@@ -406,6 +508,7 @@ def plot_delay_doppler_mf(
     d_max: float = None,
     d_min: float = None,
     interactive: bool = False,
+    corner_note: str = None,
 ):
     """
     MF-based DD:
@@ -476,6 +579,13 @@ def plot_delay_doppler_mf(
     # Delay axis from delay samples 
     delay_s = ((np.arange(delay_len) - delay_len // 2) / fs) 
     delay_ms = delay_s * 1e3
+    auto_delay_window = d_min is None and d_max is None
+    d_min, d_max, strongest_delay_ms = _auto_delay_bounds(
+        delay_ms,
+        power_db,
+        d_min,
+        d_max,
+    )
 
     # Apply delay mask
     d_mask = np.ones_like(delay_ms, dtype=bool)
@@ -485,9 +595,6 @@ def plot_delay_doppler_mf(
 
     if d_min is not None:
         d_mask = d_mask & (delay_ms >= d_min)
-
-    d_plot = delay_ms[d_mask]
-    power_db = power_db[:, d_mask]
 
     # Optional Doppler zoom
     if fd_max is not None or fd_min is not None:
@@ -503,6 +610,13 @@ def plot_delay_doppler_mf(
 
     d_plot = delay_ms[d_mask]
     power_db = power_db[:, d_mask]
+    if d_plot.size == 0:
+        raise ValueError(
+            "No delay bins selected; check --d-min/--d-max. "
+            f"Available delay range is {delay_ms.min():.3f} to {delay_ms.max():.3f} ms."
+        )
+    if not auto_delay_window:
+        strongest_delay_ms = _strongest_delay_bin_ms(power_db, d_plot)
 
     plt.figure(figsize=(10, 6))
     plt.pcolormesh(fd_plot, d_plot, power_db.T, shading="nearest", cmap="inferno", vmin=vmin, vmax=vmax)
@@ -510,6 +624,9 @@ def plot_delay_doppler_mf(
     plt.ylabel("Delay [ms]")
     plt.title(title)
     plt.colorbar(label="Power [dB]")
+    if strongest_delay_ms is not None:
+        _add_lower_left_note(f"Strongest delay bin: {strongest_delay_ms:.3f} ms")
+    _add_corner_note(corner_note)
     plt.tight_layout()
     if output_file:
         # Expand the ~ if it exists
@@ -543,6 +660,7 @@ def plot_delay_doppler_dechirp(
     d_min: float = None,
     interactive: bool = False,
     positive_delay_axis: bool = True,
+    corner_note: str = None,
 ):
     B = lfm_config.bandwidth
     fs = lfm_config.sample_rate
@@ -589,6 +707,13 @@ def plot_delay_doppler_dechirp(
     delay_order = np.argsort(delay_ms)
     delay_ms = delay_ms[delay_order]
     power_db = power_db[:, delay_order]
+    auto_delay_window = d_min is None and d_max is None
+    d_min, d_max, strongest_delay_ms = _auto_delay_bounds(
+        delay_ms,
+        power_db,
+        d_min,
+        d_max,
+    )
 
     # Apply delay mask
     d_mask = np.ones_like(delay_ms, dtype=bool)
@@ -601,6 +726,13 @@ def plot_delay_doppler_dechirp(
 
     d_plot = delay_ms[d_mask]
     power_db = power_db[:, d_mask]
+    if d_plot.size == 0:
+        raise ValueError(
+            "No delay bins selected; check --d-min/--d-max. "
+            f"Available delay range is {delay_ms.min():.3f} to {delay_ms.max():.3f} ms."
+        )
+    if not auto_delay_window:
+        strongest_delay_ms = _strongest_delay_bin_ms(power_db, d_plot)
 
     # Optional Doppler zoom
     if fd_max is not None or fd_min is not None:
@@ -620,6 +752,9 @@ def plot_delay_doppler_dechirp(
     plt.ylabel("Delay [ms]")
     plt.title(title)
     plt.colorbar(label="Power [dB]")
+    if strongest_delay_ms is not None:
+        _add_lower_left_note(f"Strongest delay bin: {strongest_delay_ms:.3f} ms")
+    _add_corner_note(corner_note)
     plt.tight_layout()
     if output_file:
         # Expand the ~ if it exists
@@ -633,6 +768,141 @@ def plot_delay_doppler_dechirp(
         plt.savefig(full_path, dpi=300)
         if interactive == True:
             plt.show()
+        plt.close()
+    else:
+        plt.show()
+
+
+def plot_doppler_time_from_delay_band(
+    dechirp_spectra: np.ndarray,
+    lfm_config,
+    title: str,
+    output_file: str = None,
+    vmin: float = None,
+    vmax: float = None,
+    d_min: float = None,
+    d_max: float = None,
+    fd_min: float = None,
+    fd_max: float = None,
+    integration_time: float = 60.0,
+    hop_time: float = 10.0,
+    slow_window: str = "hann",
+    nfft_doppler: int = None,
+    combine: str = "incoherent",
+    tstart: float = 0.0,
+    selected_delay_ms: np.ndarray = None,
+    corner_note: str = None,
+):
+    prf = lfm_config.sweep_frequency
+    if dechirp_spectra.ndim != 2:
+        raise ValueError("dechirp_spectra must be 2D: (num_chirps, n_bins)")
+    if d_min is None or d_max is None:
+        raise ValueError("Both --d-min and --d-max are required for Doppler-vs-time plots")
+    if integration_time <= 0 or hop_time <= 0:
+        raise ValueError("--integration-time and --hop-time must be > 0")
+    if combine not in ("incoherent", "coherent", "peak"):
+        raise ValueError("--combine must be one of: incoherent, coherent, peak")
+
+    num_chirps, n_bins = dechirp_spectra.shape
+
+    if selected_delay_ms is None:
+        B = lfm_config.bandwidth
+        fs = lfm_config.sample_rate
+        T = 1.0 / prf
+        k = B / T
+        if k == 0:
+            raise ValueError("Cannot convert dechirp beat frequency to delay when bandwidth is zero")
+
+        fb = np.fft.fftshift(np.fft.fftfreq(n_bins, d=1.0 / fs))
+        delay_ms = np.mod(-fb / k * 1e3, T * 1e3)
+        delay_order = np.argsort(delay_ms)
+        delay_ms = delay_ms[delay_order]
+        spectra = dechirp_spectra[:, delay_order]
+
+        d_mask = (delay_ms >= d_min) & (delay_ms <= d_max)
+        selected_delays = delay_ms[d_mask]
+        if selected_delays.size == 0:
+            raise ValueError(
+                "No delay bins selected; check --d-min/--d-max. "
+                f"Available delay range is {delay_ms.min():.3f} to {delay_ms.max():.3f} ms."
+            )
+        band = spectra[:, d_mask]
+    else:
+        selected_delays = np.asarray(selected_delay_ms)
+        if selected_delays.ndim != 1 or selected_delays.size != n_bins:
+            raise ValueError("selected_delay_ms must be 1D and match dechirp_spectra.shape[1]")
+        band = dechirp_spectra
+
+    window_len = int(round(integration_time * prf))
+    hop_len = int(round(hop_time * prf))
+    if window_len < 1:
+        raise ValueError("--integration-time is shorter than one sweep")
+    if hop_len < 1:
+        raise ValueError("--hop-time is shorter than one sweep")
+    if num_chirps < window_len:
+        raise ValueError(
+            f"Not enough sweeps for integration_time={integration_time:g}s "
+            f"({num_chirps} available, {window_len} needed)"
+        )
+
+    if nfft_doppler is None:
+        nfft_doppler = 1 << int(np.ceil(np.log2(max(window_len, 1))))
+
+    w = window_from_arg(window_len, slow_window).astype(np.float32, copy=False)
+    coherent_gain = np.mean(w)
+    if coherent_gain == 0:
+        raise ValueError(f"Slow-time window '{slow_window}' has zero coherent gain")
+
+    frame_starts = np.arange(0, num_chirps - window_len + 1, hop_len, dtype=int)
+    fd = np.fft.fftshift(np.fft.fftfreq(nfft_doppler, d=1.0 / prf))
+
+    power = np.empty((len(frame_starts), len(fd)), dtype=np.float32)
+    for frame_idx, start in enumerate(frame_starts):
+        x = band[start:start + window_len, :]
+        xw = x * (w[:, None] / coherent_gain)
+        X = np.fft.fftshift(np.fft.fft(xw, n=nfft_doppler, axis=0), axes=0)
+        bin_power = np.abs(X) ** 2
+
+        if combine == "incoherent":
+            power[frame_idx] = np.mean(bin_power, axis=1)
+        elif combine == "coherent":
+            coherent = np.sum(X, axis=1)
+            power[frame_idx] = np.abs(coherent) ** 2 / X.shape[1]
+        else:
+            strongest_bin = int(np.argmax(np.mean(np.abs(x) ** 2, axis=0)))
+            power[frame_idx] = bin_power[:, strongest_bin]
+
+    power_db = 10.0 * np.log10(power + 1e-12)
+    time_plot = tstart + (frame_starts + window_len / 2.0) / prf
+
+    fd_mask = np.ones_like(fd, dtype=bool)
+    if fd_min is not None:
+        fd_mask &= fd >= fd_min
+    if fd_max is not None:
+        fd_mask &= fd <= fd_max
+    fd_plot = fd[fd_mask]
+    power_db = power_db[:, fd_mask]
+
+    plt.figure(figsize=(10, 6))
+    plt.pcolormesh(time_plot, fd_plot, power_db.T, shading="nearest",
+                   cmap="inferno", vmin=vmin, vmax=vmax)
+    plt.xlabel("Time [s]")
+    plt.ylabel("Doppler Frequency [Hz]")
+    plt.title(
+        f"{title}\n"
+        f"Delay band {selected_delays.min():.3f}-{selected_delays.max():.3f} ms, "
+        f"{selected_delays.size} bins, {combine} combine"
+    )
+    plt.colorbar(label="Power [dB]")
+    _add_corner_note(corner_note)
+    plt.tight_layout()
+
+    if output_file:
+        full_path = os.path.expanduser(output_file)
+        output_dir = os.path.dirname(full_path)
+        if output_dir and not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        plt.savefig(full_path, dpi=300)
         plt.close()
     else:
         plt.show()
@@ -655,7 +925,7 @@ def delay_doppler_process_window(iq_chunk, frame_idx, args, lfm_config, timestam
             complex_response=complex_response,
             lfm_config=lfm_config,
             window_width=getattr(args, "window_width", getattr(args, "window", None)),
-            title=f"{args.title} | {timestamps}" if timestamps else args.title,
+            title=args.title,
             output_file=output_file,
             vmin=args.vmin,
             vmax=args.vmax,
@@ -667,6 +937,7 @@ def delay_doppler_process_window(iq_chunk, frame_idx, args, lfm_config, timestam
             d_max=args.d_max,
             d_min=args.d_min,
             interactive=interactive,
+            corner_note=timestamps,
         )
 
     else:
@@ -686,7 +957,7 @@ def delay_doppler_process_window(iq_chunk, frame_idx, args, lfm_config, timestam
         plot_delay_doppler_dechirp(
             dechirp_spectra=complex_spectra,
             lfm_config=lfm_config,
-            title=f"{args.title} | {timestamps}" if timestamps else args.title,
+            title=args.title,
             output_file=output_file,
             vmin=args.vmin,
             vmax=args.vmax,
@@ -698,6 +969,7 @@ def delay_doppler_process_window(iq_chunk, frame_idx, args, lfm_config, timestam
             d_min=args.d_min,
             interactive=interactive,
             positive_delay_axis=True,
+            corner_note=timestamps,
         )
 
 
