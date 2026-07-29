@@ -101,6 +101,14 @@ def _add_corner_note(corner_note: str = None):
         bbox={"facecolor": "white", "alpha": 0.72, "edgecolor": "none", "pad": 3},
     )
 
+def _savefig(out_png: str, dpi=150):
+    full_path = os.path.expanduser(out_png)
+    output_dir = os.path.dirname(full_path)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    plt.savefig(full_path, dpi=dpi)
+    return full_path
+
 def best_freq_units(freq_hz: np.ndarray):
     """Return (freq_scaled, units) where units is Hz/kHz/MHz/GHz."""
     mx = float(np.max(np.abs(freq_hz))) if freq_hz.size else 1.0
@@ -131,13 +139,50 @@ def lsl_print_metadata(idf: TBNFile):
     fs = idf.get_info("sample_rate")
     beginDate = idf.get_info("start_time").datetime
     central_freq = idf.get_info("freq1")
+    usable_duration = tbn_usable_duration(idf)
     print("=== LSL metadata ===")
     print(f"Opened as: {type(idf)}")
     print(f"Start time: {beginDate}")
     print(f"Sample rate: {fs} Hz")
     print(f"Tuning frequency (freq1): {central_freq:.3f} Hz")
     print(f"Frames in file: {nFramesFile}")
+    print(f"Usable duration: {usable_duration:.3f} seconds")
     print("====================")
+
+def tbn_antpol_count(idf: TBNFile, default: int = 520) -> int:
+    """
+    Return the number of ant/pol frame streams interleaved in the TBN file.
+
+    LWA TBN captures typically have 260 stands x 2 pols = 520 antpol streams.
+    LSL's nframe metadata counts raw TBN frames across all antpol streams, while
+    each frame contributes 512 samples to one stream.  Therefore one stream's
+    usable duration is nframe * 512 / (sample_rate * n_antpol).
+    """
+    try:
+        n_antpol = idf.get_info("nantenna")
+    except Exception:
+        n_antpol = None
+    if n_antpol is not None:
+        n_antpol = int(n_antpol)
+        if n_antpol > 0:
+            return n_antpol
+    return default
+
+def tbn_usable_duration(idf: TBNFile) -> float:
+    n_frames_file = float(idf.get_info("nframe"))
+    fs = float(idf.get_info("sample_rate"))
+    n_antpol = float(tbn_antpol_count(idf))
+    frames_per_stream = np.floor(n_frames_file / n_antpol)
+    return frames_per_stream * 512.0 / fs
+
+def set_default_tbn_time_bounds(args, idf: TBNFile):
+    if args.tstart is None:
+        args.tstart = 0.0
+        print("No --tstart provided, starting from beginning of file")
+    if args.tend is None:
+        args.tend = tbn_usable_duration(idf)
+        print(f"No --tend provided, using end time of file: {args.tend:.2f} seconds")
+    return args.tstart, args.tend
 
 def lsl_read_block_for_one_stream(idf: TBNFile, start_time, duration, stand_id=None, pol=None):
     """
@@ -167,6 +212,7 @@ def lsl_read_block_for_one_stream(idf: TBNFile, start_time, duration, stand_id=N
 
     xs = []
     got = 0.0
+    read_elapsed = 0.0
     antpols_seen = None
     chunk = 1
     start_timestamp = None
@@ -189,7 +235,7 @@ def lsl_read_block_for_one_stream(idf: TBNFile, start_time, duration, stand_id=N
             else:
                 observed_elapsed = _timestamp_delta_seconds(start_timestamp, first_timestamp)
                 if observed_elapsed is not None:
-                    timestamp_gap = observed_elapsed - got
+                    timestamp_gap = observed_elapsed - read_elapsed
                     if timestamp_gap > timestamp_gap_tolerance:
                         gap_seconds = min(timestamp_gap, target_seconds - got)
                         gap_samples = int(round(gap_seconds * fs))
@@ -258,7 +304,9 @@ def lsl_read_block_for_one_stream(idf: TBNFile, start_time, duration, stand_id=N
         del data # free memory immediately
 
         chunk += 1
-        got += keep_samples / fs
+        read_seconds = keep_samples / fs
+        got += read_seconds
+        read_elapsed += read_seconds
 
         if readT <= 0:
             break
@@ -317,7 +365,7 @@ def plot_averaged_spectrum(freq_hz: np.ndarray, psd_linear: np.ndarray, center_f
     _add_corner_note(corner_note)
     plt.tight_layout()
     if out_png:
-        plt.savefig(out_png, dpi=150)
+        _savefig(out_png, dpi=150)
     plt.show()
 
 

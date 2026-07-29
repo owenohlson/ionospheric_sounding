@@ -22,7 +22,7 @@ def main():
     parser.add_argument("--bandwidth", type=float, default=100e3, help="LFM sweep bandwidth in Hz")
 
     # Optional arguments
-    parser.add_argument("--title", type=str, default="Stretch-Processed Range-Time Plot", help="Plot title")
+    parser.add_argument("--title", type=str, default=None, help="Plot title")
     parser.add_argument("--output", type=str, default=None,
                         help="Output image file path, displays the plot without saving if omitted")
     parser.add_argument("--vmin", type=float, default=None, help="Minimum dB scale (Auto scales if not provided)")
@@ -82,6 +82,19 @@ def main():
         reference_gate_duty=args.reference_gate_duty,
         reference_gate_phase=args.reference_gate_phase,
     )
+    if args.title is None:
+        args.title = os.path.basename(args.output) if args.output else "Dechirp Plot"
+    dechirp_window = None if args.dechirp_window == "none" else args.dechirp_window
+    info_rows = [
+        ("File", os.path.basename(args.input_file)),
+        ("Sample rate", f"{fs / 1e3:.3f} kHz"),
+        ("Plot span", f"{args.tstart:.3f}-{args.tend:.3f} s"),
+        ("Duration", f"{args.tend - args.tstart:.3f} s"),
+        ("Navg", str(args.navg)),
+        ("Dechirp window", args.dechirp_window),
+    ]
+    if args.d_min is not None or args.d_max is not None:
+        info_rows.append(("Delay limits", f"{args.d_min} to {args.d_max} ms"))
 
     if args.streaming or args.d_min is not None or args.d_max is not None:
         plot_dechirp_streaming(
@@ -94,14 +107,15 @@ def main():
             navg=args.navg,
             d_min=args.d_min,
             d_max=args.d_max,
-            dechirp_window=None if args.dechirp_window == "none" else args.dechirp_window,
+            dechirp_window=dechirp_window,
             tstart=args.tstart,
+            info_rows=info_rows,
         )
     else:
         dechirp_mag_out, _ = dechirp_fft_complex(
             iq,
             lfm_config,
-            window=None if args.dechirp_window == "none" else args.dechirp_window,
+            window=dechirp_window,
         )
 
         plot_dechirp(
@@ -113,6 +127,7 @@ def main():
             save_path=args.output,
             navg=args.navg,
             tstart=args.tstart,
+            info_rows=info_rows,
         )
 
 

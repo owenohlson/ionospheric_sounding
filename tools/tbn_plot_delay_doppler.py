@@ -3,7 +3,13 @@
 import argparse
 
 from lfm_utils import LFMWaveform, lfm_matched_filtering, dechirp_fft_complex, reference_gate_frequency_from_args
-from tbn_utils import lsl_open_tbn, lsl_print_metadata, lsl_read_block_for_one_stream, timestamp_range_note
+from tbn_utils import (
+    lsl_open_tbn,
+    lsl_print_metadata,
+    lsl_read_block_for_one_stream,
+    set_default_tbn_time_bounds,
+    timestamp_range_note,
+)
 from plotting_utils import plot_delay_doppler_mf, plot_delay_doppler_dechirp
 
 
@@ -76,13 +82,7 @@ def main():
     fs = float(idf.get_info("sample_rate"))
     # fc = float(idf.get_info("freq1"))
 
-    if args.tstart is None:
-        args.tstart = 0.0
-        print(f"No --tstart provided, starting from beginning of file")
-    if args.tend is None:
-        nFramesFile = idf.get_info("nframe")
-        args.tend = nFramesFile / fs
-        print(f"No --tend provided, using end time of file: {args.tend:.2f} seconds")
+    set_default_tbn_time_bounds(args, idf)
 
     duration = args.tend - args.tstart
 

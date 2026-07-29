@@ -1,6 +1,7 @@
 # tbn_dechirp_plot.py
 
 import argparse
+import os
 
 from lfm_utils import (
     LFMWaveform,
@@ -16,6 +17,7 @@ from tbn_utils import (
     lsl_open_tbn,
     lsl_print_metadata,
     lsl_read_block_for_one_stream,
+    set_default_tbn_time_bounds,
     timestamp_range_note,
 )
 
@@ -72,14 +74,9 @@ def main():
     lsl_print_metadata(idf)
 
     fs = float(idf.get_info("sample_rate"))
+    fc = float(idf.get_info("freq1"))
 
-    if args.tstart is None:
-        args.tstart = 0.0
-        print("No --tstart provided, starting from beginning of file")
-    if args.tend is None:
-        nFramesFile = idf.get_info("nframe")
-        args.tend = nFramesFile / fs
-        print(f"No --tend provided, using end time of file: {args.tend:.2f} seconds")
+    set_default_tbn_time_bounds(args, idf)
 
     duration = args.tend - args.tstart
 
@@ -110,14 +107,25 @@ def main():
         )
 
     if args.title is None:
-        args.title = (
-            f"Dechirp Plot [fs={round(fs/1000, 3)} kHz, "
-            f"BW={round(args.bandwidth/1e3, 3)} kHz, "
-            f"sweep_freq={round(args.sweep_frequency, 3)} Hz, "
-            f"stand={args.stand}, pol={args.pol}]"
-        )
+        args.title = os.path.basename(args.output) if args.output else "Dechirp Plot"
 
     dechirp_window = None if args.dechirp_window == "none" else args.dechirp_window
+    file_start = idf.get_info("start_time")
+    info_rows = [
+        ("File", os.path.basename(args.filename)),
+        ("Sample rate", f"{fs / 1e3:.3f} kHz"),
+        ("Tuning freq", f"{fc / 1e6:.6f} MHz"),
+        ("Stand/pol", f"{args.stand}/{args.pol}"),
+        ("Plot span", f"{args.tstart:.3f}-{args.tend:.3f} s"),
+        ("Duration", f"{duration:.3f} s"),
+        ("Navg", str(args.navg)),
+        ("Dechirp window", args.dechirp_window),
+        ("Timestamp align", "no" if args.no_timestamp_align else "yes"),
+    ]
+    if file_start is not None:
+        info_rows.insert(1, ("File start", str(getattr(file_start, "datetime", file_start))))
+    if args.d_min is not None or args.d_max is not None:
+        info_rows.append(("Delay limits", f"{args.d_min} to {args.d_max} ms"))
 
     if args.streaming or args.d_min is not None or args.d_max is not None:
         plot_dechirp_streaming(
@@ -134,6 +142,7 @@ def main():
             tstart=args.tstart,
             start_offset_samples=start_offset_samples,
             corner_note=corner_note,
+            info_rows=info_rows,
         )
     else:
         dechirp_mag_out, _ = dechirp_fft_complex(
@@ -153,6 +162,7 @@ def main():
             navg=args.navg,
             tstart=args.tstart,
             corner_note=corner_note,
+            info_rows=info_rows,
         )
 
 

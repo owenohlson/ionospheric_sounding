@@ -1,7 +1,13 @@
 # tbn_plot_filter_output.py
 
 import argparse
-from tbn_utils import lsl_open_tbn, lsl_print_metadata, lsl_read_block_for_one_stream, timestamp_range_note
+from tbn_utils import (
+    lsl_open_tbn,
+    lsl_print_metadata,
+    lsl_read_block_for_one_stream,
+    set_default_tbn_time_bounds,
+    timestamp_range_note,
+)
 from plotting_utils import plot_matched_filter_output
 from lfm_utils import LFMWaveform, lfm_matched_filtering
 
@@ -41,13 +47,7 @@ def main():
     fs = float(idf.get_info("sample_rate"))
     center_freq = float(idf.get_info("freq1"))
 
-    if args.tstart is None:
-        args.tstart = 0.0
-        print(f"No --tstart provided, starting from beginning of file")
-    if args.tend is None:
-        nFramesFile = idf.get_info("nframe")
-        args.tend = nFramesFile / fs
-        print(f"No --tend provided, using end time of file: {args.tend:.2f} seconds")
+    set_default_tbn_time_bounds(args, idf)
 
     duration = args.tend - args.tstart
 
