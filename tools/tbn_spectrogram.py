@@ -4,6 +4,7 @@ import argparse
 import os
 from tbn_utils import (
     file_timestamp_range_note,
+    gap_fill_note,
     lsl_average_spectrum_all_antpols,
     lsl_open_tbn,
     lsl_print_metadata,
@@ -37,6 +38,8 @@ def main():
     parser.add_argument("--vmax", type=float, default=None, help="Maximum dB scale (Auto scales if not provided)")
     parser.add_argument("--tstart", type=float, default=None)
     parser.add_argument("--tend", type=float, default=None)
+    parser.add_argument("--gap-fill", choices=["nan", "zero"], default="nan",
+                        help="Fill TBN timetag gaps with NaNs for blank/corrupt regions or zeros for continuity")
     parser.add_argument("-w", "--window", choices=["none", "bartlett", "blackman", "hanning", "hann"], default="hann",
                     help="window function for LSL spectrum path")
     parser.add_argument("--title", type=str, default=None, help="Plot title (optional)")
@@ -86,7 +89,16 @@ def main():
         plot_averaged_spectrum(freq, spec_avg, center_freq_hz=fc, out_png=args.output, corner_note=corner_note)
         return
 
-    x, start_timestamp = lsl_read_block_for_one_stream(idf, args.tstart, duration, stand_id=args.stand, pol=args.pol)
+    x, start_timestamp, gap_info = lsl_read_block_for_one_stream(
+        idf,
+        args.tstart,
+        duration,
+        stand_id=args.stand,
+        pol=args.pol,
+        gap_fill=args.gap_fill,
+        return_gap_info=True,
+    )
+    footer_note = gap_fill_note(gap_info)
     corner_note = timestamp_range_note(start_timestamp, len(x) / fs)
 
     if args.title is None:
@@ -102,6 +114,7 @@ def main():
         ("Duration", f"{duration:.3f} s"),
         ("Window", f"{args.window_size} samples"),
         ("Hop", f"{args.hop_size} samples"),
+        ("Gap fill", args.gap_fill),
     ]
     if file_start is not None:
         info_rows.insert(1, ("File start", str(getattr(file_start, "datetime", file_start))))
@@ -130,6 +143,7 @@ def main():
         lfm_overlay_gate_duty=args.lfm_overlay_gate_duty,
         lfm_overlay_gate_phase=args.lfm_overlay_gate_phase,
         info_rows=info_rows,
+        info_panel_footer_note=footer_note,
     )
 
 if __name__ == "__main__":

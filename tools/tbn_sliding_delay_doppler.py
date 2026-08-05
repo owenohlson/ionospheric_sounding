@@ -12,6 +12,7 @@ from tbn_utils import (
     lsl_open_tbn,
     lsl_print_metadata,
     lsl_read_block_for_one_stream,
+    gap_fill_note,
     set_default_tbn_time_bounds,
     timestamp_range_note,
 )
@@ -42,10 +43,6 @@ def main():
     parser.add_argument("--sweep-frequency", type=float, required=True, help="Sweep repetition rate / PRF (Hz)")
     parser.add_argument("--bandwidth", type=float, default=100e3, help="Chirp bandwidth (Hz)")
 
-    # Delay processing method
-    parser.add_argument("--method", type=str, default="dechirp", choices=["mf", "dechirp"],
-                        help="Delay processing method")
-
     # Plotting parameters
     parser.add_argument("--title", type=str, default="Delay-Doppler Video", help="Video title")
     parser.add_argument("--output", type=str, default=None, help="Save path (omit to just display)")
@@ -64,14 +61,11 @@ def main():
                         help="Min delay to display (ms)")
     parser.add_argument("--offset", type=float, default=0.0,
                         help="Timestamp mode: sweep start offset in seconds after each integer-second boundary")
+    parser.add_argument("--gap-fill", choices=["nan", "zero"], default="nan",
+                        help="Fill TBN timetag gaps with NaNs for blank/corrupt regions or zeros for less disruptive videos")
     parser.add_argument("--interactive", type=bool, default=False, 
                         help="Whether to display each frame interactively")
 
-    # MF-only
-    parser.add_argument("--window-width", type=float, default=None, help="MF: fast-time window width (s)")
-    parser.add_argument("--window-center", type=float, default=None, help="MF: center time (s) for window")
-
-    # Dechirp-only
     parser.add_argument("--dechirp-window", type=str, default="hann",
                         choices=["hamming", "hann", "blackman", "cheb60", "cheb80", "cheb100", "cheb120", "none"])
     parser.add_argument("--reference-gate-frequency", type=float, default=None,
@@ -96,7 +90,8 @@ def main():
     lsl_print_metadata(idf)
 
     fs = float(idf.get_info("sample_rate"))
-    # fc = float(idf.get_info("freq1"))
+    fc = float(idf.get_info("freq1"))
+    args.tuning_frequency = fc
 
     set_default_tbn_time_bounds(args, idf)
 
@@ -126,7 +121,16 @@ def main():
         idf = lsl_open_tbn(args.input_file)  # reopen file for each frame to avoid memory leaks
 
         # Read a frame of IQ data for the current frame
-        iq_frame, start_timestamp = lsl_read_block_for_one_stream(idf, current_tstart, args.integration_time, args.stand, args.pol)
+        iq_frame, start_timestamp, gap_info = lsl_read_block_for_one_stream(
+            idf,
+            current_tstart,
+            args.integration_time,
+            args.stand,
+            args.pol,
+            gap_fill=args.gap_fill,
+            return_gap_info=True,
+        )
+        args.gap_fill_note = gap_fill_note(gap_info)
         # print("iq_frame shape:", iq_frame.shape, flush=True)
         # print("iq_frame GB:", iq_frame.nbytes / 1e9, flush=True)
 

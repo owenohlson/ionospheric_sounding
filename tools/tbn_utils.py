@@ -184,7 +184,35 @@ def set_default_tbn_time_bounds(args, idf: TBNFile):
         print(f"No --tend provided, using end time of file: {args.tend:.2f} seconds")
     return args.tstart, args.tend
 
-def lsl_read_block_for_one_stream(idf: TBNFile, start_time, duration, stand_id=None, pol=None):
+def _gap_fill_array(n_samples: int, gap_fill: str):
+    if gap_fill == "zero":
+        return np.zeros(n_samples, dtype=np.complex64)
+    if gap_fill == "nan":
+        return np.full(n_samples, np.nan + 1j * np.nan, dtype=np.complex64)
+    raise ValueError("--gap-fill must be 'nan' or 'zero'")
+
+
+def gap_fill_note(gap_info):
+    if not gap_info or int(gap_info.get("events", 0)) == 0:
+        return None
+    mode = str(gap_info.get("mode", "fill"))
+    events = int(gap_info.get("events", 0))
+    samples = int(gap_info.get("samples", 0))
+    fs = float(gap_info.get("sample_rate", 1.0))
+    seconds = samples / fs if fs > 0 else 0.0
+    fill_name = "Zeros" if mode == "zero" else "NaNs"
+    return f"* {fill_name} used to fill corrupted data/timetag gaps ({events} event(s), {seconds:.3f} s)."
+
+
+def lsl_read_block_for_one_stream(
+    idf: TBNFile,
+    start_time,
+    duration,
+    stand_id=None,
+    pol=None,
+    gap_fill="nan",
+    return_gap_info=False,
+):
     """
     Robustly read enough samples for a spectrogram from one stand/pol stream.
 
@@ -197,6 +225,8 @@ def lsl_read_block_for_one_stream(idf: TBNFile, start_time, duration, stand_id=N
     stream_index = 2 * (int(stand_id) - 1) + pol_idx
     if stream_index < 0:
         raise ValueError("Invalid --stand/--pol combination (negative index)")
+    if gap_fill not in ("nan", "zero"):
+        raise ValueError("--gap-fill must be 'nan' or 'zero'")
 
     # Position reader
     idf.offset(start_time)
@@ -212,12 +242,18 @@ def lsl_read_block_for_one_stream(idf: TBNFile, start_time, duration, stand_id=N
 
     xs = []
     got = 0.0
-    read_elapsed = 0.0
+    timeline_elapsed = 0.0
     antpols_seen = None
     chunk = 1
     start_timestamp = None
     first_timestamp = None
     first_requested_timestamp = None
+    gap_info = {
+        "mode": gap_fill,
+        "events": 0,
+        "samples": 0,
+        "sample_rate": fs,
+    }
 
     # print(f"Memory usage before reading: ", flush=True)
     # mem()
@@ -235,19 +271,23 @@ def lsl_read_block_for_one_stream(idf: TBNFile, start_time, duration, stand_id=N
             else:
                 observed_elapsed = _timestamp_delta_seconds(start_timestamp, first_timestamp)
                 if observed_elapsed is not None:
-                    timestamp_gap = observed_elapsed - read_elapsed
+                    timestamp_gap = observed_elapsed - timeline_elapsed
                     if timestamp_gap > timestamp_gap_tolerance:
                         gap_seconds = min(timestamp_gap, target_seconds - got)
                         gap_samples = int(round(gap_seconds * fs))
                         if gap_samples > 0:
                             gap_timestamp = _timestamp_at(first_requested_timestamp, got)
                             _gap_warning(
-                                "Timestamp gap; inserting NaNs",
+                                f"Timestamp gap; inserting {gap_fill} fill",
                                 start_time + got,
                                 gap_timestamp,
                             )
-                            xs.append(np.full(gap_samples, np.nan + 1j * np.nan, dtype=np.complex64))
-                            got += gap_samples / fs
+                            xs.append(_gap_fill_array(gap_samples, gap_fill))
+                            gap_info["events"] += 1
+                            gap_info["samples"] += gap_samples
+                            gap_seconds = gap_samples / fs
+                            got += gap_seconds
+                            timeline_elapsed += gap_seconds
                     elif timestamp_gap < -timestamp_gap_tolerance:
                         _gap_warning(
                             "Timestamp discontinuity; keeping returned data",
@@ -273,13 +313,17 @@ def lsl_read_block_for_one_stream(idf: TBNFile, start_time, duration, stand_id=N
                 gap_samples = int(round(gap_seconds * fs))
                 gap_timestamp = _timestamp_at(first_requested_timestamp, got)
                 _gap_warning(
-                    "Invalid timetag skip; inserting NaNs",
+                    f"Invalid timetag skip; inserting {gap_fill} fill",
                     start_time + got,
                     gap_timestamp,
                 )
                 if gap_samples > 0:
-                    xs.append(np.full(gap_samples, np.nan + 1j * np.nan, dtype=np.complex64))
-                    got += gap_samples / fs
+                    xs.append(_gap_fill_array(gap_samples, gap_fill))
+                    gap_info["events"] += 1
+                    gap_info["samples"] += gap_samples
+                    gap_seconds = gap_samples / fs
+                    got += gap_seconds
+                    timeline_elapsed += gap_seconds
                 idf.offset(gap_seconds)
                 continue
             raise
@@ -298,24 +342,25 @@ def lsl_read_block_for_one_stream(idf: TBNFile, start_time, duration, stand_id=N
 
         xs.append(data[stream_index, :keep_samples].copy())
 
-        if len(xs) == 0:
-            return None
-
         del data # free memory immediately
 
         chunk += 1
         read_seconds = keep_samples / fs
         got += read_seconds
-        read_elapsed += read_seconds
+        timeline_elapsed += read_seconds
 
         if readT <= 0:
             break
 
     if len(xs) == 0:
+        if return_gap_info:
+            return None, first_timestamp, gap_info
         return None, first_timestamp
 
     x = np.concatenate(xs)
 
+    if return_gap_info:
+        return x, first_timestamp, gap_info
     return x, first_timestamp
 
 

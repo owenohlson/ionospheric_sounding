@@ -7,16 +7,13 @@ from lfm_utils import LFMWaveform, load_iq_audio, reference_gate_frequency_from_
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Plot a delay-Doppler (delay in milliseconds) map using MF or dechirp.",
+        description="Plot a dechirped delay-Doppler map with delay in milliseconds.",
         formatter_class=lambda prog: argparse.ArgumentDefaultsHelpFormatter(prog, max_help_position=35),
     )
 
     parser.add_argument("input_file", type=str, help="Path to the stereo IQ audio file (.wav, .flac)")
     parser.add_argument("--sweep-frequency", type=float, required=True, help="Sweep repetition rate / PRF (Hz)")
     parser.add_argument("--bandwidth", type=float, default=100e3, help="Chirp bandwidth (Hz)")
-
-    parser.add_argument("--method", type=str, default="dechirp", choices=["mf", "dechirp"],
-                        help="Delay processing method")
 
     parser.add_argument("--title", type=str, default="Delay-Doppler Map", help="Plot title")
     parser.add_argument("--output", type=str, default=None, help="Save path (omit to just display)")
@@ -39,11 +36,6 @@ def main():
     parser.add_argument("--interactive", type=bool, default=False, 
                         help="Whether to display the plot interactively")
 
-    # MF-only
-    parser.add_argument("--window", type=float, default=None, help="MF: fast-time window width (s)")
-    parser.add_argument("--window-center", type=float, default=None, help="MF: center time (s) for window")
-
-    # Dechirp-only
     parser.add_argument("--dechirp-window", type=str, default="hann",
                         choices=["hamming", "hann", "cheb60", "cheb80", "cheb100", "cheb120", "none"])
     parser.add_argument("--reference-gate-frequency", type=float, default=None,
@@ -83,7 +75,7 @@ def main():
         reference_gate_phase=args.reference_gate_phase,
     )
             
-    # Process and plot delay-Doppler map using the selected method
+    # Process and plot dechirped delay-Doppler map
     delay_doppler_process_window(
         iq_chunk=iq_chunk,
         frame_idx=None,

@@ -32,10 +32,6 @@ def main():
     parser.add_argument("--sweep-frequency", type=float, required=True, help="Sweep repetition rate / PRF (Hz)")
     parser.add_argument("--bandwidth", type=float, default=100e3, help="Chirp bandwidth (Hz)")
 
-    # Delay processing method
-    parser.add_argument("--method", type=str, default="dechirp", choices=["mf", "dechirp"],
-                        help="Delay processing method")
-
     # Plotting parameters
     parser.add_argument("--title", type=str, default="Delay-Doppler Video", help="Video title")
     parser.add_argument("--output", type=str, default=None, help="Save path (omit to just display)")
@@ -57,11 +53,6 @@ def main():
     parser.add_argument("--interactive", type=bool, default=False, 
                         help="Whether to display each frame interactively")
 
-    # MF-only
-    parser.add_argument("--window-width", type=float, default=None, help="MF: fast-time window width (s)")
-    parser.add_argument("--window-center", type=float, default=None, help="MF: center time (s) for window")
-
-    # Dechirp-only
     parser.add_argument("--dechirp-window", type=str, default="hann",
                         choices=["hamming", "hann", "cheb60", "cheb80", "cheb100", "cheb120", "none"])
     parser.add_argument("--reference-gate-frequency", type=float, default=None,

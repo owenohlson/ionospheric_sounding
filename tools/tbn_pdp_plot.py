@@ -1,7 +1,9 @@
 # tbn_pdp_plot.py
 
 import argparse
+import os
 from tbn_utils import (
+    gap_fill_note,
     lsl_open_tbn,
     lsl_print_metadata,
     lsl_read_block_for_one_stream,
@@ -37,6 +39,8 @@ def main():
     parser.add_argument("--tend", type=float, default=None)
     parser.add_argument("--navg", type=int, default=4, help="Number of sweeps to average before plotting")
     parser.add_argument("--window-center", type=float, default=None, help="The time to center the window around each sweep, automatically calculates if omitted")
+    parser.add_argument("--gap-fill", choices=["nan", "zero"], default="nan",
+                        help="Fill TBN timetag gaps with NaNs for blank/corrupt regions or zeros for continuity")
     parser.add_argument("--reference-gate-frequency", type=float, default=None,
                         help="Gate the reference chirp at this frequency in Hz")
     parser.add_argument("--reference-gate-period", type=float, default=None,
@@ -57,6 +61,7 @@ def main():
     lsl_print_metadata(idf)
 
     fs = float(idf.get_info("sample_rate"))
+    center_freq = float(idf.get_info("freq1"))
 
     set_default_tbn_time_bounds(args, idf)
 
@@ -72,13 +77,16 @@ def main():
         reference_gate_phase=args.reference_gate_phase,
     )
 
-    iq, start_timestamp = lsl_read_block_for_one_stream(
+    iq, start_timestamp, gap_info = lsl_read_block_for_one_stream(
         idf,
         args.tstart,
         duration,
         stand_id=args.stand,
         pol=args.pol,
+        gap_fill=args.gap_fill,
+        return_gap_info=True,
     )
+    footer_note = gap_fill_note(gap_info)
     corner_note = timestamp_range_note(start_timestamp, len(iq) / fs)
 
     # Compute matched filter on the requested time span.
@@ -102,6 +110,17 @@ def main():
         )
     print(delay_reference_note)
 
+    info_rows = [
+        ("File", os.path.basename(args.filename)),
+        ("Tuning freq", f"{center_freq / 1e6:.6f} MHz"),
+        ("Stand/pol", f"{args.stand}/{args.pol}"),
+        ("Plot span", f"{args.tstart:.3f}-{args.tend:.3f} s"),
+        ("Duration", f"{duration:.3f} s"),
+        ("Gap fill", args.gap_fill),
+    ]
+    if args.window_center is not None:
+        info_rows.append(("Window center", f"{args.window_center * 1e3:.3f} ms"))
+
     # Call plotting function
     plot_pdp(
         magnitude_response=magnitude_response,
@@ -117,6 +136,8 @@ def main():
         tcenter=args.window_center,
         delay_reference_note=delay_reference_note,
         corner_note=corner_note,
+        info_rows=info_rows,
+        info_panel_footer_note=footer_note,
     )
 
 if __name__ == "__main__":

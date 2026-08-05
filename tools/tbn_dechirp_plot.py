@@ -14,6 +14,7 @@ from plotting_utils import (
     plot_dechirp_streaming,
 )
 from tbn_utils import (
+    gap_fill_note,
     lsl_open_tbn,
     lsl_print_metadata,
     lsl_read_block_for_one_stream,
@@ -57,6 +58,8 @@ def main():
                         help="Fast-time dechirp FFT window")
     parser.add_argument("--offset", type=float, default=0.0,
                         help="Timestamp mode: sweep start offset in seconds after each integer-second boundary")
+    parser.add_argument("--gap-fill", choices=["nan", "zero"], default="nan",
+                        help="Fill TBN timetag gaps with NaNs for blank/corrupt regions or zeros for continuity")
     parser.add_argument("--no-timestamp-align", action="store_true",
                         help="Do not align dechirp chunks to timestamp second boundaries")
     parser.add_argument("--reference-gate-frequency", type=float, default=None,
@@ -89,13 +92,16 @@ def main():
         reference_gate_phase=args.reference_gate_phase,
     )
 
-    iq, start_timestamp = lsl_read_block_for_one_stream(
+    iq, start_timestamp, gap_info = lsl_read_block_for_one_stream(
         idf,
         args.tstart,
         duration,
         stand_id=args.stand,
         pol=args.pol,
+        gap_fill=args.gap_fill,
+        return_gap_info=True,
     )
+    footer_note = gap_fill_note(gap_info)
     corner_note = timestamp_range_note(start_timestamp, len(iq) / fs)
 
     start_offset_samples = 0
@@ -120,6 +126,7 @@ def main():
         ("Duration", f"{duration:.3f} s"),
         ("Navg", str(args.navg)),
         ("Dechirp window", args.dechirp_window),
+        ("Gap fill", args.gap_fill),
         ("Timestamp align", "no" if args.no_timestamp_align else "yes"),
     ]
     if file_start is not None:
@@ -143,6 +150,7 @@ def main():
             start_offset_samples=start_offset_samples,
             corner_note=corner_note,
             info_rows=info_rows,
+            info_panel_footer_note=footer_note,
         )
     else:
         dechirp_mag_out, _ = dechirp_fft_complex(
@@ -163,6 +171,7 @@ def main():
             tstart=args.tstart,
             corner_note=corner_note,
             info_rows=info_rows,
+            info_panel_footer_note=footer_note,
         )
 
 

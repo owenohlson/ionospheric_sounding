@@ -1,6 +1,7 @@
 # tbn_doppler_time_plot.py
 
 import argparse
+import os
 
 from lfm_utils import (
     LFMWaveform,
@@ -12,6 +13,7 @@ from plotting_utils import (
     plot_doppler_time_from_delay_band,
 )
 from tbn_utils import (
+    gap_fill_note,
     lsl_open_tbn,
     lsl_print_metadata,
     lsl_read_block_for_one_stream,
@@ -59,6 +61,8 @@ def main():
                         choices=["hamming", "hann", "blackman", "cheb60", "cheb80", "cheb100", "cheb120", "none"])
     parser.add_argument("--offset", type=float, default=0.0,
                         help="Timestamp mode: sweep start offset in seconds after each integer-second boundary")
+    parser.add_argument("--gap-fill", choices=["nan", "zero"], default="nan",
+                        help="Fill TBN timetag gaps with NaNs for blank/corrupt regions or zeros for continuity")
     parser.add_argument("--no-timestamp-align", action="store_true",
                         help="Do not align dechirp chunks to timestamp second boundaries")
     parser.add_argument("--reference-gate-frequency", type=float, default=None,
@@ -76,6 +80,7 @@ def main():
     lsl_print_metadata(idf)
 
     fs = float(idf.get_info("sample_rate"))
+    center_freq = float(idf.get_info("freq1"))
 
     set_default_tbn_time_bounds(args, idf)
 
@@ -90,13 +95,16 @@ def main():
         reference_gate_phase=args.reference_gate_phase,
     )
 
-    iq, start_timestamp = lsl_read_block_for_one_stream(
+    iq, start_timestamp, gap_info = lsl_read_block_for_one_stream(
         idf,
         args.tstart,
         duration,
         stand_id=args.stand,
         pol=args.pol,
+        gap_fill=args.gap_fill,
+        return_gap_info=True,
     )
+    footer_note = gap_fill_note(gap_info)
     corner_note = timestamp_range_note(start_timestamp, len(iq) / fs)
 
     start_offset_samples = 0
@@ -124,6 +132,17 @@ def main():
         start_offset_samples=start_offset_samples,
     )
 
+    info_rows = [
+        ("File", os.path.basename(args.filename)),
+        ("Tuning freq", f"{center_freq / 1e6:.6f} MHz"),
+        ("Stand/pol", f"{args.stand}/{args.pol}"),
+        ("Plot span", f"{args.tstart:.3f}-{args.tend:.3f} s"),
+        ("Duration", f"{duration:.3f} s"),
+        ("Gap fill", args.gap_fill),
+    ]
+    if not args.no_timestamp_align:
+        info_rows.append(("Sweep offset", f"{args.offset * 1e3:.3f} ms"))
+
     plot_doppler_time_from_delay_band(
         dechirp_spectra=complex_spectra,
         lfm_config=lfm_config,
@@ -143,6 +162,8 @@ def main():
         tstart=args.tstart + start_offset_samples / fs,
         selected_delay_ms=selected_delay_ms,
         corner_note=corner_note,
+        info_rows=info_rows,
+        info_panel_footer_note=footer_note,
     )
 
 

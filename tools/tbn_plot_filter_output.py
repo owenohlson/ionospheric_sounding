@@ -1,7 +1,9 @@
 # tbn_plot_filter_output.py
 
 import argparse
+import os
 from tbn_utils import (
+    gap_fill_note,
     lsl_open_tbn,
     lsl_print_metadata,
     lsl_read_block_for_one_stream,
@@ -32,6 +34,8 @@ def main():
     parser.add_argument("--title", type=str, default=None, help="Plot title")
     parser.add_argument("--tstart", type=float, default=None)
     parser.add_argument("--tend", type=float, default=None)
+    parser.add_argument("--gap-fill", choices=["nan", "zero"], default="nan",
+                        help="Fill TBN timetag gaps with NaNs for blank/corrupt regions or zeros for continuity")
     parser.add_argument("--units", choices=["s", "ms"], default="s", help="Time units on x-axis")
 
     # Output file
@@ -58,13 +62,16 @@ def main():
         bandwidth=args.bandwidth,
     )
 
-    x, start_timestamp = lsl_read_block_for_one_stream(
+    x, start_timestamp, gap_info = lsl_read_block_for_one_stream(
         idf,
         args.tstart,
         duration,
         stand_id=args.stand,
         pol=args.pol,
+        gap_fill=args.gap_fill,
+        return_gap_info=True,
     )
+    footer_note = gap_fill_note(gap_info)
     corner_note = timestamp_range_note(start_timestamp, len(x) / fs)
 
     # Compute matched filter
@@ -72,6 +79,15 @@ def main():
 
     if args.title is None:
         args.title = f"MF Output Plot [fs={round(fs/1000, 3)} kHz, fc={round(center_freq/1e6, 3)} MHz, stand={args.stand}, pol={args.pol}, BW={round(args.bandwidth/1e3, 3)} kHz, sweep_freq={round(args.sweep_frequency, 3)} Hz]"
+
+    info_rows = [
+        ("File", os.path.basename(args.filename)),
+        ("Tuning freq", f"{center_freq / 1e6:.6f} MHz"),
+        ("Stand/pol", f"{args.stand}/{args.pol}"),
+        ("Plot span", f"{args.tstart:.3f}-{args.tend:.3f} s"),
+        ("Duration", f"{duration:.3f} s"),
+        ("Gap fill", args.gap_fill),
+    ]
 
     # Plot matched filter output
     plot_matched_filter_output(
@@ -82,6 +98,8 @@ def main():
         output_file=args.output,
         time_units=args.units,
         corner_note=corner_note,
+        info_rows=info_rows,
+        info_panel_footer_note=footer_note,
     )
 
 if __name__ == "__main__":

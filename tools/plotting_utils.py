@@ -6,7 +6,7 @@ from scipy.signal import stft
 import os
 import textwrap
 
-from lfm_utils import LFMWaveform, dechirp_fft_complex, lfm_matched_filtering, window_from_arg
+from lfm_utils import LFMWaveform, dechirp_fft_complex, window_from_arg
 
 
 C_M_PER_S = 299_792_458.0
@@ -113,7 +113,14 @@ def _append_note_rows(rows, header, note):
     return rows
 
 
-def _add_info_panel(fig, info_rows=None, corner_note=None, lower_note=None, generated_lfm=False):
+def _add_info_panel(
+    fig,
+    info_rows=None,
+    corner_note=None,
+    lower_note=None,
+    generated_lfm=False,
+    footer_note=None,
+):
     rows = _normalize_info_rows(info_rows)
     rows = _append_note_rows(rows, "Metadata", corner_note)
     if lower_note or generated_lfm:
@@ -128,6 +135,17 @@ def _add_info_panel(fig, info_rows=None, corner_note=None, lower_note=None, gene
                 elif line.strip():
                     rows.append(("", line.strip()))
     if not rows:
+        if footer_note:
+            wrapped_footer = "\n".join(textwrap.wrap(str(footer_note), width=48) or [""])
+            fig.text(
+                INFO_PANEL_AX_RECT[0],
+                INFO_PANEL_AX_RECT[1] + INFO_PANEL_AX_RECT[3],
+                wrapped_footer,
+                ha="left",
+                va="top",
+                fontsize=7.5,
+                bbox={"facecolor": "white", "alpha": 0.72, "edgecolor": "none", "pad": 3},
+            )
         return
 
     ax_info = fig.add_axes(INFO_PANEL_AX_RECT)
@@ -143,6 +161,15 @@ def _add_info_panel(fig, info_rows=None, corner_note=None, lower_note=None, gene
                 "\n".join(textwrap.wrap(str(key), width=13) or [""]),
                 "\n".join(textwrap.wrap(str(value), width=32) or [""]),
             ])
+    row_count = len(table_data) + 1
+    if row_count > 24:
+        font_size = 6.4
+    elif row_count > 18:
+        font_size = 6.9
+    else:
+        font_size = 7.5
+    row_height = min(0.045, 0.9 / max(row_count, 1))
+
     table = ax_info.table(
         cellText=table_data,
         colLabels=["Parameter", "Value"],
@@ -152,9 +179,9 @@ def _add_info_panel(fig, info_rows=None, corner_note=None, lower_note=None, gene
         colWidths=[0.34, 0.66],
     )
     table.auto_set_font_size(False)
-    table.set_fontsize(7.5)
-    table.scale(1.0, 1.36)
+    table.set_fontsize(font_size)
     for (row, col), cell in table.get_celld().items():
+        cell.set_height(row_height)
         cell.set_linewidth(0.35)
         cell.set_edgecolor("#c9c9c9")
         if row == 0:
@@ -169,6 +196,21 @@ def _add_info_panel(fig, info_rows=None, corner_note=None, lower_note=None, gene
             cell.get_text().set_text("- - - -")
             cell.get_text().set_color(GENERATED_LFM_COLOR)
             cell.get_text().set_fontweight("bold")
+    if footer_note:
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        table_bbox = table.get_window_extent(renderer).transformed(fig.transFigure.inverted())
+        footer_y = max(0.015, table_bbox.y0 - 0.012)
+        wrapped_footer = "\n".join(textwrap.wrap(str(footer_note), width=48) or [""])
+        fig.text(
+            INFO_PANEL_AX_RECT[0],
+            footer_y,
+            wrapped_footer,
+            ha="left",
+            va="top",
+            fontsize=font_size,
+            bbox={"facecolor": "white", "alpha": 0.72, "edgecolor": "none", "pad": 3},
+        )
 
 
 def _new_figure_with_info(figsize=(14, 6)):
@@ -224,7 +266,7 @@ def _add_delay_range_xaxis(ax, label="Range [km]", two_way=True):
     return secax
 
 
-def _add_colorbar(fig, mappable, ax, label, pad=0.08):
+def _add_colorbar(fig, mappable, ax, label, pad=0.16):
     cbar = fig.colorbar(mappable, ax=ax, pad=pad)
     cbar.set_label(label)
     return cbar
@@ -241,6 +283,8 @@ def _savefig(output_file: str, dpi=300):
 
 def _strongest_delay_bin_ms(power, delay_ms):
     if power.size == 0 or delay_ms.size == 0:
+        return None
+    if not np.any(np.isfinite(power)):
         return None
     _, delay_idx = np.unravel_index(np.nanargmax(power), power.shape)
     return float(delay_ms[delay_idx])
@@ -708,7 +752,7 @@ def _overlay_lfm_estimate(ax, estimate, t_min, t_max):
         )
 
 
-def _auto_delay_bounds(delay_ms, power, d_min, d_max, half_width_ms=5.0, enabled=True):
+def _auto_delay_bounds(delay_ms, power, d_min, d_max, half_width_ms=1.5, enabled=True):
     strongest_delay_ms = _strongest_delay_bin_ms(power, delay_ms)
     if enabled and d_min is None and d_max is None and strongest_delay_ms is not None:
         d_min = max(float(np.min(delay_ms)), strongest_delay_ms - half_width_ms)
@@ -773,6 +817,7 @@ def plot_iq_spectrogram(
         lfm_overlay_gate_duty: float = None,
         lfm_overlay_gate_phase: float = None,
         info_rows=None,
+        info_panel_footer_note: str = None,
 ):
     """
     Plots a vertical STFT-based spectrogram of a complex IQ audio file.
@@ -827,7 +872,7 @@ def plot_iq_spectrogram(
 
     # Plot vertical spectrogram
     lower_note = _format_lfm_estimate_note(lfm_estimate) if lfm_estimate else None
-    has_info = bool(info_rows or corner_note or lower_note)
+    has_info = bool(info_rows or corner_note or lower_note or info_panel_footer_note)
     if has_info:
         fig, ax = _new_figure_with_info(figsize=(14, 6))
     else:
@@ -855,6 +900,7 @@ def plot_iq_spectrogram(
         corner_note=corner_note,
         lower_note=lower_note,
         generated_lfm=overlay_estimated_lfm,
+        footer_note=info_panel_footer_note,
     )
     _tight_layout_with_info(fig, has_info=has_info)
 
@@ -877,6 +923,7 @@ def plot_matched_filter_output(
         time_units: str = "s",
         corner_note: str = None,
         info_rows=None,
+        info_panel_footer_note: str = None,
 
 ):
     """
@@ -896,7 +943,7 @@ def plot_matched_filter_output(
     if time_units == "ms":
         time = time * 1000
 
-    has_info = bool(info_rows or corner_note)
+    has_info = bool(info_rows or corner_note or info_panel_footer_note)
     fig, ax = _new_figure_with_info(figsize=(14, 4.8)) if has_info else plt.subplots(figsize=(10, 4))
     ax.plot(time, magnitude_response)
     ax.grid(True)
@@ -912,7 +959,12 @@ def plot_matched_filter_output(
     ax.set_title(title)
     if time_units == "ms":
         _add_delay_range_xaxis(ax, label="Range [km]")
-    _add_info_panel(fig, info_rows=info_rows, corner_note=corner_note)
+    _add_info_panel(
+        fig,
+        info_rows=info_rows,
+        corner_note=corner_note,
+        footer_note=info_panel_footer_note,
+    )
     _tight_layout_with_info(fig, has_info=has_info)
     if output_file:
         _savefig(output_file, dpi=300)
@@ -936,6 +988,7 @@ def plot_pdp(magnitude_response: np.ndarray,
              delay_reference_note: str = None,
              corner_note: str = None,
              info_rows=None,
+             info_panel_footer_note: str = None,
 ):
     if tstart is not None:
         magnitude_response = magnitude_response[int(tstart * lfm_config.sample_rate):]
@@ -982,7 +1035,7 @@ def plot_pdp(magnitude_response: np.ndarray,
     slow_time = np.linspace(0, slow_time_len * navg / lfm_config.sweep_frequency, slow_time_len)
 
     rows = list(info_rows or []) + _lfm_info_rows(lfm_config)
-    has_info = bool(rows or corner_note or delay_reference_note)
+    has_info = bool(rows or corner_note or delay_reference_note or info_panel_footer_note)
     fig, ax = _new_figure_with_info(figsize=(14, 6)) if has_info else plt.subplots(figsize=(10, 6))
     pcm = ax.pcolormesh(slow_time, lag_time * 1e3, averaged.T, shading='nearest', cmap='inferno', vmin=vmin, vmax=vmax)
     ax.set_ylabel('Relative Time Delay [ms]')
@@ -990,7 +1043,13 @@ def plot_pdp(magnitude_response: np.ndarray,
     ax.set_title(title)
     _add_delay_range_axis(ax, label="Relative virtual range [km]")
     _add_colorbar(fig, pcm, ax, 'Power [dB]')
-    _add_info_panel(fig, info_rows=rows, corner_note=corner_note, lower_note=delay_reference_note)
+    _add_info_panel(
+        fig,
+        info_rows=rows,
+        corner_note=corner_note,
+        lower_note=delay_reference_note,
+        footer_note=info_panel_footer_note,
+    )
     _tight_layout_with_info(fig, has_info=has_info)
     if output_file:
         _savefig(output_file, dpi=300)
@@ -1013,6 +1072,7 @@ def plot_dechirp(stretch_result: np.ndarray,
                  corner_note: str = None,
                  auto_delay_window: bool = True,
                  info_rows=None,
+                 info_panel_footer_note: str = None,
 ):
     T = 1 / lfm_config.sweep_frequency
     k = lfm_config.bandwidth / T
@@ -1064,7 +1124,7 @@ def plot_dechirp(stretch_result: np.ndarray,
 
     rows = list(info_rows or []) + _lfm_info_rows(lfm_config)
     lower_note = _format_delay_peaks_note(power_db, time_delays, n=5)
-    has_info = bool(rows or corner_note or lower_note)
+    has_info = bool(rows or corner_note or lower_note or info_panel_footer_note)
     fig, ax = _new_figure_with_info(figsize=(14, 6)) if has_info else plt.subplots(figsize=(10, 6))
     pcm = ax.pcolormesh(slow_time, time_delays, power_db.T, shading='nearest', cmap='inferno', vmin=vmin, vmax=vmax)
     ax.set_ylabel('Delay [ms]')
@@ -1072,7 +1132,13 @@ def plot_dechirp(stretch_result: np.ndarray,
     ax.set_title(title)
     _add_delay_range_axis(ax)
     _add_colorbar(fig, pcm, ax, 'Power [dB]')
-    _add_info_panel(fig, info_rows=rows, corner_note=corner_note, lower_note=lower_note)
+    _add_info_panel(
+        fig,
+        info_rows=rows,
+        corner_note=corner_note,
+        lower_note=lower_note,
+        footer_note=info_panel_footer_note,
+    )
     _tight_layout_with_info(fig, has_info=has_info)
 
     if save_path:
@@ -1096,6 +1162,7 @@ def plot_dechirp_streaming(
         corner_note=None,
         auto_delay_window=True,
         info_rows=None,
+        info_panel_footer_note=None,
 ):
     chirp_len = lfm_config.sweep_length
     if start_offset_samples < 0:
@@ -1182,7 +1249,7 @@ def plot_dechirp_streaming(
 
     rows = list(info_rows or []) + _lfm_info_rows(lfm_config)
     lower_note = _format_delay_peaks_note(power_db, delay_plot, n=5)
-    has_info = bool(rows or corner_note or lower_note)
+    has_info = bool(rows or corner_note or lower_note or info_panel_footer_note)
     fig, ax = _new_figure_with_info(figsize=(14, 6)) if has_info else plt.subplots(figsize=(10, 6))
     pcm = ax.pcolormesh(slow_time, delay_plot, power_db.T, shading="nearest",
                         cmap="inferno", vmin=vmin, vmax=vmax)
@@ -1191,164 +1258,17 @@ def plot_dechirp_streaming(
     ax.set_title(title)
     _add_delay_range_axis(ax)
     _add_colorbar(fig, pcm, ax, "Power [dB]")
-    _add_info_panel(fig, info_rows=rows, corner_note=corner_note, lower_note=lower_note)
-    _tight_layout_with_info(fig, has_info=has_info)
-
-    if output_file:
-        _savefig(output_file, dpi=300)
-        plt.close()
-    else:
-        plt.show()
-
-
-def plot_delay_doppler_mf(
-    complex_response: np.ndarray,
-    lfm_config,
-    window_width: float,
-    title: str,
-    output_file: str = None,
-    vmin: float = None,
-    vmax: float = None,
-    tstart=None,
-    tend=None,
-    tcenter: float = None,
-    window_slow: str = "hann",
-    nfft_doppler: int = None,
-    fd_max: float = None,
-    fd_min: float = None,
-    d_max: float = None,
-    d_min: float = None,
-    interactive: bool = False,
-    corner_note: str = None,
-    auto_delay_window: bool = True,
-    info_rows=None,
-):
-    """
-    MF-based DD:
-      - complex_response is matched-filter complex output vs time samples
-      - window around each sweep (fast-time window)
-      - stack one window per sweep
-      - Doppler FFT across sweeps
-      - y-axis is delay in ms, x-axis is Doppler in Hz
-      ...
-    """
-
-    # Trim in time
-    if tstart is not None:
-        complex_response = complex_response[int(tstart * lfm_config.sample_rate):]
-    if tend is not None:
-        complex_response = complex_response[:int(tend * lfm_config.sample_rate)]
-
-    if window_width is None:
-        window_width = 1 / lfm_config.sweep_frequency
-
-    fs = lfm_config.sample_rate
-    window_size = int(window_width * fs / 2) * 2  # even
-
-    if tcenter is None:
-        search_len = min(int(2 * lfm_config.sweep_length), len(complex_response))
-        tcenter = int(np.argmax(np.abs(complex_response[:search_len])))
-
-    t0 = int(tcenter - window_width * fs / 2)
-
-    # Handle wrap-around if t0 is negative
-    if t0 < 0:
-        t0 += lfm_config.sweep_length
-
-    trimmed = complex_response[t0:]
-    if len(trimmed) < window_size:
-        raise ValueError(f"Not enough samples after trimming for window_size={window_size}")
-
-    # all_windows = sliding_window_view(trimmed, window_shape=window_size) # (len(trimmed) - window_size + 1, window_size)
-    # sweeps = all_windows[::lfm_config.sweep_length]  # (num_sweeps, window_size)
-
-    num_sweeps = (len(trimmed) - window_size) // lfm_config.sweep_length
-
-    sweeps = np.empty((num_sweeps, window_size), dtype=complex_response.dtype)
-
-    for i in range(num_sweeps):
-        start = i * lfm_config.sweep_length
-        sweeps[i] = trimmed[start:start + window_size]
-
-    slow_len, delay_len = sweeps.shape
-
-    # Slow-time window
-    w = window_from_arg(slow_len, window_slow)
-    coherent_gain = np.mean(w)
-    if coherent_gain == 0:
-        raise ValueError(f"Slow-time window '{window_slow}' has zero coherent gain")
-
-    x = sweeps * (w[:, None] / coherent_gain)
-
-    PRF = lfm_config.sweep_frequency
-    if nfft_doppler is None:
-        nfft_doppler = 1 << int(np.ceil(np.log2(max(slow_len, 1))))
-
-    DD = np.fft.fftshift(np.fft.fft(x, n=nfft_doppler, axis=0), axes=0)
-    fd = np.fft.fftshift(np.fft.fftfreq(nfft_doppler, d=1.0 / PRF))
-
-    power_db = 10 * np.log10(np.abs(DD) ** 2 + 1e-12)
-
-    # Delay axis from delay samples 
-    delay_s = ((np.arange(delay_len) - delay_len // 2) / fs) 
-    delay_ms = delay_s * 1e3
-    should_auto_delay_window = auto_delay_window and d_min is None and d_max is None
-    d_min, d_max, strongest_delay_ms = _auto_delay_bounds(
-        delay_ms,
-        power_db,
-        d_min,
-        d_max,
-        enabled=auto_delay_window,
+    _add_info_panel(
+        fig,
+        info_rows=rows,
+        corner_note=corner_note,
+        lower_note=lower_note,
+        footer_note=info_panel_footer_note,
     )
-
-    # Apply delay mask
-    d_mask = np.ones_like(delay_ms, dtype=bool)
-
-    if d_max is not None:
-        d_mask = d_mask & (delay_ms <= d_max)
-
-    if d_min is not None:
-        d_mask = d_mask & (delay_ms >= d_min)
-
-    # Optional Doppler zoom
-    if fd_max is not None or fd_min is not None:
-        fd_mask = np.ones_like(fd, dtype=bool)
-        if fd_max is not None:
-            fd_mask = fd_mask & (fd <= fd_max)
-        if fd_min is not None:
-            fd_mask = fd_mask & (fd >= fd_min)
-        fd_plot = fd[fd_mask]
-        power_db = power_db[fd_mask, :]
-    else:
-        fd_plot = fd
-
-    d_plot = delay_ms[d_mask]
-    power_db = power_db[:, d_mask]
-    if d_plot.size == 0:
-        raise ValueError(
-            "No delay bins selected; check --d-min/--d-max. "
-            f"Available delay range is {delay_ms.min():.3f} to {delay_ms.max():.3f} ms."
-        )
-    if not should_auto_delay_window:
-        strongest_delay_ms = _strongest_delay_bin_ms(power_db, d_plot)
-
-    rows = list(info_rows or []) + _lfm_info_rows(lfm_config)
-    lower_note = _format_delay_peaks_note(power_db, d_plot, n=5)
-    has_info = bool(rows or corner_note or lower_note)
-    fig, ax = _new_figure_with_info(figsize=(14, 6)) if has_info else plt.subplots(figsize=(10, 6))
-    pcm = ax.pcolormesh(fd_plot, d_plot, power_db.T, shading="nearest", cmap="inferno", vmin=vmin, vmax=vmax)
-    ax.set_xlabel("Doppler Frequency [Hz]")
-    ax.set_ylabel("Delay [ms]")
-    ax.set_title(title)
-    _add_delay_range_axis(ax)
-    _add_colorbar(fig, pcm, ax, "Power [dB]")
-    _add_info_panel(fig, info_rows=rows, corner_note=corner_note, lower_note=lower_note)
     _tight_layout_with_info(fig, has_info=has_info)
+
     if output_file:
-        # Expand the ~ if it exists
         _savefig(output_file, dpi=300)
-        if interactive == True:
-            plt.show()
         plt.close()
     else:
         plt.show()
@@ -1372,6 +1292,7 @@ def plot_delay_doppler_dechirp(
     corner_note: str = None,
     auto_delay_window: bool = True,
     info_rows=None,
+    info_panel_footer_note: str = None,
 ):
     B = lfm_config.bandwidth
     fs = lfm_config.sample_rate
@@ -1460,7 +1381,7 @@ def plot_delay_doppler_dechirp(
 
     rows = list(info_rows or []) + _lfm_info_rows(lfm_config)
     lower_note = _format_delay_peaks_note(power_db, d_plot, n=5)
-    has_info = bool(rows or corner_note or lower_note)
+    has_info = bool(rows or corner_note or lower_note or info_panel_footer_note)
     fig, ax = _new_figure_with_info(figsize=(14, 6)) if has_info else plt.subplots(figsize=(10, 6))
     pcm = ax.pcolormesh(fd_plot, d_plot, power_db.T, shading="nearest", cmap="inferno", vmin=vmin, vmax=vmax)
     ax.set_xlabel("Doppler Frequency [Hz]")
@@ -1468,7 +1389,13 @@ def plot_delay_doppler_dechirp(
     ax.set_title(title)
     _add_delay_range_axis(ax)
     _add_colorbar(fig, pcm, ax, "Power [dB]")
-    _add_info_panel(fig, info_rows=rows, corner_note=corner_note, lower_note=lower_note)
+    _add_info_panel(
+        fig,
+        info_rows=rows,
+        corner_note=corner_note,
+        lower_note=lower_note,
+        footer_note=info_panel_footer_note,
+    )
     _tight_layout_with_info(fig, has_info=has_info)
     if output_file:
         # Expand the ~ if it exists
@@ -1500,6 +1427,7 @@ def plot_doppler_time_from_delay_band(
     selected_delay_ms: np.ndarray = None,
     corner_note: str = None,
     info_rows=None,
+    info_panel_footer_note: str = None,
 ):
     prf = lfm_config.sweep_frequency
     if dechirp_spectra.ndim != 2:
@@ -1593,23 +1521,23 @@ def plot_doppler_time_from_delay_band(
 
     title_text = (
         f"{title}\n"
-        f"Delay band {selected_delays.min():.3f}-{selected_delays.max():.3f} ms, "
-        f"{selected_delays.size} bins, {combine} combine"
     )
     rows = list(info_rows or []) + _lfm_info_rows(lfm_config) + [
         ("Delay band", f"{selected_delays.min():.3f}-{selected_delays.max():.3f} ms"),
         ("Delay range", f"{selected_delays.min() * C_M_PER_S * 1e-6 / 2:.2f}-{selected_delays.max() * C_M_PER_S * 1e-6 / 2:.2f} km"),
+        ("Integration", f"{integration_time:.3f} s"),
+        ("Hop", f"{hop_time:.3f} s"),
         ("Combine", combine),
     ]
-    has_info = bool(rows or corner_note)
+    has_info = bool(rows or corner_note or info_panel_footer_note)
     fig, ax = _new_figure_with_info(figsize=(14, 6)) if has_info else plt.subplots(figsize=(10, 6))
     pcm = ax.pcolormesh(time_plot, fd_plot, power_db.T, shading="nearest",
                         cmap="inferno", vmin=vmin, vmax=vmax)
     ax.set_xlabel("Time [s]")
     ax.set_ylabel("Doppler Frequency [Hz]")
     ax.set_title(title_text)
-    fig.colorbar(pcm, ax=ax, label="Power [dB]")
-    _add_info_panel(fig, info_rows=rows, corner_note=corner_note)
+    _add_colorbar(fig, pcm, ax, "Power [dB]")
+    _add_info_panel(fig, info_rows=rows, corner_note=corner_note, footer_note=info_panel_footer_note)
     _tight_layout_with_info(fig, has_info=has_info)
 
     if output_file:
@@ -1622,10 +1550,20 @@ def plot_doppler_time_from_delay_band(
 def delay_doppler_process_window(iq_chunk, frame_idx, args, lfm_config, timestamps, start_timestamp=None):
     interactive = getattr(args, "interactive", False)
     auto_delay_window = frame_idx is None
-    info_rows = [
-        ("Method", getattr(args, "method", "unknown")),
-        ("Integration", f"{getattr(args, 'integration_time', len(iq_chunk) / lfm_config.sample_rate):.3f} s"),
-    ]
+    info_rows = []
+    input_file = getattr(args, "input_file", None) or getattr(args, "filename", None)
+    if input_file:
+        info_rows.append(("File", os.path.basename(input_file)))
+    tuning_frequency = getattr(args, "tuning_frequency", None)
+    if tuning_frequency is not None:
+        info_rows.append(("Tuning freq", f"{float(tuning_frequency) / 1e6:.6f} MHz"))
+    if getattr(args, "stand", None) is not None or getattr(args, "pol", None) is not None:
+        info_rows.append(("Stand/pol", f"{getattr(args, 'stand', None)}/{getattr(args, 'pol', None)}"))
+    info_rows.append(("Integration", f"{getattr(args, 'integration_time', len(iq_chunk) / lfm_config.sample_rate):.3f} s"))
+    if getattr(args, "hop_time", None) is not None:
+        info_rows.append(("Hop", f"{args.hop_time:.3f} s"))
+    if getattr(args, "gap_fill", None) is not None:
+        info_rows.append(("Gap fill", args.gap_fill))
     if getattr(args, "fd_min", None) is not None or getattr(args, "fd_max", None) is not None:
         info_rows.append(("Doppler limits", f"{getattr(args, 'fd_min', None)} to {getattr(args, 'fd_max', None)} Hz"))
     if getattr(args, "d_min", None) is not None or getattr(args, "d_max", None) is not None:
@@ -1637,273 +1575,39 @@ def delay_doppler_process_window(iq_chunk, frame_idx, args, lfm_config, timestam
         output_file = args.output
     else:
         output_file = None
+    info_panel_footer_note = getattr(args, "gap_fill_note", None)
 
-    if args.method == "mf":
-        _, _, complex_response = lfm_matched_filtering(iq_chunk, lfm_config)
-
-        plot_delay_doppler_mf(
-            complex_response=complex_response,
-            lfm_config=lfm_config,
-            window_width=getattr(args, "window_width", getattr(args, "window", None)),
-            title=args.title,
-            output_file=output_file,
-            vmin=args.vmin,
-            vmax=args.vmax,
-            tcenter=args.window_center,
-            window_slow=args.slow_window,
-            nfft_doppler=args.nfft_doppler,
-            fd_max=args.fd_max,
-            fd_min=args.fd_min,
-            d_max=args.d_max,
-            d_min=args.d_min,
-            interactive=interactive,
-            corner_note=timestamps,
-            auto_delay_window=auto_delay_window,
-            info_rows=info_rows,
-        )
-
-    else:
-        start_offset_samples = _timestamp_sweep_offset_samples(
-            start_timestamp,
-            lfm_config,
-            sweep_offset=getattr(args, "offset", 0.0),
-        )
-
-        _, complex_spectra = dechirp_fft_complex(
-            received_signal=iq_chunk,
-            lfm_config=lfm_config,
-            window=args.dechirp_window,
-            start_offset_samples=start_offset_samples,
-        )
-
-        plot_delay_doppler_dechirp(
-            dechirp_spectra=complex_spectra,
-            lfm_config=lfm_config,
-            title=args.title,
-            output_file=output_file,
-            vmin=args.vmin,
-            vmax=args.vmax,
-            window_slow=args.slow_window,
-            nfft_doppler=args.nfft_doppler,
-            fd_max=args.fd_max,
-            fd_min=args.fd_min,
-            d_max=args.d_max,
-            d_min=args.d_min,
-            interactive=interactive,
-            positive_delay_axis=True,
-            corner_note=timestamps,
-            auto_delay_window=auto_delay_window,
-            info_rows=info_rows,
-        )
-
-
-def plot_micro_doppler(
-    dechirp_spectra: np.ndarray,   # (num_chirps, n_bins), complex, fftshifted
-    lfm_config,
-    title: str,
-    output_file: str = None,
-    vmin: float = None,
-    vmax: float = None,
-    # --- Micro-Doppler specific ---
-    chirp_index: int = 0,           # Which chirp to analyse (or 'mean' across chirps)
-    use_mean_chirp: bool = False,   # Average chirps before analysis (improves SNR)
-    nperseg: int = 256,             # STFT window length (samples)
-    noverlap: int = None,           # STFT overlap; defaults to 75% of nperseg
-    nfft_stft: int = None,          # STFT FFT size; defaults to next power of 2 >= nperseg
-    window_stft: str = "hann",
-    beat_bin_window: int = 10,      # +/- bins around beat peak to extract phase track
-    fd_max: float = None,         # Hz, optional zoom on micro-Doppler axis
-    fd_min: float = None,
-    d_max: float = None,   # delay axis limit in milliseconds
-    d_min: float = None,
-    # --- Phase track panel ---
-    show_phase_track: bool = True,  # Also plot instantaneous phase vs. fast time
-):
-    """
-    Micro-Doppler / within-sweep ionospheric scintillation analysis.
-
-    Instead of the chirp-to-chirp (slow-time) Doppler FFT — which is limited to
-    [-PRF/2, PRF/2] = [-0.5, 0.5] Hz at PRF=1 Hz — this function analyses the
-    PHASE EVOLUTION of the beat-frequency signal within a single chirp sweep.
-
-    The beat signal at the ionospheric target's delay bin has the form:
-        s(t) = A(t) * exp(j * 2*pi * (fb + fd_ion(t)) * t)
-    where fd_ion(t) is the instantaneous ionospheric Doppler (scintillation).
-
-    An STFT along fast-time reveals fd_ion(t) at a temporal resolution of
-    nperseg/fs seconds and a Doppler resolution of fs/nfft_stft Hz, both far
-    better than anything achievable on the slow-time axis with PRF=1 Hz.
-
-    Parameters
-    ----------
-    dechirp_spectra : (num_chirps, n_bins) complex array, fftshifted beat spectra
-    lfm_config      : object with .bandwidth, .sample_rate, .sweep_frequency
-    chirp_index     : which chirp row to use (ignored if use_mean_chirp=True)
-    use_mean_chirp  : coherently average all chirps before STFT (boosts SNR,
-                      smooths slow amplitude variations)
-    nperseg         : STFT segment length in samples — controls time resolution.
-                      Shorter → better time resolution, worse Doppler resolution.
-                      Rule of thumb: nperseg ~ fs / max_expected_fd_ion
-    noverlap        : STFT overlap in samples (default: 75% of nperseg)
-    nfft_stft       : FFT size for STFT (default: next pow2 >= nperseg)
-    beat_bin_window : half-width in bins around the peak beat bin used to extract
-                      the complex envelope for phase-track analysis
-    fd_limit        : clip the displayed Doppler axis to [-fd_limit, +fd_limit] Hz
-    show_phase_track: if True, adds a second panel showing unwrapped phase vs time
-    """
-    import numpy as np
-    import matplotlib.pyplot as plt
-    from scipy.signal import stft as scipy_stft
-
-    B   = lfm_config.bandwidth
-    fs  = lfm_config.sample_rate
-    PRF = lfm_config.sweep_frequency
-    T   = 1.0 / PRF
-    k   = B / T   # chirp rate Hz/s
-
-    if dechirp_spectra.ndim != 2:
-        raise ValueError("dechirp_spectra must be 2D: (num_chirps, n_bins)")
-    num_chirps, n_bins = dechirp_spectra.shape
-
-    # ------------------------------------------------------------------
-    # 1.  Select / form the beat-domain signal to analyse
-    # ------------------------------------------------------------------
-    if use_mean_chirp:
-        # Coherent average across chirps — maximises SNR for a stable target.
-        # Incoherent scintillation amplitude variations are preserved in phase.
-        beat_signal = np.mean(dechirp_spectra, axis=0)   # (n_bins,)
-    else:
-        beat_signal = dechirp_spectra[chirp_index, :]    # (n_bins,)
-
-    # ------------------------------------------------------------------
-    # 2.  Locate the dominant beat frequency bin (ionospheric echo peak)
-    # ------------------------------------------------------------------
-    peak_bin = int(np.argmax(np.abs(beat_signal)))
-
-    # Beat frequency axis (fftshifted, so index 0 = most negative freq)
-    fb_axis = np.fft.fftshift(np.fft.fftfreq(n_bins, d=1.0 / fs))
-    fb_peak = fb_axis[peak_bin]
-    delay_peak_ms = np.mod(-fb_peak / k * 1e3, T * 1e3)
-
-    # ------------------------------------------------------------------
-    # 3.  Extract the complex envelope around the peak bin
-    #     Summing neighbouring bins improves SNR without distorting phase
-    #     when the target is well-resolved.
-    # ------------------------------------------------------------------
-    lo = max(0, peak_bin - beat_bin_window)
-    hi = min(n_bins, peak_bin + beat_bin_window + 1)
-    # Phase-coherent sum: rotate each bin back to baseband first
-    bin_offsets = np.arange(lo, hi) - peak_bin
-    bin_freqs   = fb_axis[lo:hi] - fb_peak          # residual freq offsets
-    # Build a time vector for the beat signal (fast-time within one sweep)
-    t_fast = np.arange(n_bins) / fs                  # (n_bins,) seconds
-
-    # Derotate each contributing bin to remove its carrier, then sum
-    envelope = np.zeros(n_bins, dtype=complex)
-    for i, b in enumerate(range(lo, hi)):
-        phase_ramp = np.exp(-1j * 2 * np.pi * bin_freqs[i] * t_fast)
-        envelope += beat_signal[b] * phase_ramp      # project to common phase centre
-
-    # ------------------------------------------------------------------
-    # 4.  STFT of the complex envelope → micro-Doppler spectrogram
-    # ------------------------------------------------------------------
-    if noverlap is None:
-        noverlap = int(0.75 * nperseg)
-    if nfft_stft is None:
-        nfft_stft = 1 << int(np.ceil(np.log2(max(nperseg, 1))))
-
-    window_map = {
-        "hann": "hann", "hanning": "hann",
-        "hamming": "hamming", "blackman": "blackman", "none": "boxcar"
-    }
-    win_name = window_map.get(window_stft.lower(), "hann")
-
-    # scipy.signal.stft returns (freqs, times, Zxx)
-    # We feed it the MAGNITUDE-normalised envelope so the spectrogram
-    # shows Doppler structure rather than amplitude variations.
-    f_stft, t_stft, Zxx = scipy_stft(
-        envelope,
-        fs=fs,
-        window=win_name,
-        nperseg=nperseg,
-        noverlap=noverlap,
-        nfft=nfft_stft,
-        return_onesided=False,   # complex signal → two-sided
+    start_offset_samples = _timestamp_sweep_offset_samples(
+        start_timestamp,
+        lfm_config,
+        sweep_offset=getattr(args, "offset", 0.0),
     )
 
-    # fftshift so DC (fd=0) is centred
-    f_stft = np.fft.fftshift(f_stft)
-    Zxx    = np.fft.fftshift(Zxx, axes=0)
-
-    power_db = 10.0 * np.log10(np.abs(Zxx) ** 2 + 1e-12)
-
-    # Convert fast-time axis to milliseconds for display
-    t_stft_ms = t_stft * 1e3
-
-    # Optional Doppler zoom
-    fd_mask = np.ones(len(f_stft), dtype=bool)
-
-    if fd_max is not None and fd_min is not None:
-        fd_mask = (f_stft >= fd_min) & (f_stft <= fd_max)
-    else:
-        fd_mask = np.ones(len(f_stft), dtype=bool)
-
-    f_plot  = f_stft[fd_mask]
-    pow_plot = power_db[fd_mask, :]
-
-    # ------------------------------------------------------------------
-    # 5.  Instantaneous phase track (unwrapped)
-    # ------------------------------------------------------------------
-    inst_phase = np.unwrap(np.angle(envelope))   # radians, fast-time
-    # Instantaneous frequency = d(phase)/dt  [Hz]
-    inst_freq  = np.diff(inst_phase) / (2 * np.pi) * fs
-    t_inst_ms  = np.arange(len(inst_freq)) / fs * 1e3
-
-    # ------------------------------------------------------------------
-    # 6.  Plot
-    # ------------------------------------------------------------------
-    n_panels = 2 if show_phase_track else 1
-    fig, axes = plt.subplots(
-        n_panels, 1,
-        figsize=(11, 5 * n_panels),
-        squeeze=False,
+    _, complex_spectra = dechirp_fft_complex(
+        received_signal=iq_chunk,
+        lfm_config=lfm_config,
+        window=args.dechirp_window,
+        start_offset_samples=start_offset_samples,
     )
 
-    # --- Panel 1: Micro-Doppler STFT spectrogram ---
-    ax0 = axes[0, 0]
-    pcm = ax0.pcolormesh(
-        t_stft_ms, f_plot, pow_plot,
-        shading="nearest", cmap="inferno",
-        vmin=vmin, vmax=vmax,
+    plot_delay_doppler_dechirp(
+        dechirp_spectra=complex_spectra,
+        lfm_config=lfm_config,
+        title=args.title,
+        output_file=output_file,
+        vmin=args.vmin,
+        vmax=args.vmax,
+        window_slow=args.slow_window,
+        nfft_doppler=args.nfft_doppler,
+        fd_max=args.fd_max,
+        fd_min=args.fd_min,
+        d_max=args.d_max,
+        d_min=args.d_min,
+        interactive=interactive,
+        positive_delay_axis=True,
+        corner_note=timestamps,
+        auto_delay_window=auto_delay_window,
+        info_rows=info_rows,
+        info_panel_footer_note=info_panel_footer_note,
     )
-    ax0.set_xlabel("Fast Time within Sweep [ms]")
-    ax0.set_ylabel("Micro-Doppler Frequency [Hz]")
-    ax0.set_title(
-        f"{title}\n"
-        f"Micro-Doppler STFT  |  Beat peak @ {fb_peak/1e3:.2f} kHz "
-        f"(delay ≈ {delay_peak_ms:.3f} ms)  |  "
-        f"Δf_res = {fs/nfft_stft:.1f} Hz  |  "
-        f"Δt_res = {nperseg/fs*1e3:.2f} ms"
-    )
-    fig.colorbar(pcm, ax=ax0, label="Power [dB]")
 
-    # --- Panel 2: Instantaneous frequency track ---
-    if show_phase_track:
-        ax1 = axes[1, 0]
-        ax1.plot(t_inst_ms, inst_freq, color="orange", lw=0.8)
-        if fd_min is not None and fd_max is not None:
-            ax1.set_ylim(fd_min, fd_max)
-        ax1.axhline(0, color="white" if plt.rcParams["axes.facecolor"] == "black" else "black",
-                    lw=0.6, ls=":")
-        ax1.set_xlabel("Fast Time [ms]")
-        ax1.set_ylabel("Inst. Doppler [Hz]")
-        ax1.set_title("Instantaneous Frequency Track (d phase/dt) — Scintillation Signature")
-        ax1.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    if output_file:
-        _savefig(output_file, dpi=300)
-        plt.show()
-        plt.close()
-    else:
-        plt.show()
