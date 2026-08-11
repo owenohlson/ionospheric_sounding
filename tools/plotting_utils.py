@@ -837,15 +837,26 @@ def plot_iq_spectrogram(
     # Handle duration and tstart
     start_sample = int(tstart * fs)
     end_sample = int(start_sample + (tend - tstart) * fs) if tend is not None else len(iq)
-    sliced_iq = iq[start_sample:end_sample]
+    iq = np.asarray(iq)
+    single_stream = iq.ndim == 1
+    if single_stream:
+        iq = iq[None, :]
+    elif iq.ndim != 2:
+        raise ValueError("iq must be 1D or 2D (n_streams, n_samples)")
+    sliced_iq = iq[:, start_sample:end_sample]
 
     noverlap = window_size - hop_size
 
     # Compute STFT
-    f, t, Zxx = stft(sliced_iq, fs=fs, window=window, nperseg=window_size, noverlap=noverlap, return_onesided=False)
+    f = t = None
+    power = None
+    for stream in sliced_iq:
+        f, t, Zxx = stft(stream, fs=fs, window=window, nperseg=window_size, noverlap=noverlap, return_onesided=False)
+        stream_power = np.abs(Zxx) ** 2
+        power = stream_power if power is None else power + stream_power
     f = np.fft.fftshift(f)
-    Zxx = np.fft.fftshift(Zxx, axes=0)
-    Zxx_dB = 10 * np.log10(np.abs(Zxx) ** 2 + 1e-12)
+    power = np.fft.fftshift(power, axes=0)
+    Zxx_dB = 10 * np.log10(power + 1e-12)
     lfm_estimate = None
     if estimate_lfm:
         lfm_estimate = _estimate_lfm_from_stft(
@@ -1167,9 +1178,15 @@ def plot_dechirp_streaming(
     chirp_len = lfm_config.sweep_length
     if start_offset_samples < 0:
         raise ValueError("start_offset_samples must be >= 0")
-    iq = iq[start_offset_samples:]
+    iq = np.asarray(iq)
+    single_stream = iq.ndim == 1
+    if single_stream:
+        iq = iq[None, :]
+    elif iq.ndim != 2:
+        raise ValueError("iq must be 1D or 2D (n_streams, n_samples)")
+    iq = iq[:, start_offset_samples:]
 
-    num_chirps = len(iq) // chirp_len
+    num_chirps = iq.shape[1] // chirp_len
     if num_chirps < 1:
         raise ValueError("Not enough samples for one complete chirp")
     if navg < 1:
@@ -1216,10 +1233,10 @@ def plot_dechirp_streaming(
         for j in range(navg):
             chirp_idx = group_idx * navg + j
             start = chirp_idx * chirp_len
-            seg = iq[start:start + chirp_len]
+            seg = iq[:, start:start + chirp_len]
             beat = seg * np.conj(reference_chirp)
-            spectrum = np.fft.fftshift(np.fft.fft(beat * w) / coherent_gain)
-            acc += np.abs(spectrum[selected_bins]) ** 2
+            spectrum = np.fft.fftshift(np.fft.fft(beat * w, axis=1) / coherent_gain, axes=1)
+            acc += np.sum(np.abs(spectrum[:, selected_bins]) ** 2, axis=0)
         power[group_idx] = acc / navg
 
     power_db = 10.0 * np.log10(power + 1e-12)
@@ -1302,17 +1319,22 @@ def plot_delay_doppler_dechirp(
     if k == 0:
         raise ValueError("Cannot convert dechirp beat frequency to delay when bandwidth is zero")
 
-    if dechirp_spectra.ndim != 2:
-        raise ValueError("dechirp_spectra must be 2D: (num_chirps, n_bins)")
+    dechirp_spectra = np.asarray(dechirp_spectra)
+    if dechirp_spectra.ndim == 2:
+        spectra = dechirp_spectra[None, :, :]
+    elif dechirp_spectra.ndim == 3:
+        spectra = dechirp_spectra
+    else:
+        raise ValueError("dechirp_spectra must be 2D (num_chirps, n_bins) or 3D (n_streams, num_chirps, n_bins)")
     
-    slow_len, n_bins = dechirp_spectra.shape
+    _, slow_len, n_bins = spectra.shape
 
     # Slow-time window
     w = window_from_arg(slow_len, window_slow)
     coherent_gain = np.mean(w)
     if coherent_gain == 0:
         raise ValueError(f"Slow-time window '{window_slow}' has zero coherent gain")
-    x = dechirp_spectra * (w[:, None] / coherent_gain)
+    x = spectra * (w[None, :, None] / coherent_gain)
 
     # Doppler FFT across slow-time
     if nfft_doppler is None:
@@ -1320,7 +1342,7 @@ def plot_delay_doppler_dechirp(
 
     print(f"Using nfft_doppler={nfft_doppler} for Doppler FFT (slow_len={slow_len})")
 
-    DD = np.fft.fftshift(np.fft.fft(x, n=nfft_doppler, axis=0), axes=0)
+    DD = np.fft.fftshift(np.fft.fft(x, n=nfft_doppler, axis=1), axes=1)
     
     # Beat frequency axis
     fb = np.fft.fftshift(np.fft.fftfreq(n_bins, d=1.0 / fs))
@@ -1328,7 +1350,7 @@ def plot_delay_doppler_dechirp(
     # Doppler frequency axis
     fd = np.fft.fftshift(np.fft.fftfreq(nfft_doppler, d=1.0 / PRF))
 
-    power_db = 10.0 * np.log10(np.abs(DD) ** 2 + 1e-12)
+    power_db = 10.0 * np.log10(np.sum(np.abs(DD) ** 2, axis=0) + 1e-12)
 
     # Convert beat frequency to delay
     delay_s = -fb / k
@@ -1430,8 +1452,13 @@ def plot_doppler_time_from_delay_band(
     info_panel_footer_note: str = None,
 ):
     prf = lfm_config.sweep_frequency
-    if dechirp_spectra.ndim != 2:
-        raise ValueError("dechirp_spectra must be 2D: (num_chirps, n_bins)")
+    dechirp_spectra = np.asarray(dechirp_spectra)
+    if dechirp_spectra.ndim == 2:
+        spectra_in = dechirp_spectra[None, :, :]
+    elif dechirp_spectra.ndim == 3:
+        spectra_in = dechirp_spectra
+    else:
+        raise ValueError("dechirp_spectra must be 2D (num_chirps, n_bins) or 3D (n_streams, num_chirps, n_bins)")
     if d_min is None or d_max is None:
         raise ValueError("Both --d-min and --d-max are required for Doppler-vs-time plots")
     if integration_time <= 0 or hop_time <= 0:
@@ -1439,7 +1466,7 @@ def plot_doppler_time_from_delay_band(
     if combine not in ("incoherent", "coherent", "peak"):
         raise ValueError("--combine must be one of: incoherent, coherent, peak")
 
-    num_chirps, n_bins = dechirp_spectra.shape
+    _, num_chirps, n_bins = spectra_in.shape
 
     if selected_delay_ms is None:
         B = lfm_config.bandwidth
@@ -1453,7 +1480,7 @@ def plot_doppler_time_from_delay_band(
         delay_ms = np.mod(-fb / k * 1e3, T * 1e3)
         delay_order = np.argsort(delay_ms)
         delay_ms = delay_ms[delay_order]
-        spectra = dechirp_spectra[:, delay_order]
+        spectra = spectra_in[:, :, delay_order]
 
         d_mask = (delay_ms >= d_min) & (delay_ms <= d_max)
         selected_delays = delay_ms[d_mask]
@@ -1462,12 +1489,12 @@ def plot_doppler_time_from_delay_band(
                 "No delay bins selected; check --d-min/--d-max. "
                 f"Available delay range is {delay_ms.min():.3f} to {delay_ms.max():.3f} ms."
             )
-        band = spectra[:, d_mask]
+        band = spectra[:, :, d_mask]
     else:
         selected_delays = np.asarray(selected_delay_ms)
         if selected_delays.ndim != 1 or selected_delays.size != n_bins:
-            raise ValueError("selected_delay_ms must be 1D and match dechirp_spectra.shape[1]")
-        band = dechirp_spectra
+            raise ValueError("selected_delay_ms must be 1D and match the dechirp_spectra delay-bin axis")
+        band = spectra_in
 
     window_len = int(round(integration_time * prf))
     hop_len = int(round(hop_time * prf))
@@ -1494,19 +1521,19 @@ def plot_doppler_time_from_delay_band(
 
     power = np.empty((len(frame_starts), len(fd)), dtype=np.float32)
     for frame_idx, start in enumerate(frame_starts):
-        x = band[start:start + window_len, :]
-        xw = x * (w[:, None] / coherent_gain)
-        X = np.fft.fftshift(np.fft.fft(xw, n=nfft_doppler, axis=0), axes=0)
+        x = band[:, start:start + window_len, :]
+        xw = x * (w[None, :, None] / coherent_gain)
+        X = np.fft.fftshift(np.fft.fft(xw, n=nfft_doppler, axis=1), axes=1)
         bin_power = np.abs(X) ** 2
 
         if combine == "incoherent":
-            power[frame_idx] = np.mean(bin_power, axis=1)
+            power[frame_idx] = np.mean(np.sum(bin_power, axis=0), axis=1)
         elif combine == "coherent":
-            coherent = np.sum(X, axis=1)
-            power[frame_idx] = np.abs(coherent) ** 2 / X.shape[1]
+            coherent = np.sum(X, axis=2)
+            power[frame_idx] = np.sum(np.abs(coherent) ** 2, axis=0) / X.shape[2]
         else:
-            strongest_bin = int(np.argmax(np.mean(np.abs(x) ** 2, axis=0)))
-            power[frame_idx] = bin_power[:, strongest_bin]
+            strongest_bin = int(np.argmax(np.mean(np.sum(np.abs(x) ** 2, axis=0), axis=0)))
+            power[frame_idx] = np.sum(bin_power[:, :, strongest_bin], axis=0)
 
     power_db = 10.0 * np.log10(power + 1e-12)
     time_plot = tstart + (frame_starts + window_len / 2.0) / prf
@@ -1537,6 +1564,228 @@ def plot_doppler_time_from_delay_band(
     ax.set_ylabel("Doppler Frequency [Hz]")
     ax.set_title(title_text)
     _add_colorbar(fig, pcm, ax, "Power [dB]")
+    _add_info_panel(fig, info_rows=rows, corner_note=corner_note, footer_note=info_panel_footer_note)
+    _tight_layout_with_info(fig, has_info=has_info)
+
+    if output_file:
+        _savefig(output_file, dpi=300)
+        plt.close()
+    else:
+        plt.show()
+
+
+def _phase_doppler_from_dechirp_spectra(dechirp_spectra, prf, estimator_sweeps=1):
+    dechirp_spectra = np.asarray(dechirp_spectra)
+    if dechirp_spectra.ndim == 2:
+        spectra = dechirp_spectra[None, :, :]
+    elif dechirp_spectra.ndim == 3:
+        spectra = dechirp_spectra
+    else:
+        raise ValueError("dechirp_spectra must be 2D (num_chirps, n_bins) or 3D (n_streams, num_chirps, n_bins)")
+    if estimator_sweeps < 1:
+        raise ValueError("--estimator-sweeps must be >= 1")
+    if spectra.shape[1] < estimator_sweeps + 1:
+        raise ValueError(
+            f"Need at least estimator_sweeps+1 sweeps "
+            f"({estimator_sweeps + 1}) for phase-Doppler estimation"
+        )
+
+    products = spectra[:, 1:, :] * np.conj(spectra[:, :-1, :])
+    pair_power = 0.5 * (
+        np.abs(spectra[:, 1:, :]) ** 2
+        + np.abs(spectra[:, :-1, :]) ** 2
+    )
+    valid = np.isfinite(products.real) & np.isfinite(products.imag) & np.isfinite(pair_power)
+
+    _, num_pairs, n_bins = products.shape
+    num_estimates = num_pairs - estimator_sweeps + 1
+    fd_hz = np.full((num_estimates, n_bins), np.nan, dtype=np.float32)
+    power = np.full((num_estimates, n_bins), np.nan, dtype=np.float32)
+
+    dt = 1.0 / prf
+    for i in range(num_estimates):
+        p = products[:, i:i + estimator_sweeps, :]
+        pw = pair_power[:, i:i + estimator_sweeps, :]
+        ok = valid[:, i:i + estimator_sweeps, :]
+        counts = np.sum(ok, axis=(0, 1))
+        summed = np.sum(np.where(ok, p, 0.0), axis=(0, 1))
+        good = (counts > 0) & (np.abs(summed) > 0)
+        fd_hz[i, good] = np.angle(summed[good]) / (2.0 * np.pi * dt)
+        power[i, good] = np.sum(np.where(ok, pw, 0.0), axis=(0, 1))[good] / counts[good]
+
+    time_centers = (np.arange(num_estimates, dtype=float) + estimator_sweeps / 2.0) / prf
+    power_db = 10.0 * np.log10(power + 1e-12)
+    return time_centers, fd_hz, power_db
+
+
+def _phase_doppler_axis_limits(prf, fd_min=None, fd_max=None):
+    unambiguous_min = -0.5 * prf
+    unambiguous_max = 0.5 * prf
+    requested_min = unambiguous_min if fd_min is None else float(fd_min)
+    requested_max = unambiguous_max if fd_max is None else float(fd_max)
+    if requested_min > requested_max:
+        raise ValueError("--fd-min must be <= --fd-max")
+
+    clipped_min = max(requested_min, unambiguous_min)
+    clipped_max = min(requested_max, unambiguous_max)
+    if clipped_min > clipped_max:
+        raise ValueError(
+            "Requested Doppler display limits do not overlap the unambiguous "
+            f"phase-Doppler range {unambiguous_min:.3f} to {unambiguous_max:.3f} Hz"
+        )
+    if clipped_min != requested_min or clipped_max != requested_max:
+        print(
+            f"Clipping phase-Doppler display limits to unambiguous range: "
+            f"{clipped_min:.3f} to {clipped_max:.3f} Hz",
+            flush=True,
+        )
+    return clipped_min, clipped_max, unambiguous_min, unambiguous_max
+
+
+def plot_phase_doppler_time_delay(
+    dechirp_spectra: np.ndarray,
+    selected_delay_ms: np.ndarray,
+    lfm_config,
+    title: str,
+    output_file: str = None,
+    fd_min: float = None,
+    fd_max: float = None,
+    estimator_sweeps: int = 1,
+    power_floor_db: float = None,
+    tstart: float = 0.0,
+    corner_note: str = None,
+    info_rows=None,
+    info_panel_footer_note: str = None,
+):
+    selected_delay_ms = np.asarray(selected_delay_ms)
+    spectra = np.asarray(dechirp_spectra)
+    delay_axis_len = spectra.shape[-1]
+    if selected_delay_ms.ndim != 1 or selected_delay_ms.size != delay_axis_len:
+        raise ValueError("selected_delay_ms must be 1D and match the dechirp_spectra delay-bin axis")
+
+    prf = lfm_config.sweep_frequency
+    time_centers, fd_hz, power_db = _phase_doppler_from_dechirp_spectra(
+        dechirp_spectra,
+        prf,
+        estimator_sweeps=estimator_sweeps,
+    )
+    time_plot = tstart + time_centers
+    fd_plot = fd_hz.copy()
+    if power_floor_db is not None:
+        fd_plot[power_db < power_floor_db] = np.nan
+
+    fd_min, fd_max, unambiguous_min, unambiguous_max = _phase_doppler_axis_limits(
+        prf,
+        fd_min=fd_min,
+        fd_max=fd_max,
+    )
+
+    rows = list(info_rows or []) + _lfm_info_rows(lfm_config) + [
+        ("Delay band", f"{selected_delay_ms.min():.3f}-{selected_delay_ms.max():.3f} ms"),
+        ("Delay range", f"{selected_delay_ms.min() * C_M_PER_S * 1e-6 / 2:.2f}-{selected_delay_ms.max() * C_M_PER_S * 1e-6 / 2:.2f} km"),
+        ("Estimator", "sweep-to-sweep phase"),
+        ("Estimator sweeps", str(estimator_sweeps)),
+        ("Update interval", f"{1.0 / prf:.3f} s"),
+        ("Unambiguous fd", f"{unambiguous_min:.3f} to {unambiguous_max:.3f} Hz"),
+        ("Displayed fd", f"{fd_min:.3f} to {fd_max:.3f} Hz"),
+    ]
+    if power_floor_db is not None:
+        rows.append(("Power floor", f"{power_floor_db:.3f} dB"))
+
+    has_info = bool(rows or corner_note or info_panel_footer_note)
+    fig, ax = _new_figure_with_info(figsize=(14, 6)) if has_info else plt.subplots(figsize=(10, 6))
+    pcm = ax.pcolormesh(
+        time_plot,
+        selected_delay_ms,
+        np.ma.masked_invalid(fd_plot.T),
+        shading="nearest",
+        cmap="RdBu_r",
+        vmin=fd_min,
+        vmax=fd_max,
+    )
+    ax.set_xlabel("Time [s]")
+    ax.set_ylabel("Delay [ms]")
+    ax.set_title(title)
+    _add_delay_range_axis(ax)
+    _add_colorbar(fig, pcm, ax, "Phase-derived Doppler [Hz]")
+    _add_info_panel(fig, info_rows=rows, corner_note=corner_note, footer_note=info_panel_footer_note)
+    _tight_layout_with_info(fig, has_info=has_info)
+
+    if output_file:
+        _savefig(output_file, dpi=300)
+        plt.close()
+    else:
+        plt.show()
+
+
+def plot_phase_doppler_delay_frame(
+    fd_hz: np.ndarray,
+    power_db: np.ndarray,
+    selected_delay_ms: np.ndarray,
+    lfm_config,
+    title: str,
+    output_file: str = None,
+    fd_min: float = None,
+    fd_max: float = None,
+    power_floor_db: float = None,
+    vmin: float = None,
+    vmax: float = None,
+    corner_note: str = None,
+    info_rows=None,
+    info_panel_footer_note: str = None,
+):
+    selected_delay_ms = np.asarray(selected_delay_ms)
+    fd_hz = np.asarray(fd_hz)
+    power_db = np.asarray(power_db)
+    if selected_delay_ms.ndim != 1 or fd_hz.shape != selected_delay_ms.shape:
+        raise ValueError("fd_hz and selected_delay_ms must be matching 1D arrays")
+    if power_db.shape != selected_delay_ms.shape:
+        raise ValueError("power_db and selected_delay_ms must be matching 1D arrays")
+
+    prf = lfm_config.sweep_frequency
+    fd_min, fd_max, unambiguous_min, unambiguous_max = _phase_doppler_axis_limits(
+        prf,
+        fd_min=fd_min,
+        fd_max=fd_max,
+    )
+
+    valid = np.isfinite(fd_hz) & np.isfinite(power_db)
+    if power_floor_db is not None:
+        valid &= power_db >= power_floor_db
+
+    rows = list(info_rows or []) + _lfm_info_rows(lfm_config) + [
+        ("Estimator", "sweep-to-sweep phase"),
+        ("Unambiguous fd", f"{unambiguous_min:.3f} to {unambiguous_max:.3f} Hz"),
+        ("Displayed fd", f"{fd_min:.3f} to {fd_max:.3f} Hz"),
+    ]
+    if power_floor_db is not None:
+        rows.append(("Power floor", f"{power_floor_db:.3f} dB"))
+
+    has_info = bool(rows or corner_note or info_panel_footer_note)
+    fig, ax = _new_figure_with_info(figsize=(14, 6)) if has_info else plt.subplots(figsize=(10, 6))
+    if np.any(valid):
+        sc = ax.scatter(
+            fd_hz[valid],
+            selected_delay_ms[valid],
+            c=power_db[valid],
+            s=18,
+            cmap="inferno",
+            vmin=vmin,
+            vmax=vmax,
+            linewidths=0,
+        )
+        _add_colorbar(fig, sc, ax, "Power [dB]")
+    else:
+        ax.text(0.5, 0.5, "No valid phase-Doppler estimates", transform=ax.transAxes,
+                ha="center", va="center")
+
+    ax.set_xlim(fd_min, fd_max)
+    ax.set_ylim(float(np.min(selected_delay_ms)), float(np.max(selected_delay_ms)))
+    ax.set_xlabel("Phase-derived Doppler [Hz]")
+    ax.set_ylabel("Delay [ms]")
+    ax.set_title(title)
+    ax.grid(True, alpha=0.25)
+    _add_delay_range_axis(ax)
     _add_info_panel(fig, info_rows=rows, corner_note=corner_note, footer_note=info_panel_footer_note)
     _tight_layout_with_info(fig, has_info=has_info)
 
@@ -1610,4 +1859,3 @@ def delay_doppler_process_window(iq_chunk, frame_idx, args, lfm_config, timestam
         info_rows=info_rows,
         info_panel_footer_note=info_panel_footer_note,
     )
-

@@ -84,10 +84,22 @@ def lfm_matched_filtering(iq, lfm_in: LFMWaveform):
     # Complex LFM sweep centered at 0 Hz
     lfm_waveform = lfm_in.waveform
 
-    filter_output = oaconvolve(iq, np.conj(lfm_waveform[::-1]), mode='valid')
-    lags = correlation_lags(len(iq), len(lfm_waveform), mode='valid')
-    magnitude_response = 10 * np.log10(np.abs(filter_output) ** 2)
+    iq = np.asarray(iq)
+    single_stream = iq.ndim == 1
+    if single_stream:
+        iq = iq[None, :]
+    elif iq.ndim != 2:
+        raise ValueError("iq must be 1D or 2D (n_streams, n_samples)")
 
+    filter_rows = []
+    for row in iq:
+        filter_rows.append(oaconvolve(row, np.conj(lfm_waveform[::-1]), mode='valid'))
+    filter_output = np.asarray(filter_rows)
+    lags = correlation_lags(iq.shape[1], len(lfm_waveform), mode='valid')
+    magnitude_response = 10 * np.log10(np.sum(np.abs(filter_output) ** 2, axis=0) + 1e-12)
+
+    if single_stream:
+        filter_output = filter_output[0]
     return magnitude_response, lags, filter_output
 
 
@@ -103,8 +115,16 @@ def dechirp_fft_complex(received_signal: np.ndarray,
     if start_offset_samples < 0:
         raise ValueError("start_offset_samples must be >= 0")
 
-    received_signal = received_signal[start_offset_samples:]
-    num_chirps = len(received_signal) // chirp_len
+    received_signal = np.asarray(received_signal)
+    single_stream = received_signal.ndim == 1
+    if single_stream:
+        received_signal = received_signal[None, :]
+    elif received_signal.ndim != 2:
+        raise ValueError("received_signal must be 1D or 2D (n_streams, n_samples)")
+
+    received_signal = received_signal[:, start_offset_samples:]
+    num_streams = received_signal.shape[0]
+    num_chirps = received_signal.shape[1] // chirp_len
 
     reference_chirp = lfm_config.waveform.astype(received_signal.dtype)
 
@@ -113,16 +133,18 @@ def dechirp_fft_complex(received_signal: np.ndarray,
     if coherent_gain == 0:
         raise ValueError(f"Window '{window}' has zero coherent gain")
 
-    out = np.zeros((num_chirps, chirp_len), dtype=np.complex64)
+    out = np.zeros((num_streams, num_chirps, chirp_len), dtype=np.complex64)
     mag_out = np.zeros((num_chirps, chirp_len), dtype=np.float32)
 
     for i in range(num_chirps):
-        seg = received_signal[i * chirp_len:(i + 1) * chirp_len]
+        seg = received_signal[:, i * chirp_len:(i + 1) * chirp_len]
         beat = seg * np.conj(reference_chirp)
-        beat = beat * w
-        out[i, :] = np.fft.fftshift(np.fft.fft(beat) / coherent_gain)
-        mag_out[i, :] = np.abs(out[i, :])**2
+        spectra = np.fft.fftshift(np.fft.fft(beat * w, axis=1) / coherent_gain, axes=1)
+        out[:, i, :] = spectra
+        mag_out[i, :] = np.sum(np.abs(spectra) ** 2, axis=0)
 
+    if single_stream:
+        return mag_out, out[0]
     return mag_out, out
 
 
@@ -138,8 +160,16 @@ def dechirp_fft_delay_band_complex(received_signal: np.ndarray,
     if d_min is None or d_max is None:
         raise ValueError("Both d_min and d_max are required")
 
-    received_signal = received_signal[start_offset_samples:]
-    num_chirps = len(received_signal) // chirp_len
+    received_signal = np.asarray(received_signal)
+    single_stream = received_signal.ndim == 1
+    if single_stream:
+        received_signal = received_signal[None, :]
+    elif received_signal.ndim != 2:
+        raise ValueError("received_signal must be 1D or 2D (n_streams, n_samples)")
+
+    received_signal = received_signal[:, start_offset_samples:]
+    num_streams = received_signal.shape[0]
+    num_chirps = received_signal.shape[1] // chirp_len
 
     fs = lfm_config.sample_rate
     prf = lfm_config.sweep_frequency
@@ -167,13 +197,15 @@ def dechirp_fft_delay_band_complex(received_signal: np.ndarray,
     if coherent_gain == 0:
         raise ValueError(f"Window '{window}' has zero coherent gain")
 
-    out = np.empty((num_chirps, selected_bins.size), dtype=np.complex64)
+    out = np.empty((num_streams, num_chirps, selected_bins.size), dtype=np.complex64)
     for i in range(num_chirps):
-        seg = received_signal[i * chirp_len:(i + 1) * chirp_len]
+        seg = received_signal[:, i * chirp_len:(i + 1) * chirp_len]
         beat = seg * np.conj(reference_chirp)
-        spectrum = np.fft.fftshift(np.fft.fft(beat * w) / coherent_gain)
-        out[i, :] = spectrum[selected_bins]
+        spectrum = np.fft.fftshift(np.fft.fft(beat * w, axis=1) / coherent_gain, axes=1)
+        out[:, i, :] = spectrum[:, selected_bins]
 
+    if single_stream:
+        return selected_delay_ms, out[0]
     return selected_delay_ms, out
 
 

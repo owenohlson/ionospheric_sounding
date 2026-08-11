@@ -33,7 +33,8 @@ def main():
 
     # Antenna selection
     parser.add_argument("-s", "--stand", type=int, default=1, help="stand ID to select")
-    parser.add_argument("-p", "--pol", type=str, default="x", help="pol to select (x/y)")
+    parser.add_argument("-p", "--pol", choices=["both", "x", "y", "0", "1"], default="both",
+                        help="receiver polarization to use; both sums x and y power")
 
     # LFM waveform parameters
     parser.add_argument("--sweep-frequency", type=float, required=True, help="Sweep repetition rate (Hz)")
@@ -102,7 +103,7 @@ def main():
         return_gap_info=True,
     )
     footer_note = gap_fill_note(gap_info)
-    corner_note = timestamp_range_note(start_timestamp, len(iq) / fs)
+    corner_note = timestamp_range_note(start_timestamp, iq.shape[-1] / fs)
 
     start_offset_samples = 0
     if not args.no_timestamp_align:

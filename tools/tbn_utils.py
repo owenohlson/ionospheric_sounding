@@ -126,7 +126,13 @@ def pol_to_index(pol) -> int:
         return 0
     if p in ("y", "1"):
         return 1
-    raise ValueError("--pol must be x/y or 0/1")
+    raise ValueError("--pol must be both, x/y, or 0/1")
+
+def pol_to_indices(pol):
+    p = str(pol).strip().lower()
+    if p == "both":
+        return [0, 1]
+    return [pol_to_index(pol)]
 
 def lsl_open_tbn(filename: str):
     idf = LWADataFile(filename)
@@ -204,6 +210,13 @@ def gap_fill_note(gap_info):
     return f"* {fill_name} used to fill corrupted data/timetag gaps ({events} event(s), {seconds:.3f} s)."
 
 
+def _gap_fill_block(n_streams: int, n_samples: int, gap_fill: str):
+    block = _gap_fill_array(n_samples, gap_fill)
+    if n_streams == 1:
+        return block
+    return np.tile(block[None, :], (n_streams, 1))
+
+
 def lsl_read_block_for_one_stream(
     idf: TBNFile,
     start_time,
@@ -214,17 +227,18 @@ def lsl_read_block_for_one_stream(
     return_gap_info=False,
 ):
     """
-    Robustly read enough samples for a spectrogram from one stand/pol stream.
+    Robustly read enough samples from one stand and one or both polarization streams.
 
     Returns:
-        x   : complex samples (1D)
-        t   : time vector for x (1D, seconds)
+        x   : complex samples, shape (n_samples,) for one pol or (2, n_samples) for pol="both"
+        t   : starting timestamp
     """
     # Decide stream_index
-    pol_idx = pol_to_index(pol)          # x/0 -> 0, y/1 -> 1
-    stream_index = 2 * (int(stand_id) - 1) + pol_idx
-    if stream_index < 0:
+    pol_indices = pol_to_indices(pol)
+    stream_indices = [2 * (int(stand_id) - 1) + pol_idx for pol_idx in pol_indices]
+    if min(stream_indices) < 0:
         raise ValueError("Invalid --stand/--pol combination (negative index)")
+    n_requested_streams = len(stream_indices)
     if gap_fill not in ("nan", "zero"):
         raise ValueError("--gap-fill must be 'nan' or 'zero'")
 
@@ -282,7 +296,7 @@ def lsl_read_block_for_one_stream(
                                 start_time + got,
                                 gap_timestamp,
                             )
-                            xs.append(_gap_fill_array(gap_samples, gap_fill))
+                            xs.append(_gap_fill_block(n_requested_streams, gap_samples, gap_fill))
                             gap_info["events"] += 1
                             gap_info["samples"] += gap_samples
                             gap_seconds = gap_samples / fs
@@ -318,7 +332,7 @@ def lsl_read_block_for_one_stream(
                     gap_timestamp,
                 )
                 if gap_samples > 0:
-                    xs.append(_gap_fill_array(gap_samples, gap_fill))
+                    xs.append(_gap_fill_block(n_requested_streams, gap_samples, gap_fill))
                     gap_info["events"] += 1
                     gap_info["samples"] += gap_samples
                     gap_seconds = gap_samples / fs
@@ -332,15 +346,18 @@ def lsl_read_block_for_one_stream(
             raise RuntimeError(f"Unexpected data shape from idf.read(): {data.shape}")
 
         antpols_seen = data.shape[0]
-        if stream_index >= antpols_seen:
-            raise ValueError(f"Requested stream_index={stream_index} but data has only antpols={antpols_seen}. "
+        if max(stream_indices) >= antpols_seen:
+            raise ValueError(f"Requested stream_indices={stream_indices} but data has only antpols={antpols_seen}. "
                              f"(Check --stand/--pol)")
 
         keep_samples = min(data.shape[1], int(round((target_seconds - got) * fs)))
         if keep_samples <= 0:
             break
 
-        xs.append(data[stream_index, :keep_samples].copy())
+        if n_requested_streams == 1:
+            xs.append(data[stream_indices[0], :keep_samples].copy())
+        else:
+            xs.append(data[stream_indices, :keep_samples].copy())
 
         del data # free memory immediately
 

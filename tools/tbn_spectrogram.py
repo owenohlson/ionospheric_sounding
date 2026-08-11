@@ -29,7 +29,8 @@ def main():
     parser.add_argument("--plot", choices=["single-stream", "average"], default="single-stream",
                     help="plot a single-stream spectrogram or one averaged spectrum")
     parser.add_argument("-s", "--stand", type=int, default=1, help="stand ID to select for spectrogram")
-    parser.add_argument("-p", "--pol", type=str, default="x", help="pol to select (x/y) for spectrogram")
+    parser.add_argument("-p", "--pol", choices=["both", "x", "y", "0", "1"], default="both",
+                        help="receiver polarization to use; both sums x and y power")
 
     # Spectrogram controls
     parser.add_argument("--window-size", type=int, default=1024, help="FFT length")
@@ -99,7 +100,7 @@ def main():
         return_gap_info=True,
     )
     footer_note = gap_fill_note(gap_info)
-    corner_note = timestamp_range_note(start_timestamp, len(x) / fs)
+    corner_note = timestamp_range_note(start_timestamp, x.shape[-1] / fs)
 
     if args.title is None:
         args.title = os.path.basename(args.output) if args.output else "TBN Spectrogram"
