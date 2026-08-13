@@ -5,6 +5,7 @@ import os
 
 from lfm_utils import (
     LFMWaveform,
+    auto_delay_bounds_from_iq,
     dechirp_fft_delay_band_complex,
     reference_gate_frequency_from_args,
 )
@@ -41,8 +42,12 @@ def main():
     parser.add_argument("--tstart", type=float, default=None)
     parser.add_argument("--tend", type=float, default=None)
 
-    parser.add_argument("--d-min", type=float, required=True, help="Minimum delay band edge (ms)")
-    parser.add_argument("--d-max", type=float, required=True, help="Maximum delay band edge (ms)")
+    parser.add_argument("--d-min", type=float, default=None, help="Minimum delay band edge (ms)")
+    parser.add_argument("--d-max", type=float, default=None, help="Maximum delay band edge (ms)")
+    parser.add_argument("--auto-delay-sweeps", type=int, default=32,
+                        help="Number of initial sweeps used when auto-selecting delay bounds")
+    parser.add_argument("--auto-delay-half-width", type=float, default=1.5,
+                        help="Half-width in ms around the strongest preview delay bin when auto-selecting")
     parser.add_argument("--fd-min", type=float, default=None,
                         help="Minimum Doppler color scale (Hz), clipped to +/- PRF/2")
     parser.add_argument("--fd-max", type=float, default=None,
@@ -108,13 +113,26 @@ def main():
             lfm_config,
             sweep_offset=args.offset,
         )
+    dechirp_window = None if args.dechirp_window == "none" else args.dechirp_window
+    auto_delay_used = args.d_min is None and args.d_max is None
+    if (args.d_min is None) != (args.d_max is None):
+        raise ValueError("Provide both --d-min and --d-max, or omit both for auto delay selection")
+    if auto_delay_used:
+        args.d_min, args.d_max, _ = auto_delay_bounds_from_iq(
+            iq,
+            lfm_config,
+            window=dechirp_window,
+            start_offset_samples=start_offset_samples,
+            preview_sweeps=args.auto_delay_sweeps,
+            half_width_ms=args.auto_delay_half_width,
+        )
 
     selected_delay_ms, complex_spectra = dechirp_fft_delay_band_complex(
         received_signal=iq,
         lfm_config=lfm_config,
         d_min=args.d_min,
         d_max=args.d_max,
-        window=None if args.dechirp_window == "none" else args.dechirp_window,
+        window=dechirp_window,
         start_offset_samples=start_offset_samples,
     )
 
@@ -124,9 +142,12 @@ def main():
         ("Stand/pol", f"{args.stand}/{args.pol}"),
         ("Plot span", f"{args.tstart:.3f}-{args.tend:.3f} s"),
         ("Duration", f"{duration:.3f} s"),
+        ("Delay band", f"{args.d_min:.3f}-{args.d_max:.3f} ms"),
         ("Dechirp window", args.dechirp_window),
         ("Gap fill", args.gap_fill),
     ]
+    if auto_delay_used:
+        info_rows.append(("Auto delay", f"first {args.auto_delay_sweeps} sweeps"))
     if not args.no_timestamp_align:
         info_rows.append(("Sweep offset", f"{args.offset * 1e3:.3f} ms"))
 

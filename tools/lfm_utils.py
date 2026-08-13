@@ -148,6 +148,87 @@ def dechirp_fft_complex(received_signal: np.ndarray,
     return mag_out, out
 
 
+def dechirp_delay_axis_ms(lfm_config: LFMWaveform,
+                          n_bins: int = None,
+                          positive_delay_axis: bool = True,
+                          bandlimit: bool = True):
+    if n_bins is None:
+        n_bins = len(lfm_config.waveform)
+    fs = lfm_config.sample_rate
+    prf = lfm_config.sweep_frequency
+    T = 1.0 / prf
+    k = lfm_config.bandwidth / T
+    if k == 0:
+        raise ValueError("Cannot convert dechirp beat frequency to delay when bandwidth is zero")
+
+    fb = np.fft.fftshift(np.fft.fftfreq(n_bins, d=1.0 / fs))
+    bin_order = np.arange(n_bins)
+    if bandlimit:
+        df = fs / n_bins
+        half_bandwidth = abs(lfm_config.bandwidth) / 2.0
+        nyquist = fs / 2.0
+        if half_bandwidth < nyquist:
+            band_mask = np.abs(fb) <= (half_bandwidth + 0.5 * df)
+            fb = fb[band_mask]
+            bin_order = bin_order[band_mask]
+    delay_ms = -fb / k * 1e3
+    if positive_delay_axis:
+        delay_ms = np.mod(delay_ms, T * 1e3)
+    delay_order = np.argsort(delay_ms)
+    return delay_ms[delay_order], bin_order[delay_order]
+
+
+def auto_delay_bounds_from_iq(received_signal: np.ndarray,
+                              lfm_config: LFMWaveform,
+                              window: str = "hann",
+                              start_offset_samples: int = 0,
+                              preview_sweeps: int = 32,
+                              half_width_ms: float = 1.5):
+    if preview_sweeps < 1:
+        raise ValueError("preview_sweeps must be >= 1")
+    if half_width_ms <= 0:
+        raise ValueError("half_width_ms must be > 0")
+
+    chirp_len = len(lfm_config.waveform)
+    received_signal = np.asarray(received_signal)
+    single_stream = received_signal.ndim == 1
+    if single_stream:
+        received_signal = received_signal[None, :]
+    elif received_signal.ndim != 2:
+        raise ValueError("received_signal must be 1D or 2D (n_streams, n_samples)")
+
+    available_samples = received_signal.shape[-1] - int(start_offset_samples)
+    available_sweeps = available_samples // chirp_len
+    n_preview = int(min(preview_sweeps, available_sweeps))
+    if n_preview < 1:
+        raise ValueError("Not enough samples to auto-estimate delay bounds")
+
+    preview = received_signal[:, start_offset_samples:start_offset_samples + n_preview * chirp_len].copy()
+    preview[~np.isfinite(preview)] = 0.0
+    power, _ = dechirp_fft_complex(
+        preview[0] if single_stream else preview,
+        lfm_config,
+        window=window,
+        start_offset_samples=0,
+    )
+    delay_ms, delay_order = dechirp_delay_axis_ms(lfm_config, n_bins=power.shape[-1])
+    power = power[:, delay_order]
+    if not np.any(np.isfinite(power)):
+        raise ValueError("Could not auto-estimate delay bounds because preview power is all non-finite")
+
+    _, delay_idx = np.unravel_index(np.nanargmax(power), power.shape)
+    strongest_delay_ms = float(delay_ms[delay_idx])
+    d_min = max(float(np.min(delay_ms)), strongest_delay_ms - half_width_ms)
+    d_max = min(float(np.max(delay_ms)), strongest_delay_ms + half_width_ms)
+    print(
+        f"No --d-min/--d-max provided; auto-centering on strongest delay bin "
+        f"{strongest_delay_ms:.3f} ms using first {n_preview} sweep(s), "
+        f"range {d_min:.3f} to {d_max:.3f} ms",
+        flush=True,
+    )
+    return d_min, d_max, strongest_delay_ms
+
+
 def dechirp_fft_delay_band_complex(received_signal: np.ndarray,
                                    lfm_config: LFMWaveform,
                                    d_min: float,
@@ -171,17 +252,7 @@ def dechirp_fft_delay_band_complex(received_signal: np.ndarray,
     num_streams = received_signal.shape[0]
     num_chirps = received_signal.shape[1] // chirp_len
 
-    fs = lfm_config.sample_rate
-    prf = lfm_config.sweep_frequency
-    T = 1.0 / prf
-    k = lfm_config.bandwidth / T
-    if k == 0:
-        raise ValueError("Cannot convert dechirp beat frequency to delay when bandwidth is zero")
-
-    fb = np.fft.fftshift(np.fft.fftfreq(chirp_len, d=1.0 / fs))
-    delay_ms = np.mod(-fb / k * 1e3, T * 1e3)
-    delay_order = np.argsort(delay_ms)
-    delay_ms = delay_ms[delay_order]
+    delay_ms, delay_order = dechirp_delay_axis_ms(lfm_config, n_bins=chirp_len)
     d_mask = (delay_ms >= d_min) & (delay_ms <= d_max)
     selected_bins = delay_order[d_mask]
     selected_delay_ms = delay_ms[d_mask]

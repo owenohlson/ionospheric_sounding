@@ -374,7 +374,7 @@ def lsl_read_block_for_one_stream(
             return None, first_timestamp, gap_info
         return None, first_timestamp
 
-    x = np.concatenate(xs)
+    x = np.concatenate(xs, axis=-1)
 
     if return_gap_info:
         return x, first_timestamp, gap_info

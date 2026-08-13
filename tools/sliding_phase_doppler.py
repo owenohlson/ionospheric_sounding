@@ -1,6 +1,7 @@
 # sliding_phase_doppler.py
 
 import argparse
+import glob
 import os
 import subprocess
 
@@ -8,6 +9,7 @@ import soundfile as sf
 
 from lfm_utils import (
     LFMWaveform,
+    auto_delay_bounds_from_iq,
     dechirp_fft_delay_band_complex,
     load_iq_audio,
     reference_gate_frequency_from_args,
@@ -33,10 +35,24 @@ def make_video(output_dir, framerate, video_name="phase_doppler_video.mp4"):
     try:
         subprocess.run(ffmpeg_cmd, check=True)
         print(f"Video created successfully: {video_path}", flush=True)
+        return True
     except subprocess.CalledProcessError as e:
         print(f"Error creating video: {e}", flush=True)
     except FileNotFoundError:
         print("ffmpeg not found. Please install ffmpeg to create the video.", flush=True)
+    return False
+
+
+def cleanup_frame_pngs(output_dir):
+    frame_paths = sorted(glob.glob(os.path.join(os.path.expanduser(output_dir), "frame_*.png")))
+    removed = 0
+    for frame_path in frame_paths:
+        try:
+            os.remove(frame_path)
+            removed += 1
+        except OSError as exc:
+            print(f"Could not remove frame PNG {frame_path}: {exc}", flush=True)
+    print(f"Removed {removed} frame PNG(s). Use --keep-frames to preserve them.", flush=True)
 
 
 def main():
@@ -53,8 +69,12 @@ def main():
     parser.add_argument("--tstart", type=float, default=None)
     parser.add_argument("--tend", type=float, default=None)
 
-    parser.add_argument("--d-min", type=float, required=True, help="Minimum delay band edge (ms)")
-    parser.add_argument("--d-max", type=float, required=True, help="Maximum delay band edge (ms)")
+    parser.add_argument("--d-min", type=float, default=None, help="Minimum delay band edge (ms)")
+    parser.add_argument("--d-max", type=float, default=None, help="Maximum delay band edge (ms)")
+    parser.add_argument("--auto-delay-sweeps", type=int, default=32,
+                        help="Number of initial sweeps used when auto-selecting delay bounds")
+    parser.add_argument("--auto-delay-half-width", type=float, default=1.5,
+                        help="Half-width in ms around the strongest preview delay bin when auto-selecting")
     parser.add_argument("--fd-min", type=float, default=None,
                         help="Minimum Doppler axis (Hz), clipped to +/- PRF/2")
     parser.add_argument("--fd-max", type=float, default=None,
@@ -70,6 +90,8 @@ def main():
     parser.add_argument("--max-frames", type=int, default=None,
                         help="Optional cap on rendered frames")
     parser.add_argument("--framerate", type=int, default=10, help="Output video frame rate")
+    parser.add_argument("--keep-frames", action="store_true",
+                        help="Keep individual frame_*.png files after successfully creating the video")
 
     parser.add_argument("--dechirp-window", type=str, default="hann",
                         choices=["hamming", "hann", "blackman", "cheb60", "cheb80", "cheb100", "cheb120", "none"])
@@ -108,13 +130,25 @@ def main():
         reference_gate_duty=args.reference_gate_duty,
         reference_gate_phase=args.reference_gate_phase,
     )
+    dechirp_window = None if args.dechirp_window == "none" else args.dechirp_window
+    auto_delay_used = args.d_min is None and args.d_max is None
+    if (args.d_min is None) != (args.d_max is None):
+        raise ValueError("Provide both --d-min and --d-max, or omit both for auto delay selection")
+    if auto_delay_used:
+        args.d_min, args.d_max, _ = auto_delay_bounds_from_iq(
+            iq,
+            lfm_config,
+            window=dechirp_window,
+            preview_sweeps=args.auto_delay_sweeps,
+            half_width_ms=args.auto_delay_half_width,
+        )
 
     selected_delay_ms, complex_spectra = dechirp_fft_delay_band_complex(
         received_signal=iq,
         lfm_config=lfm_config,
         d_min=args.d_min,
         d_max=args.d_max,
-        window=None if args.dechirp_window == "none" else args.dechirp_window,
+        window=dechirp_window,
     )
     time_centers, fd_hz, power_db = _phase_doppler_from_dechirp_spectra(
         complex_spectra,
@@ -135,6 +169,8 @@ def main():
             ("Frame hop", f"{args.frame_hop_sweeps} estimates"),
             ("Dechirp window", args.dechirp_window),
         ]
+        if auto_delay_used:
+            info_rows.append(("Auto delay", f"first {args.auto_delay_sweeps} sweeps"))
         plot_phase_doppler_delay_frame(
             fd_hz=fd_hz[estimate_idx],
             power_db=power_db[estimate_idx],
@@ -151,7 +187,9 @@ def main():
         )
         print(f"Rendered frame {frame_num + 1} at t={t_abs:.3f}s", flush=True)
 
-    make_video(args.output, args.framerate)
+    video_created = make_video(args.output, args.framerate)
+    if video_created and not args.keep_frames:
+        cleanup_frame_pngs(args.output)
 
 
 if __name__ == "__main__":

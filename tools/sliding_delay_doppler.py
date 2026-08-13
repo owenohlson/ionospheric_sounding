@@ -2,12 +2,18 @@
 
 import argparse
 import gc
-import numpy as np
+import glob
 import os
 import psutil
 import subprocess
+import numpy as np
 
-from lfm_utils import LFMWaveform, load_iq_audio, reference_gate_frequency_from_args
+from lfm_utils import (
+    LFMWaveform,
+    auto_delay_bounds_from_iq,
+    load_iq_audio,
+    reference_gate_frequency_from_args,
+)
 from plotting_utils import delay_doppler_process_window
 
 
@@ -15,6 +21,17 @@ process = psutil.Process(os.getpid())
 
 def mem():
     print(f"Memory usage: {process.memory_info().rss / 1e9:.2f} GB", flush=True)
+
+def cleanup_frame_pngs(output_dir):
+    frame_paths = sorted(glob.glob(os.path.join(os.path.expanduser(output_dir), "frame_*.png")))
+    removed = 0
+    for frame_path in frame_paths:
+        try:
+            os.remove(frame_path)
+            removed += 1
+        except OSError as exc:
+            print(f"Could not remove frame PNG {frame_path}: {exc}", flush=True)
+    print(f"Removed {removed} frame PNG(s). Use --keep-frames to preserve them.", flush=True)
 
 def main():
     parser = argparse.ArgumentParser(
@@ -48,6 +65,10 @@ def main():
                         help="Max delay to display (ms)")
     parser.add_argument("--d-min", type=float, default=None,
                         help="Min delay to display (ms)")
+    parser.add_argument("--auto-delay-sweeps", type=int, default=32,
+                        help="Number of initial sweeps used when auto-selecting delay bounds")
+    parser.add_argument("--auto-delay-half-width", type=float, default=1.5,
+                        help="Half-width in ms around the strongest preview delay bin when auto-selecting")
     parser.add_argument("--offset", type=float, default=0.0,
                         help="Timestamp mode: sweep start offset in seconds after each integer-second boundary")
     parser.add_argument("--interactive", type=bool, default=False, 
@@ -66,8 +87,12 @@ def main():
     
     # FFmpeg parameters
     parser.add_argument("--framerate", type=int, default=2, help="Frame rate for the output video (frames per second)")
+    parser.add_argument("--keep-frames", action="store_true",
+                        help="Keep individual frame_*.png files after successfully creating the video")
 
     args = parser.parse_args()
+    if (args.d_min is None) != (args.d_max is None):
+        raise ValueError("Provide both --d-min and --d-max, or omit both for auto delay selection")
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -97,6 +122,20 @@ def main():
     nframes = int(np.floor(available / args.hop_time)) + 1
     frame_idx = 0
     anchor_start = args.tstart
+    auto_delay_used = args.d_min is None and args.d_max is None
+    if auto_delay_used:
+        preview_start = int(anchor_start * fs)
+        preview_stop = int(min(args.tend, anchor_start + args.integration_time) * fs)
+        preview_iq = iq[preview_start:preview_stop]
+        dechirp_window = None if args.dechirp_window == "none" else args.dechirp_window
+        args.d_min, args.d_max, _ = auto_delay_bounds_from_iq(
+            preview_iq,
+            lfm_config,
+            window=dechirp_window,
+            preview_sweeps=args.auto_delay_sweeps,
+            half_width_ms=args.auto_delay_half_width,
+        )
+        args.auto_delay_note = f"first {args.auto_delay_sweeps} sweeps"
 
     for frame_idx in range(nframes):
         current_tstart = anchor_start + (frame_idx * args.hop_time)
@@ -162,6 +201,8 @@ def main():
         try:
             subprocess.run(ffmpeg_cmd, check=True)
             print(f"Video created successfully: {video_name}", flush=True)
+            if not args.keep_frames:
+                cleanup_frame_pngs(full_output_path)
         except subprocess.CalledProcessError as e:
             print(f"Error creating video: {e}", flush=True)
         except FileNotFoundError:
