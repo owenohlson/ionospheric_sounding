@@ -11,7 +11,11 @@ process = psutil.Process(os.getpid())
 from datetime import datetime, timedelta
 
 # LSL imports
-from lsl.reader.ldp import LWADataFile, TBNFile
+from lsl.reader.ldp import LWADataFile
+try:
+    from lsl.reader.ldp import TBNFile
+except ImportError:
+    TBNFile = None
 from lsl.correlator import fx as fxc
 from lsl.reader import errors
 
@@ -136,8 +140,14 @@ def pol_to_indices(pol):
 
 def lsl_open_tbn(filename: str):
     idf = LWADataFile(filename)
-    if not isinstance(idf, TBNFile):
+    if TBNFile is not None and not isinstance(idf, TBNFile):
         raise RuntimeError(f"'{filename}' does not appear to be a valid TBN file (LSL type={type(idf)})")
+    if TBNFile is None:
+        try:
+            idf.get_info("sample_rate")
+            idf.get_info("freq1")
+        except Exception as exc:
+            raise RuntimeError(f"'{filename}' does not appear to be a valid TBN file (LSL type={type(idf)})") from exc
     return idf
 
 def lsl_print_metadata(idf: TBNFile):
