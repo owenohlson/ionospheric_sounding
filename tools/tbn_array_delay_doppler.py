@@ -10,6 +10,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
+from rdc_cache import prepare_rdc2_view, iter_rdc2_view_chunks
+
 from lfm_utils import LFMWaveform, reference_gate_frequency_from_args
 from plotting_utils import (
     INFO_PANEL_RECT,
@@ -24,6 +26,8 @@ from plotting_utils import (
     _timestamp_sweep_offset_samples,
 )
 from rdc_utils import (
+    cable_phase_factors,
+    lwasv_selected_antennas,
     BAD_LWA_STANDS,
     capon_mvdr_spectrum,
     dechirp_range_fft_delay_band_rdc0,
@@ -31,10 +35,8 @@ from rdc_utils import (
     export_tbn_rdc0_hdf5,
     format_bytes,
     iter_rdc0_hdf5_channel_chunks,
-    iter_rdc2_hdf5_channel_chunks,
     load_lwa_antenna_positions,
     load_rdc0_hdf5_metadata,
-    load_rdc2_hdf5_metadata,
     parse_stands,
     polarization_metadata,
     steering_vector,
@@ -116,6 +118,7 @@ def plot_angle_spectra(
     footer_note=None,
     cell_snapshot_info=None,
     cell_labels=None,
+    normalize_peak=False,
 ):
     spectra = np.asarray(spectra, dtype=float)
     if spectra.ndim != 3:
@@ -164,7 +167,11 @@ def plot_angle_spectra(
             continue
         spec = spectra_plot[idx][radius_order, :]
         peak = np.nanmax(spec)
-        spec_db = 10.0 * np.log10(spec / peak + 1e-30) if np.isfinite(peak) and peak > 0 else np.full_like(spec, np.nan)
+        reference = peak if normalize_peak else 1.0
+        spec_db = np.full_like(spec, np.nan)
+        valid = np.isfinite(spec) & (spec >= 0)
+        if np.isfinite(reference) and reference > 0:
+            spec_db[valid] = 10.0 * np.log10(np.maximum(spec[valid] / reference, 1e-30))
         label_text = str(cell_labels[idx]).lower() if cell_labels is not None and idx < len(cell_labels) else ""
         suppress_cell_title = "window" in label_text or "beam pattern" in label_text
         if np.any(np.isfinite(spec_db)):
@@ -195,7 +202,7 @@ def plot_angle_spectra(
         ax.set_title("" if suppress_cell_title else f"Cell {idx + 1}")
     if last_pcm is not None:
         cbar = fig.colorbar(last_pcm, ax=axes.ravel().tolist(), pad=0.08)
-        cbar.set_label("Normalized Angle Power [dB]")
+        cbar.set_label("Normalized Beam Power [dB]" if normalize_peak else "Angle Power [dB re 1 processing unit]")
     combined_lower_note = "\n".join([note for note in [lower_note, "\n".join(lower_lines)] if note])
     _add_info_panel(
         fig,
@@ -242,13 +249,18 @@ def pol_to_index(pol):
     raise ValueError("--pol must be x/y or 0/1 for array beamforming")
 
 
-def select_array_channels(channel_stands, channel_pols, pol, drop_bad=True, require_positions=True):
+def select_array_channels(channel_stands, channel_pols, pol, drop_bad=True, require_positions=True,
+                          operational_only=False):
     channel_stands = np.asarray(channel_stands, dtype=int)
     channel_pols = np.asarray(channel_pols, dtype=int)
     wanted_pol = pol_to_index(pol)
     mask = channel_pols == wanted_pol
     if drop_bad:
         mask &= ~np.isin(channel_stands, np.asarray(BAD_LWA_STANDS, dtype=int))
+    if operational_only:
+        candidates = np.flatnonzero(mask)
+        antennas = lwasv_selected_antennas(channel_stands[candidates], channel_pols[candidates])
+        mask[candidates] &= np.array([a.combined_status == 33 for a in antennas])
 
     indices = np.flatnonzero(mask)
     stands = channel_stands[indices]
@@ -269,10 +281,31 @@ def select_array_channels(channel_stands, channel_pols, pol, drop_bad=True, requ
             stands = stands[position_mask]
             pols = pols[position_mask]
         if indices.size == 0:
-            raise ValueError("No selected channels have built-in LWA antenna positions")
+            raise ValueError("No selected channels have LSL LWA-SV antenna positions")
         if len(np.unique(stands)) != len(stands):
             raise ValueError("Array beamforming requires one selected channel per stand; choose one polarization with --pol")
     return indices, stands, pols, positions, missing_position_stands
+
+
+def array_cable_factors(args, metadata, stands, pols, frequency_hz):
+    """Resolve correction once for all selected channels, before chunking."""
+    mode = getattr(args, "cable_correction", "auto")
+    already_corrected = metadata.get("cable_phase_corrected", False)
+    if mode == "off":
+        note = "already corrected in input" if already_corrected else "off"
+    elif already_corrected:
+        note = "already corrected in input"
+    elif mode == "auto" and metadata.get("synthetic", False) and not metadata.get("cable_delays_injected", False):
+        note = "ideal simulation (not applied)"
+    else:
+        factors = cable_phase_factors(stands, pols, frequency_hz)
+        note = f"LSL LWA-SV, {frequency_hz / 1e6:.6f} MHz"
+        args._cable_note = note
+        print(f"Cable phase correction: {note}", flush=True)
+        return factors
+    args._cable_note = note
+    print(f"Cable phase correction: {note}", flush=True)
+    return np.ones(len(stands), dtype=np.complex128)
 
 
 def estimate_spatial_covariance(
@@ -420,6 +453,7 @@ def write_beam_pattern_plot(
         corner_note=corner_note,
         footer_note=footer_note,
         cell_labels=["beam pattern reference"],
+        normalize_peak=True,
     )
 
 
@@ -587,7 +621,10 @@ def contiguous_axis_selection(values, vmin=None, vmax=None, axis_name="axis"):
 
 
 def load_rdc2_frame_for_array(args, frame_idx=0, require_positions=True):
-    loaded = load_rdc2_hdf5_metadata(args.rdc2_input)
+    loaded = getattr(args, "_rdc2_view", None)
+    if loaded is None:
+        loaded = prepare_rdc2_view(args)
+        args._rdc2_view = loaded
     metadata = loaded["metadata"]
     apply_rdc2_metadata_defaults(args, metadata)
     shape = loaded["shape"]
@@ -613,10 +650,11 @@ def load_rdc2_frame_for_array(args, frame_idx=0, require_positions=True):
         args.pol,
         drop_bad=args.drop_bad_stands,
         require_positions=require_positions,
+        operational_only=getattr(args, "operational_only", False),
     )
     rdc2_chunks = []
-    for _, _, rdc2_chunk in iter_rdc2_hdf5_channel_chunks(
-        args.rdc2_input,
+    for _, _, rdc2_chunk in iter_rdc2_view_chunks(
+        loaded,
         args.channel_chunk_size,
         channel_indices=selected_channel_indices,
         frame_start=frame_idx,
@@ -631,6 +669,9 @@ def load_rdc2_frame_for_array(args, frame_idx=0, require_positions=True):
     nonfinite_values_filled = 0
     if args.gap_fill == "zero":
         rdc2, nonfinite_values_filled = zero_fill_nonfinite_complex(rdc2)
+    frequency = args.carrier_frequency or metadata.get("tuning_frequency_hz") or metadata.get("carrier_frequency_hz") or metadata.get("freq1_hz")
+    factors = array_cable_factors(args, metadata, channel_stands, channel_pols, frequency)
+    rdc2 *= factors.astype(rdc2.dtype)
     return {
         "rdc2": rdc2,
         "nonfinite_values_filled": nonfinite_values_filled,
@@ -694,7 +735,7 @@ def main():
     )
     parser.add_argument("input_file", nargs="?", help="Input TBN file; omit when using --rdc0-input")
     parser.add_argument("--rdc0-input", default=None, help="Existing RDC0 HDF5 file to process")
-    parser.add_argument("--rdc2-input", default=None, help="Existing RDC2 HDF5 file to plot without redoing range/Doppler FFTs")
+    parser.add_argument("--rdc2-input", default=None, help="RDC2 cache; timing overrides recompute Doppler from retained RDC1")
     parser.add_argument("--rdc2-frame-index", type=int, default=0,
                         help="RDC2 frame index to plot when --rdc2-input contains multiple frames")
     parser.add_argument("--rdc0-cache", default=None, help="RDC0 HDF5 cache path to create/reuse for TBN input")
@@ -705,6 +746,8 @@ def main():
     parser.add_argument("--tstart", type=float, default=None)
     parser.add_argument("--tend", type=float, default=None)
     parser.add_argument("--duration", type=float, default=None)
+    parser.add_argument("--integration-time", type=float, default=None, help="RDC2 cache integration; requires retained RDC1 to change")
+    parser.add_argument("--hop-time", type=float, default=None, help="RDC2 cache hop; choose a window with --rdc2-frame-index")
     parser.add_argument("--sweep-frequency", type=float, default=None)
     parser.add_argument("--bandwidth", type=float, default=None)
     parser.add_argument("--offset", type=float, default=0.0)
@@ -752,6 +795,14 @@ def main():
                         help="Output PNG showing the conventional array point-spread/beam pattern for the resolved look direction")
     parser.add_argument("--angle-plot-vmin", type=float, default=-40.0)
     parser.add_argument("--angle-plot-vmax", type=float, default=0.0)
+    parser.add_argument("--beam-pattern-vmin", type=float, default=-40.0,
+                        help="Beam-pattern color minimum in dB relative to its peak")
+    parser.add_argument("--beam-pattern-vmax", type=float, default=0.0,
+                        help="Beam-pattern color maximum in dB relative to its peak")
+    parser.add_argument("--cable-correction", choices=["auto", "on", "off"], default="auto",
+                        help="Correct LSL LWA-SV cable phase at RF center; auto skips ideal simulations and already-corrected input")
+    parser.add_argument("--operational-only", action="store_true",
+                        help="Additionally require LSL combined_status=33 (installed station status, not observation-date status)")
     parser.add_argument("--angle-source", choices=["window", "cells"], default="window",
                         help="Use the full plotted delay-Doppler window or selected cells for angle spectra")
     parser.add_argument("--angle-top-n", type=int, default=0,
@@ -844,7 +895,7 @@ def main():
         frame_tend = float(loaded_rdc2["frame_tend_s"][args.rdc2_frame_index])
         if missing_position_stands:
             print(
-                "Dropping selected channel(s) without built-in LWA positions before array processing: "
+                "Dropping selected channel(s) without LSL LWA-SV positions before array processing: "
                 f"{missing_position_stands}",
                 flush=True,
             )
@@ -897,6 +948,7 @@ def main():
             ("RDC2 cache", "yes"),
         ])
         info_rows.extend(_lfm_info_rows(lfm_config))
+        info_rows.append(("Cable phase", getattr(args, "_cable_note", "unknown")))
         footer_note = "\n".join(note for note in [
             gap_fill_note(metadata.get("gap_info")),
             f"RDC2 nonfinite values replaced with zeros for this plot: {nonfinite_rdc2_values_filled}"
@@ -936,8 +988,8 @@ def main():
                 ],
                 corner_note=corner_note,
                 footer_note=footer_note,
-                vmin=args.angle_plot_vmin,
-                vmax=args.angle_plot_vmax,
+                vmin=args.beam_pattern_vmin,
+                vmax=args.beam_pattern_vmax,
             )
             print(f"Wrote {args.beam_pattern_output}", flush=True)
         return
@@ -992,10 +1044,11 @@ def main():
         args.pol,
         drop_bad=args.drop_bad_stands,
         require_positions=args.beamformer in ("mvdr", "conventional") or wants_angle_product or wants_pattern_product,
+        operational_only=args.operational_only,
     )
     if missing_position_stands:
         print(
-            "Dropping selected channel(s) without built-in LWA positions before array processing: "
+            "Dropping selected channel(s) without LSL LWA-SV positions before array processing: "
             f"{missing_position_stands}",
             flush=True,
         )
@@ -1023,6 +1076,7 @@ def main():
     rdc2_chunks = [] if need_channel_cube else None
     look_auto = args.beamformer in ("mvdr", "conventional") and args.look_az is None and args.look_el is None
 
+    cable_factors = array_cable_factors(args, metadata, channel_stands, channel_pols, fc)
     for chunk_start, chunk_stop, rdc0_chunk in iter_rdc0_hdf5_channel_chunks(
         cache_path,
         args.channel_chunk_size,
@@ -1067,6 +1121,7 @@ def main():
                 raise RuntimeError("Doppler axis changed unexpectedly between RDC0 chunks")
 
         rdc2_chunk = rdc2_chunk[:, fd_mask, :]
+        rdc2_chunk *= cable_factors[chunk_start:chunk_stop].astype(rdc2_chunk.dtype)
         if args.gap_fill == "zero":
             rdc2_chunk, bad_count = zero_fill_nonfinite_complex(rdc2_chunk)
             nonfinite_rdc2_values_filled += bad_count
@@ -1179,6 +1234,7 @@ def main():
     if args.fd_min is not None or args.fd_max is not None:
         info_rows.append(("Doppler limits", f"{args.fd_min} to {args.fd_max} Hz"))
     info_rows.extend(_lfm_info_rows(lfm_config))
+    info_rows.append(("Cable phase", getattr(args, "_cable_note", "unknown")))
     footer_note = "\n".join(note for note in [
         gap_fill_note(metadata.get("gap_info")),
         f"RDC0 nonfinite values replaced with zeros for this plot: {nonfinite_rdc0_values_filled}"
@@ -1209,7 +1265,7 @@ def main():
     print(f"Wrote {args.output}", flush=True)
 
     if args.angle_output or args.angle_plot_output:
-        print("Using built-in LWA stand positions from coordInfo files.", flush=True)
+        print("Using LWA-SV stand positions from lsl.common.stations.lwasv.", flush=True)
         wavelength = 299_792_458.0 / float(fc)
         az_grid = np.arange(args.az_min, args.az_max + 0.5 * args.az_step, args.az_step)
         el_grid = np.arange(args.el_min, args.el_max + 0.5 * args.el_step, args.el_step)
@@ -1326,6 +1382,8 @@ def main():
             "source_file": os.path.basename(args.rdc0_input or args.input_file or cache_path),
             "beamformer": f"{args.angle_method}_angle_spectrum",
             "angle_method": args.angle_method,
+            "cable_phase_correction": getattr(args, "_cable_note", "unknown"),
+            "operational_only": args.operational_only,
             "angle_source": angle_source,
             "carrier_frequency_hz": fc,
             "selected_stands": [int(s) for s in channel_stands],
@@ -1360,6 +1418,7 @@ def main():
                     ("Array channels", f"{len(selected_channel_indices)} {args.pol}-pol"),
                     ("Stands used", str(len(np.unique(channel_stands)))),
                     ("Angle method", args.angle_method.upper()),
+                    ("Cable phase", getattr(args, "_cable_note", "unknown")),
                     ("Angle source", angle_source),
                     ("Min snapshots", str(args.angle_min_snapshots)),
                     ("Diag loading", f"{args.diagonal_loading:g}"),
@@ -1391,8 +1450,8 @@ def main():
             ],
             corner_note=corner_note,
             footer_note=footer_note,
-            vmin=args.angle_plot_vmin,
-            vmax=args.angle_plot_vmax,
+            vmin=args.beam_pattern_vmin,
+            vmax=args.beam_pattern_vmax,
         )
         print(f"Wrote {args.beam_pattern_output}", flush=True)
 

@@ -13,6 +13,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import psutil
 
+from rdc_cache import prepare_rdc2_view
+
 from lfm_utils import LFMWaveform, reference_gate_frequency_from_args
 from plotting_utils import (
     _add_colorbar,
@@ -34,10 +36,11 @@ from rdc_utils import (
     format_bytes,
     iter_rdc0_hdf5_channel_chunks,
     load_rdc0_hdf5_metadata,
-    load_rdc2_hdf5_metadata,
     parse_stands,
 )
 from tbn_array_delay_doppler import (
+    apply_rdc2_metadata_defaults,
+    array_cable_factors,
     angle_snapshot_block,
     array_delay_doppler_power_from_rdc2,
     beamform_rdc2,
@@ -160,8 +163,8 @@ def maybe_write_beam_pattern(args, positions, fc, look_az, look_el, selected_cha
         ],
         corner_note=corner_note,
         footer_note=footer_note,
-        vmin=args.angle_plot_vmin,
-        vmax=args.angle_plot_vmax,
+        vmin=args.beam_pattern_vmin,
+        vmax=args.beam_pattern_vmax,
     )
     args._beam_pattern_written = True
     print(f"Wrote {args.beam_pattern_output}", flush=True)
@@ -238,10 +241,11 @@ def process_array_delay_doppler_frame(
         args.pol,
         drop_bad=args.drop_bad_stands,
         require_positions=wants_positions,
+        operational_only=args.operational_only,
     )
     if missing_position_stands:
         print(
-            "Dropping selected channel(s) without built-in LWA positions before array processing: "
+            "Dropping selected channel(s) without LSL LWA-SV positions before array processing: "
             f"{missing_position_stands}",
             flush=True,
         )
@@ -262,6 +266,7 @@ def process_array_delay_doppler_frame(
     covariance_note = None
     frame_warning = None
 
+    cable_factors = array_cable_factors(args, metadata, channel_stands, channel_pols, fc)
     for chunk_start, chunk_stop, rdc0_chunk in iter_rdc0_hdf5_channel_chunks(
         cache_path,
         args.channel_chunk_size,
@@ -312,6 +317,7 @@ def process_array_delay_doppler_frame(
                 raise RuntimeError("Doppler axis changed unexpectedly between RDC0 chunks")
 
         rdc2_chunk = rdc2_chunk[:, fd_mask, :]
+        rdc2_chunk *= cable_factors[chunk_start:chunk_stop].astype(rdc2_chunk.dtype)
         if args.gap_fill == "zero":
             rdc2_chunk, bad_count = zero_fill_nonfinite_complex(rdc2_chunk)
             nonfinite_rdc2_values_filled += bad_count
@@ -562,6 +568,7 @@ def process_array_delay_doppler_frame(
                 ("Array channels", f"{len(selected_channel_indices)} {args.pol}-pol"),
                 ("Stands used", str(len(np.unique(channel_stands)))),
                 ("Angle method", args.angle_method.upper()),
+                ("Cable phase", getattr(args, "_cable_note", "unknown")),
                 ("Angle source", angle_source),
                 ("Min snapshots", str(args.angle_min_snapshots)),
                 ("Diag loading", f"{args.diagonal_loading:g}"),
@@ -640,6 +647,7 @@ def process_array_delay_doppler_frame(
     if args.fd_min is not None or args.fd_max is not None:
         info_rows.append(("Doppler limits", f"{args.fd_min} to {args.fd_max} Hz"))
     info_rows.extend(_lfm_info_rows(lfm_config))
+    info_rows.append(("Cable phase", getattr(args, "_cable_note", "unknown")))
 
     footer_note = "\n".join(note for note in [
         gap_fill_note(metadata.get("gap_info")),
@@ -710,7 +718,7 @@ def process_array_delay_doppler_rdc2_frame(args, fc, frame_idx, nframes, source_
 
     if missing_position_stands:
         print(
-            "Dropping selected channel(s) without built-in LWA positions before array processing: "
+            "Dropping selected channel(s) without LSL LWA-SV positions before array processing: "
             f"{missing_position_stands}",
             flush=True,
         )
@@ -858,6 +866,7 @@ def process_array_delay_doppler_rdc2_frame(args, fc, frame_idx, nframes, source_
                 ("Array channels", f"{len(selected_channel_indices)} {args.pol}-pol"),
                 ("Stands used", str(len(np.unique(channel_stands)))),
                 ("Angle method", args.angle_method.upper()),
+                ("Cable phase", getattr(args, "_cable_note", "unknown")),
                 ("Angle source", angle_source),
                 ("RDC2 cache", "yes"),
                 ("Plot span", f"{frame_tstart:.3f}-{frame_tend:.3f} s"),
@@ -924,6 +933,7 @@ def process_array_delay_doppler_rdc2_frame(args, fc, frame_idx, nframes, source_
         ("RDC2 cache", "yes"),
     ])
     info_rows.extend(_lfm_info_rows(lfm_config))
+    info_rows.append(("Cable phase", getattr(args, "_cable_note", "unknown")))
     footer_note = "\n".join(note for note in [
         gap_fill_note(metadata.get("gap_info")),
         f"RDC2 nonfinite values replaced with zeros in this frame: {nonfinite_rdc2_values_filled}"
@@ -957,7 +967,7 @@ def main():
     )
     parser.add_argument("input_file", nargs="?", help="Input TBN file; omit when using --rdc0-input")
     parser.add_argument("--rdc0-input", default=None, help="Existing RDC0 HDF5 file to process")
-    parser.add_argument("--rdc2-input", default=None, help="Existing RDC2 HDF5 file to plot without redoing range/Doppler FFTs")
+    parser.add_argument("--rdc2-input", default=None, help="RDC2 cache; timing overrides recompute Doppler from retained RDC1")
     parser.add_argument("--output", required=True, help="Output directory for frame PNGs and video")
 
     parser.add_argument("--integration-time", type=float, default=None)
@@ -971,6 +981,14 @@ def main():
                         help="Output PNG showing the conventional array point-spread/beam pattern for the first resolved look direction")
     parser.add_argument("--angle-plot-vmin", type=float, default=-40.0)
     parser.add_argument("--angle-plot-vmax", type=float, default=0.0)
+    parser.add_argument("--beam-pattern-vmin", type=float, default=-40.0,
+                        help="Beam-pattern color minimum in dB relative to its peak")
+    parser.add_argument("--beam-pattern-vmax", type=float, default=0.0,
+                        help="Beam-pattern color maximum in dB relative to its peak")
+    parser.add_argument("--cable-correction", choices=["auto", "on", "off"], default="auto",
+                        help="Correct LSL LWA-SV cable phase at RF center; auto skips ideal simulations and already-corrected input")
+    parser.add_argument("--operational-only", action="store_true",
+                        help="Additionally require LSL combined_status=33 (installed station status, not observation-date status)")
     parser.add_argument("--angle-source", choices=["window", "cells"], default="window",
                         help="Use the full plotted delay-Doppler window or selected cells for angle spectra")
     parser.add_argument("--angle-top-n", type=int, default=0,
@@ -1073,8 +1091,8 @@ def main():
     start_timestamp_for_alignment = None
     if args.rdc2_input:
         source_name = args.rdc2_input
-        rdc2_metadata = load_rdc2_hdf5_metadata(args.rdc2_input)
-        from tbn_array_delay_doppler import apply_rdc2_metadata_defaults
+        rdc2_metadata = prepare_rdc2_view(args)
+        args._rdc2_view = rdc2_metadata
         apply_rdc2_metadata_defaults(args, rdc2_metadata["metadata"])
         if args.sweep_frequency is None or args.bandwidth is None:
             raise ValueError("RDC2 metadata is missing sweep_frequency_hz or bandwidth_hz")

@@ -923,6 +923,40 @@ def plot_iq_spectrogram(
         plt.show(block=True)
 
 
+def plot_dechirp_profile(delay_ms, spectra, lfm_config, title="Dechirped Power–Delay Profile",
+                         output_file=None, time_units="ms", vmin=None, vmax=None,
+                         corner_note=None, info_rows=None, info_panel_footer_note=None):
+    """Sum polarization powers, then average valid sweep powers before taking dB."""
+    spectra = np.asarray(spectra)
+    if spectra.ndim == 2:
+        spectra = spectra[None, ...]
+    if spectra.ndim != 3 or spectra.shape[1] == 0:
+        raise ValueError("Profile requires at least one complete sweep")
+    power = np.sum(np.abs(spectra) ** 2, axis=0)
+    valid = np.isfinite(power)
+    counts = valid.sum(axis=0)
+    mean_power = np.divide(np.where(valid, power, 0).sum(axis=0), counts,
+                           out=np.full(power.shape[1], np.nan), where=counts > 0)
+    if not np.any(counts):
+        raise ValueError("No valid sweeps available for a dechirped profile")
+    rows = list(info_rows or []) + _lfm_info_rows(lfm_config)
+    fig, ax = _new_figure_with_info(figsize=(14, 4.8))
+    ax.plot(np.asarray(delay_ms) / (1000 if time_units == "s" else 1),
+            10 * np.log10(mean_power + 1e-12))
+    ax.set(xlabel=f"Delay [{time_units}]", ylabel="Mean power [dB]", title=title)
+    ax.set_ylim(bottom=vmin, top=vmax)
+    ax.grid(True)
+    _add_info_panel(fig, info_rows=rows, corner_note=corner_note,
+                    footer_note=info_panel_footer_note)
+    _tight_layout_with_info(fig, has_info=True)
+    if output_file:
+        _savefig(output_file, dpi=300)
+    else:
+        plt.show()
+    plt.close(fig)
+    return ax
+
+
 def plot_matched_filter_output(
         lags: np.ndarray,
         magnitude_response: np.ndarray,
@@ -1325,6 +1359,11 @@ def plot_delay_doppler_dechirp(
     # Doppler FFT across slow-time
     if nfft_doppler is None:
         nfft_doppler = 1 << int(np.ceil(np.log2(max(slow_len, 1))))
+    if nfft_doppler < slow_len:
+        raise ValueError(
+            f"Doppler FFT length ({nfft_doppler}) must be >= the number of sweeps ({slow_len}); "
+            "a shorter FFT truncates the slow-time window. Increase --nfft-doppler or omit it."
+        )
 
     print(f"Using nfft_doppler={nfft_doppler} for Doppler FFT (slow_len={slow_len})")
 
@@ -1480,6 +1519,11 @@ def plot_doppler_time_from_delay_band(
 
     if nfft_doppler is None:
         nfft_doppler = 1 << int(np.ceil(np.log2(max(window_len, 1))))
+    if nfft_doppler < window_len:
+        raise ValueError(
+            f"Doppler FFT length ({nfft_doppler}) must be >= the number of sweeps ({window_len}); "
+            "a shorter FFT truncates the slow-time window. Increase --nfft-doppler or omit it."
+        )
 
     w = window_from_arg(window_len, slow_window).astype(np.float32, copy=False)
     coherent_gain = np.mean(w)

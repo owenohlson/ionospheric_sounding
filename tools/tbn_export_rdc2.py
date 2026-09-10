@@ -110,13 +110,15 @@ def make_temp_rdc0(args, fs):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Export TBN/RDC0 data as RDC2 delay-Doppler radar data cube: (frames, delay, doppler, channels).",
+        description="Export a 3D RDC2 with retained RDC1 for later integration/hop selection; explicit timing exports windowed RDC2.",
         formatter_class=lambda prog: argparse.ArgumentDefaultsHelpFormatter(prog, max_help_position=35),
     )
     parser.add_argument("input_file", nargs="?", help="Input TBN file; omit when using --rdc0-input")
     parser.add_argument("--rdc0-input", default=None, help="Existing RDC0 HDF5 file to process")
     parser.add_argument("--output", required=True, help="Output RDC2 HDF5 file")
 
+    parser.add_argument("--no-store-rdc1", action="store_true",
+                        help="Omit per-sweep data; integration/hop cannot then be changed after export")
     parser.add_argument("--tstart", type=float, default=None)
     parser.add_argument("--tend", type=float, default=None)
     parser.add_argument("--duration", type=float, default=None)
@@ -167,6 +169,7 @@ def main():
     if args.rdc0_input is None and args.input_file is None:
         raise ValueError("Provide a TBN input_file or --rdc0-input")
 
+    windowed_export = args.integration_time is not None or args.hop_time is not None
     delete_rdc0 = False
     if args.rdc0_input:
         rdc0_path = os.path.expanduser(args.rdc0_input)
@@ -202,15 +205,29 @@ def main():
     if args.tend <= args.tstart:
         raise ValueError("--tend must be greater than --tstart")
 
-    selected_span = args.tend - args.tstart
+    # TBN extraction has already applied the requested start time. Cache reads
+    # instead index directly into the existing RDC0; never apply TBN tstart twice.
+    selection_start = int(round(args.tstart * args.sweep_frequency)) if args.rdc0_input else 0
+    selection_stop = (int(round(args.tend * args.sweep_frequency)) if args.rdc0_input
+                      else rdc0_shape[1])
+    if selection_start < 0 or selection_stop > rdc0_shape[1] or selection_stop <= selection_start:
+        raise ValueError("Selected time range is outside the RDC0 cache")
+    selected_pulses = selection_stop - selection_start
+    selected_span = selected_pulses / args.sweep_frequency
+    time_origin = (selection_start / args.sweep_frequency if args.rdc0_input else
+                   args.tstart + float(rdc0_metadata.get("start_offset_samples", 0)) / fs)
     if args.integration_time is None:
         args.integration_time = selected_span
     if args.hop_time is None:
         args.hop_time = args.integration_time
-    if args.integration_time <= 0 or args.hop_time <= 0:
-        raise ValueError("--integration-time and --hop-time must be > 0")
-    if selected_span < args.integration_time:
-        raise ValueError("Selected time range is shorter than --integration-time")
+    if not np.isfinite(args.integration_time) or not np.isfinite(args.hop_time) or args.integration_time <= 0 or args.hop_time <= 0:
+        raise ValueError("--integration-time and --hop-time must be finite and > 0")
+    pulse_count = int(round(args.integration_time * args.sweep_frequency))
+    hop_pulses = int(round(args.hop_time * args.sweep_frequency))
+    if pulse_count < 1 or hop_pulses < 1 or pulse_count > selected_pulses:
+        raise ValueError("Integration/hop must contain complete sweeps within the selected span")
+    args.integration_time = pulse_count / args.sweep_frequency
+    args.hop_time = hop_pulses / args.sweep_frequency
 
     lfm_config = LFMWaveform(
         sample_rate=fs,
@@ -240,8 +257,8 @@ def main():
         raise ValueError("No Doppler bins selected; check --fd-min/--fd-max")
     doppler_count = int(np.count_nonzero(fd_mask))
 
-    frame_count = int(np.floor((selected_span - args.integration_time) / args.hop_time)) + 1
-    frame_tstart = args.tstart + np.arange(frame_count, dtype=float) * args.hop_time
+    frame_count = (selected_pulses - pulse_count) // hop_pulses + 1
+    frame_tstart = time_origin + np.arange(frame_count, dtype=float) * args.hop_time
     frame_tend = frame_tstart + args.integration_time
 
     stands = parse_stands(args.stands, max_stand=args.max_stand, drop_bad=False)
@@ -254,11 +271,11 @@ def main():
     )
     n_channels = int(len(channel_indices))
     expected_bytes = estimate_rdc2_bytes(frame_count, delay_count, doppler_count, n_channels, args.dtype)
-    print(
-        f"RDC2 shape will be (frames={frame_count}, delay={delay_count}, "
-        f"doppler={doppler_count}, channels={n_channels})",
-        flush=True,
-    )
+    storage_shape = ((frame_count, delay_count, doppler_count, n_channels) if windowed_export
+                     else (delay_count, doppler_count, n_channels))
+    rdc1_bytes = 0 if args.no_store_rdc1 else 2 * delay_count * selected_pulses * n_channels * np.dtype(args.dtype).itemsize
+    print(f"RDC2 shape will be {storage_shape}", flush=True)
+    print(f"Retained RDC1 uncompressed size: {format_bytes(rdc1_bytes)}", flush=True)
     print(f"Uncompressed real/imag size: {format_bytes(expected_bytes)}", flush=True)
     print(f"Channels include {len(set(channel_stands.tolist()))} stand(s), pol stream(s): {sorted(set(channel_pols.tolist()))}", flush=True)
     if args.dry_run_size:
@@ -279,7 +296,9 @@ def main():
     tmp_output = output_file + ".tmp"
     out_dtype = np.dtype(args.dtype)
     compression_arg, opts = compression_args(args.compression, args.compression_level)
-    chunks = (1, delay_count, doppler_count, min(n_channels, max(1, int(args.channel_chunk_size))))
+    chunks = (min(delay_count, 32), min(doppler_count, 256), min(n_channels, max(1, int(args.channel_chunk_size))))
+    if windowed_export:
+        chunks = (1,) + chunks
     nonfinite_rdc0_values_filled = 0
 
     try:
@@ -287,7 +306,7 @@ def main():
             grp = h5.create_group("rdc2")
             dset_real = grp.create_dataset(
                 "real",
-                shape=(frame_count, delay_count, doppler_count, n_channels),
+                shape=storage_shape,
                 dtype=out_dtype,
                 chunks=chunks,
                 compression=compression_arg,
@@ -295,62 +314,62 @@ def main():
             )
             dset_imag = grp.create_dataset(
                 "imag",
-                shape=(frame_count, delay_count, doppler_count, n_channels),
+                shape=storage_shape,
                 dtype=out_dtype,
                 chunks=chunks,
                 compression=compression_arg,
                 compression_opts=opts,
             )
 
-            delay_ms = None
-            doppler_hz = None
-            for frame_idx, start_s in enumerate(frame_tstart):
-                pulse_start = int(round(start_s * args.sweep_frequency))
-                pulse_stop = pulse_start + pulse_count
-                print(
-                    f"Exporting RDC2 frame {frame_idx + 1}/{frame_count} "
-                    f"(t={start_s:.3f}-{frame_tend[frame_idx]:.3f} s)",
-                    flush=True,
-                )
-                out_channel = 0
-                for chunk_start, chunk_stop, rdc0_chunk in iter_rdc0_hdf5_channel_chunks(
-                    rdc0_path,
-                    args.channel_chunk_size,
-                    channel_indices=channel_indices,
-                    pulse_start=pulse_start,
-                    pulse_stop=pulse_stop,
-                ):
-                    if args.gap_fill == "zero":
-                        finite = np.isfinite(rdc0_chunk.real) & np.isfinite(rdc0_chunk.imag)
-                        bad_count = int(rdc0_chunk.size - np.count_nonzero(finite))
-                        if bad_count:
-                            nonfinite_rdc0_values_filled += bad_count
-                            rdc0_chunk = np.nan_to_num(rdc0_chunk, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-                    rdc1_band, chunk_delay_ms = dechirp_range_fft_delay_band_rdc0(
-                        rdc0_chunk,
-                        lfm_config,
-                        args.d_min,
-                        args.d_max,
-                        window=None if args.dechirp_window == "none" else args.dechirp_window,
-                        adc_start=adc_start,
+            rdc1_group = None
+            if not args.no_store_rdc1:
+                rdc1_group = h5.create_group("rdc1")
+                for component in ("real", "imag"):
+                    rdc1_group.create_dataset(
+                        component, shape=(delay_count, selected_pulses, n_channels),
+                        dtype=out_dtype, chunks=(min(delay_count, 32), min(selected_pulses, 256), chunks[-1]),
+                        compression=compression_arg, compression_opts=opts,
                     )
-                    rdc2_chunk, chunk_fd_hz = doppler_fft_rdc1(
-                        rdc1_band,
-                        prf=args.sweep_frequency,
+                rdc1_group.attrs["tstart_s"] = time_origin
+                rdc1_group.attrs["sweep_frequency_hz"] = args.sweep_frequency
+
+            delay_ms = None
+            doppler_hz = fd_hz_full[fd_mask]
+            for chunk_start, chunk_stop, rdc0_chunk in iter_rdc0_hdf5_channel_chunks(
+                rdc0_path, args.channel_chunk_size, channel_indices=channel_indices,
+                pulse_start=selection_start, pulse_stop=selection_stop,
+            ):
+                if args.gap_fill == "zero":
+                    finite = np.isfinite(rdc0_chunk.real) & np.isfinite(rdc0_chunk.imag)
+                    nonfinite_rdc0_values_filled += int(finite.size - np.count_nonzero(finite))
+                    rdc0_chunk = np.nan_to_num(rdc0_chunk, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+                rdc1_band, delay_ms = dechirp_range_fft_delay_band_rdc0(
+                    rdc0_chunk, lfm_config, args.d_min, args.d_max,
+                    window=None if args.dechirp_window == "none" else args.dechirp_window,
+                    adc_start=adc_start,
+                )
+                del rdc0_chunk
+                if rdc1_group is not None:
+                    rdc1_group["real"][:, :, chunk_start:chunk_stop] = rdc1_band.real.astype(out_dtype)
+                    rdc1_group["imag"][:, :, chunk_start:chunk_stop] = rdc1_band.imag.astype(out_dtype)
+                for frame_idx in range(frame_count):
+                    start = frame_idx * hop_pulses
+                    cube, _ = doppler_fft_rdc1(
+                        rdc1_band[:, start:start + pulse_count, :], args.sweep_frequency,
                         window=None if args.slow_window == "none" else args.slow_window,
                         nfft=nfft_doppler,
                     )
-                    rdc2_chunk = rdc2_chunk[:, fd_mask, :]
-                    if delay_ms is None:
-                        delay_ms = chunk_delay_ms
-                        doppler_hz = chunk_fd_hz[fd_mask]
-                    elif not np.array_equal(delay_ms, chunk_delay_ms) or not np.array_equal(doppler_hz, chunk_fd_hz[fd_mask]):
-                        raise RuntimeError("RDC2 axes changed unexpectedly between chunks")
-                    out_stop = out_channel + rdc2_chunk.shape[2]
-                    dset_real[frame_idx, :, :, out_channel:out_stop] = rdc2_chunk.real.astype(out_dtype, copy=False)
-                    dset_imag[frame_idx, :, :, out_channel:out_stop] = rdc2_chunk.imag.astype(out_dtype, copy=False)
-                    out_channel = out_stop
-                    del rdc0_chunk, rdc1_band, rdc2_chunk
+                    cube = cube[:, fd_mask, :]
+                    selection = (slice(None), slice(None), slice(chunk_start, chunk_stop))
+                    if windowed_export:
+                        selection = (frame_idx,) + selection
+                    dset_real[selection] = cube.real.astype(out_dtype)
+                    dset_imag[selection] = cube.imag.astype(out_dtype)
+                print(f"Exported channels {chunk_start + 1}-{chunk_stop}/{n_channels}", flush=True)
+                del rdc1_band, cube
+            if rdc1_group is not None:
+                for name, values in (("delay_ms", delay_ms), ("channel_stands", channel_stands), ("channel_pols", channel_pols)):
+                    rdc1_group.create_dataset(name, data=values)
 
             grp.create_dataset("delay_ms", data=delay_ms)
             grp.create_dataset("doppler_hz", data=doppler_hz)
@@ -360,6 +379,16 @@ def main():
             grp.create_dataset("channel_pols", data=channel_pols)
             h5.attrs["metadata_json"] = metadata_json(
                 rdc_stage=2,
+                cache_version=2,
+                retains_rdc1=not args.no_store_rdc1,
+                storage_shape=list(storage_shape),
+                station=rdc0_metadata.get("station", "lwasv"),
+                channel_id_kind=rdc0_metadata.get("channel_id_kind", "legacy_input_pair"),
+                channel_digitizers=([int(rdc0_metadata["channel_digitizers"][i]) for i in channel_indices]
+                                    if rdc0_metadata.get("channel_digitizers") is not None else None),
+                cable_phase_corrected=rdc0_metadata.get("cable_phase_corrected", False),
+                synthetic=rdc0_metadata.get("synthetic", False),
+                cable_delays_injected=rdc0_metadata.get("cable_delays_injected", False),
                 source_file=os.path.basename(args.input_file) if args.input_file else None,
                 source_rdc0=os.path.basename(args.rdc0_input) if args.rdc0_input else None,
                 shape_frames_delay_doppler_channels=[int(frame_count), int(delay_count), int(doppler_count), int(n_channels)],
@@ -367,8 +396,8 @@ def main():
                 tuning_frequency_hz=rdc0_metadata.get("tuning_frequency_hz"),
                 sweep_frequency_hz=float(args.sweep_frequency),
                 bandwidth_hz=float(args.bandwidth),
-                tstart=float(args.tstart),
-                tend=float(args.tend),
+                tstart=float(time_origin),
+                tend=float(time_origin + selected_span),
                 integration_time_s=float(args.integration_time),
                 hop_time_s=float(args.hop_time),
                 d_min_ms=float(args.d_min),
@@ -407,8 +436,8 @@ def main():
                 pass
 
     print(f"Wrote {output_file}", flush=True)
-    print(f"Actual RDC2 shape: {(frame_count, delay_count, doppler_count, n_channels)}", flush=True)
-    print(f"Actual uncompressed size: {format_bytes(expected_bytes)}", flush=True)
+    print(f"Actual RDC2 shape: {storage_shape}", flush=True)
+    print(f"Actual uncompressed size: {format_bytes(expected_bytes + rdc1_bytes)}", flush=True)
     if nonfinite_rdc0_values_filled:
         print(f"Replaced {nonfinite_rdc0_values_filled} nonfinite RDC0 values with zeros before processing", flush=True)
 
