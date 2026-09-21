@@ -1,4 +1,4 @@
-# tbn_array_delay_doppler.py
+# array_delay_doppler.py
 
 import argparse
 import json
@@ -41,15 +41,7 @@ from rdc_utils import (
     polarization_metadata,
     steering_vector,
 )
-from tbn_utils import file_timestamp_range_note, gap_fill_note, lsl_open_tbn, lsl_print_metadata, set_default_tbn_time_bounds
-
-
-def probe_start_timestamp(filename, tstart):
-    idf = lsl_open_tbn(filename)
-    idf.offset(float(tstart))
-    readT, timestamp, data = idf.read(0.001)
-    del data
-    return timestamp
+from tbn_utils import file_timestamp_range_note, gap_fill_note, lsl_open_tbn, lsl_print_metadata, probe_start_timestamp, set_default_tbn_time_bounds
 
 
 def maybe_make_rdc0_cache(args, fs, start_offset_samples):
@@ -728,6 +720,38 @@ def angle_snapshot_block(
     }
 
 
+def prepare_array_input(args):
+    """Resolve a positional HDF5 input and inherit its raw sampling metadata."""
+    import json
+    import h5py
+    if args.input_file and args.input_file.lower().endswith((".h5", ".hdf5")):
+        if args.rdc0_input or args.rdc2_input:
+            raise ValueError("Provide only one HDF5 input")
+        with h5py.File(os.path.expanduser(args.input_file), "r") as h5:
+            if "rdc2" in h5:
+                args.rdc2_input = args.input_file
+            elif "rdc0" in h5:
+                args.rdc0_input = args.input_file
+            else:
+                raise ValueError("Array plots need RDC0 or RDC2; convert RDC1 using rdc_export.py --stage 2")
+        args.input_file = None
+    path = args.rdc2_input or args.rdc0_input
+    if not path:
+        return
+    with h5py.File(os.path.expanduser(path), "r") as h5:
+        metadata = json.loads(h5.attrs.get("metadata_json", "{}"))
+    if metadata.get("channel_id_kind") == "receiver" or metadata.get("source_format") == "wav":
+        raise ValueError("Array beamforming requires physical antenna geometry; a WAV I/Q receiver has no LWA array channels. Use plot_delay_doppler.py instead.")
+    if args.rdc0_input:
+        for attr, key in (("sweep_frequency", "sweep_frequency_hz"), ("bandwidth", "bandwidth_hz")):
+            value = metadata.get(key)
+            requested = getattr(args, attr)
+            if value is not None and requested is not None and not np.isclose(value, requested):
+                raise ValueError(f"--{attr.replace('_', '-')} conflicts with cached {key}")
+            if requested is None:
+                setattr(args, attr, value)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Array delay-Doppler processing from TBN/RDC0 through RDC1/RDC2 and optional MVDR angle spectra.",
@@ -843,6 +867,7 @@ def main():
     parser.add_argument("--reference-gate-phase", type=float, default=0.0)
 
     args = parser.parse_args()
+    prepare_array_input(args)
     if args.rdc2_input is None and args.rdc0_input is None and args.input_file is None:
         raise ValueError("Provide a TBN input_file, --rdc0-input, or --rdc2-input")
     if args.rdc2_input is not None and (args.rdc0_input is not None or args.input_file is not None):

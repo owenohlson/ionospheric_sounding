@@ -19,11 +19,11 @@ class CableCorrectionTests(unittest.TestCase):
     def setUpClass(cls):
         # Isolate the unavailable raw TBN reader; spatial processing stays real.
         stub = types.ModuleType("tbn_utils")
-        for name in ["file_timestamp_range_note", "gap_fill_note", "lsl_open_tbn",
+        for name in ["file_timestamp_range_note", "gap_fill_note", "lsl_open_tbn", "probe_start_timestamp",
                      "lsl_print_metadata", "set_default_tbn_time_bounds"]:
             setattr(stub, name, lambda *a, **kw: None)
         with patch.dict(sys.modules, {"tbn_utils": stub}):
-            cls.array = importlib.import_module("tbn_array_delay_doppler")
+            cls.array = importlib.import_module("array_delay_doppler")
 
     def setUp(self):
         rng = np.random.default_rng(721)

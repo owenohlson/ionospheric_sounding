@@ -1,4 +1,4 @@
-# tbn_sliding_array_delay_doppler.py
+# sliding_array_delay_doppler.py
 
 import argparse
 import gc
@@ -38,7 +38,8 @@ from rdc_utils import (
     load_rdc0_hdf5_metadata,
     parse_stands,
 )
-from tbn_array_delay_doppler import (
+from array_delay_doppler import (
+    prepare_array_input,
     apply_rdc2_metadata_defaults,
     array_cable_factors,
     angle_snapshot_block,
@@ -54,7 +55,7 @@ from tbn_array_delay_doppler import (
     write_beam_pattern_plot,
     zero_fill_nonfinite_complex,
 )
-from tbn_utils import file_timestamp_range_note, gap_fill_note, lsl_open_tbn, lsl_print_metadata, set_default_tbn_time_bounds
+from tbn_utils import file_timestamp_range_note, gap_fill_note, lsl_open_tbn, lsl_print_metadata, probe_start_timestamp, set_default_tbn_time_bounds
 
 
 process = psutil.Process(os.getpid())
@@ -168,14 +169,6 @@ def maybe_write_beam_pattern(args, positions, fc, look_az, look_el, selected_cha
     )
     args._beam_pattern_written = True
     print(f"Wrote {args.beam_pattern_output}", flush=True)
-
-
-def probe_start_timestamp(filename, tstart):
-    idf = lsl_open_tbn(filename)
-    idf.offset(float(tstart))
-    readT, timestamp, data = idf.read(0.001)
-    del data
-    return timestamp
 
 
 def export_frame_rdc0(args, frame_tstart, start_offset_samples):
@@ -1069,6 +1062,7 @@ def main():
     parser.add_argument("--reference-gate-phase", type=float, default=0.0)
 
     args = parser.parse_args()
+    prepare_array_input(args)
     if args.rdc2_input is None and args.rdc0_input is None and args.input_file is None:
         raise ValueError("Provide a TBN input_file, --rdc0-input, or --rdc2-input")
     if args.rdc2_input is not None and (args.rdc0_input is not None or args.input_file is not None):

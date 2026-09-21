@@ -2,6 +2,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import shutil
 from pathlib import Path
 import sys
 import tempfile
@@ -23,9 +24,10 @@ class CacheTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         stub = types.ModuleType("tbn_utils")
-        for name in ("lsl_open_tbn", "lsl_print_metadata", "set_default_tbn_time_bounds"):
+        for name in ("lsl_open_tbn", "lsl_print_metadata", "probe_start_timestamp", "set_default_tbn_time_bounds"):
             setattr(stub, name, lambda *a, **kw: None)
-        spec = importlib.util.spec_from_file_location("export_under_test", Path(__file__).resolve().parents[1] / "tools/tbn_export_rdc2.py")
+        cls.tbn_stub = stub
+        spec = importlib.util.spec_from_file_location("export_under_test", Path(__file__).resolve().parents[1] / "tools/rdc_export.py")
         cls.exporter = importlib.util.module_from_spec(spec)
         with patch.dict(sys.modules, {"tbn_utils": stub}):
             spec.loader.exec_module(cls.exporter)
@@ -115,10 +117,12 @@ class CacheTests(unittest.TestCase):
         np.testing.assert_allclose(rebuilt, stored, rtol=2e-6, atol=2e-5)
 
     def test_raw_nonzero_start_is_applied_once(self):
-        fake = types.SimpleNamespace(get_info=lambda key: 64.)
+        fake = types.SimpleNamespace(get_info=lambda key: 64., close=lambda: None)
         # Extraction returns an already trimmed temporary RDC0.
-        with patch.object(self.exporter, "lsl_open_tbn", return_value=fake), \
-             patch.object(self.exporter, "make_temp_rdc0", return_value=str(self.source)):
+        with patch.object(self.tbn_stub, "lsl_open_tbn", return_value=fake), \
+             patch.dict(sys.modules, {"tbn_utils": self.tbn_stub}), \
+             patch.object(self.exporter, "export_raw_rdc0",
+                          side_effect=lambda args, fs, output, **kw: shutil.copyfile(self.source, output)):
             self.export("--tstart", "10", "--tend", "15", raw=True)
         loaded = load_rdc2_hdf5_metadata(self.output)
         np.testing.assert_array_equal(loaded["frame_tstart_s"], [10])
@@ -129,12 +133,12 @@ class CacheTests(unittest.TestCase):
     def test_array_plot_commands_accept_new_and_legacy_caches(self):
         import importlib
         stub = types.ModuleType("tbn_utils")
-        for name in ("file_timestamp_range_note", "gap_fill_note", "lsl_open_tbn",
+        for name in ("file_timestamp_range_note", "gap_fill_note", "lsl_open_tbn", "probe_start_timestamp",
                      "lsl_print_metadata", "set_default_tbn_time_bounds"):
             setattr(stub, name, lambda *a, **kw: None)
         with patch.dict(sys.modules, {"tbn_utils": stub}):
-            array = importlib.import_module("tbn_array_delay_doppler")
-            sliding = importlib.import_module("tbn_sliding_array_delay_doppler")
+            array = importlib.import_module("array_delay_doppler")
+            sliding = importlib.import_module("sliding_array_delay_doppler")
         self.export()
         image = Path(self.tmp.name) / "array.png"
         common = ["--rdc2-input", str(self.output), "--beamformer", "incoherent",

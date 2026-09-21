@@ -54,7 +54,7 @@ def cable_phase_factors(stands, pols, frequency_hz):
 def cached_physical_channel_ids(stands, pols, metadata):
     """Legacy real-data exporters labeled digitizer pairs as stands."""
     kind = metadata.get("channel_id_kind", "physical_stand" if metadata.get("synthetic") else "legacy_input_pair")
-    if kind == "physical_stand":
+    if kind in ("physical_stand", "receiver"):
         return np.asarray(stands, dtype=int), np.asarray(pols, dtype=int)
     if kind != "legacy_input_pair":
         raise ValueError(f"Unknown cached channel ID convention: {kind}")
@@ -512,6 +512,56 @@ def _rdc2_group(h5, path):
     return grp
 
 
+def _rdc1_group(h5, path):
+    if "rdc1" not in h5:
+        raise ValueError(f"HDF5 file '{path}' does not contain '/rdc1'")
+    grp = h5["rdc1"]
+    for name in ("real", "imag", "delay_ms", "channel_stands", "channel_pols"):
+        if name not in grp:
+            raise ValueError(f"Missing RDC1 dataset: {name}")
+    shape = grp["real"].shape
+    if len(shape) != 3 or shape != grp["imag"].shape or any(n == 0 for n in shape):
+        raise ValueError("RDC1 real/imag must have matching nonempty (delay, pulses, channels) shapes")
+    for name, count in (("delay_ms", shape[0]), ("channel_stands", shape[2]), ("channel_pols", shape[2])):
+        if grp[name].shape != (count,):
+            raise ValueError(f"RDC1 {name} does not match cube dimensions")
+    return grp
+
+
+def load_rdc1_hdf5_metadata(path):
+    """Read standalone RDC1 or the retained RDC1 inside an RDC2 cache."""
+    import h5py
+
+    path = os.path.expanduser(path)
+    with _open_hdf5_read(path, h5py) as h5:
+        grp = _rdc1_group(h5, path)
+        metadata = json.loads(h5.attrs.get("metadata_json", "{}"))
+        for attr, key in (("tstart_s", "tstart"), ("sweep_frequency_hz", "sweep_frequency_hz")):
+            if attr in grp.attrs:
+                value = float(grp.attrs[attr])
+                if key in metadata and not np.isclose(value, metadata[key], rtol=1e-10, atol=1e-10):
+                    raise ValueError(f"Conflicting RDC1 metadata for {key}")
+                metadata[key] = value
+        for key in ("sample_rate_hz", "sweep_frequency_hz", "bandwidth_hz"):
+            value = metadata.get(key)
+            if value is None or not np.isfinite(value) or value == 0 or (key != "bandwidth_hz" and value < 0):
+                raise ValueError(f"Missing or invalid RDC1 metadata: {key}")
+        delay_ms = grp["delay_ms"][...]
+        if not np.all(np.isfinite(delay_ms)) or np.any(np.diff(delay_ms) <= 0):
+            raise ValueError("RDC1 delay_ms must be finite and strictly increasing")
+        stands, pols = cached_physical_channel_ids(grp["channel_stands"][...], grp["channel_pols"][...], metadata)
+        return dict(shape=grp["real"].shape, delay_ms=delay_ms,
+                    channel_stands=stands, channel_pols=pols, metadata=metadata)
+
+
+def iter_rdc1_hdf5_channel_chunks(path, channel_chunk_size=8, channel_indices=None,
+                                  pulse_start=None, pulse_stop=None, delay_selection=None):
+    yield from iter_rdc0_hdf5_channel_chunks(
+        path, channel_chunk_size, channel_indices, pulse_start, pulse_stop,
+        _stage=1, _delay_selection=delay_selection,
+    )
+
+
 def load_rdc0_hdf5(path):
     try:
         import h5py
@@ -568,6 +618,9 @@ def iter_rdc0_hdf5_channel_chunks(
     channel_indices=None,
     pulse_start=None,
     pulse_stop=None,
+    *,
+    _stage=0,
+    _delay_selection=None,
 ):
     try:
         import h5py
@@ -579,7 +632,7 @@ def iter_rdc0_hdf5_channel_chunks(
         raise ValueError("channel_chunk_size must be >= 1")
 
     with _open_hdf5_read(path, h5py) as h5:
-        grp = _rdc0_group(h5, path)
+        grp = _rdc0_group(h5, path) if _stage == 0 else _rdc1_group(h5, path)
         real = grp["real"]
         imag = grp["imag"]
         n_channels = real.shape[2]
@@ -598,7 +651,8 @@ def iter_rdc0_hdf5_channel_chunks(
         for start in range(0, selected.size, channel_chunk_size):
             stop = min(start + channel_chunk_size, selected.size)
             idx = selected[start:stop]
-            chunk = real[:, pulse_start:pulse_stop, idx] + 1j * imag[:, pulse_start:pulse_stop, idx]
+            band = slice(None) if _delay_selection is None else _delay_selection
+            chunk = real[band, pulse_start:pulse_stop, idx] + 1j * imag[band, pulse_start:pulse_stop, idx]
             yield start, stop, chunk.astype(np.complex64, copy=False)
 
 
@@ -764,6 +818,8 @@ def export_tbn_rdc0_hdf5(
             compression=compression_arg,
             compression_opts=opts,
         )
+        invalid_counts = grp.create_dataset("invalid_counts", (total_pulses, n_channels), dtype="int64",
+                                            maxshape=(total_pulses, n_channels))
 
         while got < target_seconds and pulse_idx < total_pulses:
             try:
@@ -783,7 +839,7 @@ def export_tbn_rdc0_hdf5(
                             gap_samples = int(round(min(timestamp_gap, target_seconds - got) * fs))
                             if gap_samples > 0:
                                 _gap_warning("Timestamp gap; inserting RDC0 fill", tstart + got, _timestamp_at(first_requested_timestamp, got))
-                                buffer = np.concatenate([buffer, _gap_fill_block(n_channels, gap_samples, gap_fill)], axis=-1)
+                                buffer = np.concatenate([buffer, _gap_fill_block(n_channels, gap_samples, "nan")], axis=-1)
                                 gap_info["events"] += 1
                                 gap_info["samples"] += gap_samples
                                 gap_seconds = gap_samples / fs
@@ -795,7 +851,7 @@ def export_tbn_rdc0_hdf5(
                 gap_seconds = min(timetag_skip_seconds, target_seconds - got)
                 gap_samples = int(round(gap_seconds * fs))
                 _gap_warning("Invalid timetag skip; inserting RDC0 fill", tstart + got, _timestamp_at(first_requested_timestamp, got))
-                buffer = np.concatenate([buffer, _gap_fill_block(n_channels, gap_samples, gap_fill)], axis=-1)
+                buffer = np.concatenate([buffer, _gap_fill_block(n_channels, gap_samples, "nan")], axis=-1)
                 gap_info["events"] += 1
                 gap_info["samples"] += gap_samples
                 got += gap_seconds
@@ -825,6 +881,9 @@ def export_tbn_rdc0_hdf5(
             while buffer.shape[1] >= sweep_length and pulse_idx < total_pulses:
                 sweep = buffer[:, :sweep_length]
                 adc = sweep[:, adc_start:adc_start + adc_count].T
+                invalid_counts[pulse_idx] = np.count_nonzero(~np.isfinite(adc), axis=0)
+                if gap_fill == "zero":
+                    adc = np.where(np.isfinite(adc), adc, 0)
                 dset_real[:, pulse_idx, :] = adc.real.astype(out_dtype, copy=False)
                 dset_imag[:, pulse_idx, :] = adc.imag.astype(out_dtype, copy=False)
                 buffer = buffer[:, sweep_length:]
@@ -833,6 +892,7 @@ def export_tbn_rdc0_hdf5(
                     print(f"Wrote RDC0 pulse {pulse_idx}/{total_pulses}", flush=True)
 
         if pulse_idx < total_pulses:
+            invalid_counts.resize((pulse_idx, n_channels))
             dset_real.resize((int(adc_count), pulse_idx, n_channels))
             dset_imag.resize((int(adc_count), pulse_idx, n_channels))
 
@@ -841,8 +901,17 @@ def export_tbn_rdc0_hdf5(
         grp.create_dataset("adc_sample_index", data=np.arange(adc_start, adc_start + adc_count, dtype=np.int32))
         grp.create_dataset("pulse_index", data=np.arange(pulse_idx, dtype=np.int32))
         h5.attrs["metadata_json"] = metadata_json(
+            rdc_stage=0,
+            dimension_order=["adc", "pulses", "channels"],
+            gap_fill=gap_fill,
+            dtype=str(out_dtype),
+            compression=compression,
+            compression_level=compression_level,
             shape_adc_pulses_channels=[int(adc_count), int(pulse_idx), int(n_channels)],
             station="lwasv",
+            source_format="tbn",
+            pulse0_utc=(_timestamp_at(first_requested_timestamp, start_offset_samples / fs).isoformat()
+                        if _timestamp_at(first_requested_timestamp, start_offset_samples / fs) is not None else None),
             channel_id_kind="physical_stand",
             channel_digitizers=(stream_indices + 1).tolist(),
             cable_phase_corrected=False,
