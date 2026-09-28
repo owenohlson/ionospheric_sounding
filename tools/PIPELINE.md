@@ -1,98 +1,158 @@
-# One HDF5 plotting pipeline
+# Processing pipeline
 
-Raw TBN and WAV ingestion belongs in `rdc_export.py`. The paired WAV/TBN plotting
-scripts have been replaced by one HDF5-based command per plot type. Existing
-HDF5 files remain readable; raw files now need an export before single-receiver
-plotting. There is no automatic second timestamp alignment when plotting a cache.
-
-## Quick start
-
-From the repository root:
-
-```bash
-python tools/rdc_export.py data/two_path_sim.wav --stage 1 \
-  --sweep-frequency 2 --bandwidth=-100e3 --gap-fill zero \
-  --output data/sim_rdc1.h5
-
-python tools/dechirp_plot.py data/sim_rdc1.h5 --output figures/dechirp.png
-
-python tools/sliding_delay_doppler.py data/sim_rdc1.h5 \
-  --integration-time 120 --hop-time 30 --output figures/sliding_dd
+```
+raw TBN ──preprocess_tbn.py──► repaired TBN ─┐
+raw WAV (mono real / stereo I/Q) ────────────┤
+                                             ▼
+                                   export_rdc0.py   RDC0  (adc, pulses, channels)      raw sweeps
+                                             ▼
+                                   export_rdc1.py   RDC1  (delay, pulses, channels)    dechirp + range FFT
+                                    ┌────────┴─────────┐
+                  export_rdc2.py    ▼                  ▼   export_rdc2p.py
+      RDC2 (frames, delay, doppler, channels)     RDC2P (delay, estimates, channels)
+             Doppler FFT                           sweep-to-sweep phase (lag-1) products
+                  ▼
+      export_rdc3.py  RDC3 (frames, delay, doppler, beams)   array beamforming
 ```
 
-The recording must be at least as long as the selected integration. To retain
-raw samples instead, export with `--stage 0`; optionally record `--bandwidth`
-there so plots need no waveform flags. TBN uses the same workflow, with physical
-`--stands`, `--pol`, and optional `--drop-bad-stands` at export. A 30-second example:
+Every export writes one HDF5 file. Its root attribute `metadata_json` holds
+every irreversible choice made so far: sample rate, tuning, sweep rate,
+bandwidth, alignment, channel identities, windows, gating, delay/Doppler crops,
+integration/hop, and gap policy. It also holds a `history` list with one entry per
+export step. Later stages inherit these settings. A request that contradicts an
+already-applied setting is an error, never a silent relabel.
 
-```bash
-python tools/rdc_export.py recording.dat --stage 2 --duration 30 \
-  --sweep-frequency 2 --bandwidth=-99.259377e3 --pol x --drop-bad-stands \
-  --d-min 217.5 --d-max 219.5 --gap-fill zero --output recording_rdc2.h5
+Each export command also accepts any earlier input and chains through the missing
+stages. For example, `export_rdc2.py raw.dat ...` makes a temporary RDC0 first.
+An RDC2 keeps the RDC1 it came from by default, so integration and hop can be
+changed later without re-dechirping.
 
-python tools/array_delay_doppler.py --rdc2-input recording_rdc2.h5 \
-  --beamformer mvdr --output figures/array.png
-```
+The phase path (RDC2P) is per-channel and combined without phases, so it has no
+array stage. Array processing (RDC3, beamformed plots, sky maps) uses the FFT
+path.
 
-## Commands and inputs
+## Where the code lives
 
-| Current command | Supported HDF5 content |
+| Module | Contents |
 | --- | --- |
-| `dechirp_plot.py` | RDC0 or RDC1 (including retained RDC1 in RDC2) |
-| `plot_delay_doppler.py` | RDC0, RDC1, or saved RDC2 |
-| `sliding_delay_doppler.py` | RDC0, RDC1, or saved RDC2 frames |
-| `doppler_time_plot.py` | RDC0 or RDC1, including retained RDC1 |
-| `phase_doppler_plot.py` | RDC0 or RDC1, including retained RDC1 |
-| `phase_doppler_time_plot.py` | RDC0 or RDC1, including retained RDC1 |
-| `sliding_phase_doppler.py` | RDC0 or RDC1, including retained RDC1 |
-| `plot_filter_output.py` | RDC0 or RDC1; dechirped power-delay profile, not matched filtering |
-| `spectrogram.py` | RDC0 with complete ADC sweeps |
-| `array_delay_doppler.py` | LWA RDC0 or RDC2; existing array processing preserved |
-| `sliding_array_delay_doppler.py` | LWA RDC0 or RDC2; existing array processing preserved |
+| `lfm_utils.py` | Maths only: reference chirp and windows, dechirp/range FFT, delay axis, Doppler FFT, pulse-pair (phase) Doppler, sweep alignment, STFT, LFM estimation from a spectrogram |
+| `tbn_utils.py` | TBN only: LSL open/metadata/timestamps, gap-aware sample reader, frame realignment for `preprocess_tbn.py` |
+| `wav_utils.py` | WAV only: info, block reader, UTC parsing |
+| `station_utils.py` | LWA-SV stand positions, cable delays and phase factors, digitizer mapping, bad stands (list or SSMIF status), legacy channel labels |
+| `rdc_io.py` | HDF5 layout: `RDCFile` reader (all stages, legacy formats), `StageWriter`, metadata/history, atomic output |
+| `rdc_utils.py` | Stage-to-stage processing: channel selection, sweep packing, `RDCView` (brings any stored stage to the product a plot needs), exports, array processing (`ArrayProcessor`, covariance, steering, angle spectra, beam pattern), plot reductions |
+| `plotting_utils.py` | Figures only (arrays → PNG) and video assembly |
+| `cli.py` | Shared command-line flag groups and the export command line |
 
-All `tbn_` plotting prefixes have been removed. In particular,
-`delay_doppler_plot.py` is now `plot_delay_doppler.py`. Old TBN array raw-input
-compatibility remains, but exporting first is the recommended common workflow.
-Array RDC1 input should be exported to RDC2 first. Array geometry/cable lookup
-still needs LSL; ordinary WAV/HDF5 plots do not. Legacy LWA caches that labeled
-digitizer pairs instead of physical stands also require LSL to resolve identities.
+## Commands and the inputs they accept
 
-The single-receiver commands accept the HDF5 file positionally or through
-`--rdc0-input`, `--rdc1-input`, or `--rdc2-input` (`--input-rdc2` also works).
-They select the first available stand by default; use `--stand` to choose another.
-`--pol both` combines received power or phase products, never X/Y voltages.
-For WAV it means use the sole receiver of unknown polarization.
+| Command | RDC0 | RDC1 | RDC2 | RDC2P | RDC3 |
+| --- | :-: | :-: | :-: | :-: | :-: |
+| `plot_spectrogram.py` (`--average` for a mean spectrum) | ✓ | | | | |
+| `plot_dechirp.py` (delay vs time) | ✓ | ✓ | ✓ * | | |
+| `plot_power_delay.py` | ✓ | ✓ | ✓ * | | |
+| `plot_delay_doppler.py` / `sliding_delay_doppler.py` | ✓ | ✓ | ✓ | | ✓ |
+| `plot_doppler_time.py` | ✓ | ✓ | ✓ * | | |
+| `plot_phase_doppler.py` (`--kind delay-time` or `doppler-time`) / `sliding_phase_doppler.py` | ✓ | ✓ | ✓ * | ✓ | |
+| `check_array_calibration.py` | ✓ | ✓ | ✓ | | |
 
-## Processing versus display settings
+\* uses the RDC1 retained inside the RDC2 file.
 
-Sample rate, sweep frequency, bandwidth, reference gating, and applied windows
-come from the cache. Conflicting overrides for already-applied processing fail
-instead of silently relabeling data. RDC0 still needs a bandwidth if none was
-recorded at export; fast-time windows/gating can be selected at that stage.
-Timing alignment (`--offset`, `--no-timestamp-align`) belongs at raw export.
+Each command uses the most-processed stored stage that still fits the request.
+For example, a delay-Doppler plot of an RDC2 uses the stored frames. It recomputes
+from the retained RDC1 only if you change `--integration-time`, `--hop-time`,
+`--slow-window` or `--nfft-doppler`. Plots read HDF5 only; export raw
+recordings first.
 
-`--d-min`/`--d-max` remain milliseconds. The default auto window is +/-1.5 ms
-around the strongest preview bin (first 32 sweeps, or first selected saved RDC2
-frame). `--full-delay` selects all stored bins. Cropped caches cannot recover
-discarded delays. Color limits, Doppler zoom, and titles remain plot-time options.
+## Times, channels and delay windows
 
-Single-receiver `--tstart`/`--tend` are seconds relative to the cache's first
-sweep, rounded inward to complete sweeps. UTC annotations use `pulse0_utc`
-where present. Array commands retain their existing cached time-coordinate
-conventions. Saving new caches does not alter an older file's metadata.
+* **Time axis.** Seconds from the first sweep of the original RDC0 export. The
+  same instant keeps the same time in every later file. `--tstart/--tend` use
+  this axis. UTC is shown when known (TBN always; WAV only with `--start-utc`).
+* **Channels.** `--stands` accepts `"5"`, `"1-10,20"`, `first` or `all`; `--pol`
+  accepts x, y or both; `--bad-stands` accepts none, list, status or both.
+  * Single-receiver plots default to the first stand, both pols, incoherently summed.
+  * Array processing (`--beamformer conventional|mvdr`, `--angle-output`,
+    `--beam-pattern-output`) defaults to all stands, x pol, and drops the known-bad list.
+* **Delay window.** The default is ±1.5 ms around the strongest delay in a
+  preview; `--d-min/--d-max` set it explicitly and `--full-delay` shows
+  everything stored. Delays are relative to the sweep reference timing, not
+  physical ranges.
+* **Sweep offset.** With the echo far into the sweep (e.g. 218 ms of 500 ms) and
+  |B| ≠ fs, dechirping leaves a weaker copy at +(fs−|B|)/|k| and loses about 3 dB.
+  Export with `--offset` ≈ observed delay − a few ms to put echoes near 0 ms.
+  The offset is recorded in the metadata.
 
-With saved RDC2, single-receiver DD plots use its existing frames and inherit
-integration/hop/slow window/NFFT. A static plot selects the first complete frame
-inside the time bounds. To change those FFT settings, use RDC1 as the input or
-re-export from the retained RDC1 via `rdc_export.py --rdc1-input ... --stage 2`.
-Array plots retain their existing retained-RDC1 rewindowing support.
+## Examples
 
-Videos need ffmpeg; PNGs are removed only after successful encoding unless
-`--keep-frames` is given. Each run uses a separate frame directory to avoid
-including old PNGs. Gaps are annotated only when present in that view, using
-nonfinite samples or saved per-sweep gap counts. Zero filling after a poisoned
-FFT cannot recover its lost information; use zero fill before the range FFT.
+```bash
+python tools/preprocess_tbn.py raw.dat --tstart 60 --tend 960 --output clean.dat
 
-`spectrogram.py --plot average` averages finite FFT blocks over selected
-channels (all cached channels unless a stand is selected). Its optional `--pfb`
-uses LSL SpecMaster; the normal spectrum/spectrogram uses SciPy.
+python tools/export_rdc2.py clean.dat --sweep-frequency 2 --bandwidth=-99.259377e3 \
+  --pol x --bad-stands list --d-min 217.5 --d-max 219.5 --gap-fill zero \
+  --integration-time 120 --hop-time 30 --output clean_rdc2.h5
+
+python tools/plot_delay_doppler.py clean_rdc2.h5 --stands 5 --output dd_stand5.png
+python tools/sliding_delay_doppler.py clean_rdc2.h5 --beamformer conventional \
+  --angle-output sky --output dd_video
+python tools/plot_delay_doppler.py clean_rdc2.h5 --integration-time 30 --output dd_30s.png
+python tools/export_rdc3.py clean_rdc2.h5 --look 166,58 --output clean_rdc3.h5
+python tools/check_array_calibration.py clean_rdc2.h5 --pol x
+```
+
+Tests: `python -m pytest tests` (needs h5py and soundfile; LSL is not needed,
+because a fake station is used).
+
+## Migrating from the previous scripts
+
+| Old | New |
+| --- | --- |
+| `splitTBNfix.py` | `preprocess_tbn.py` (`--tend` is now an end time; output next to the input; captures are verified and resynchronised; `-r/-d` became `--chunk`) |
+| `rdc_export.py --stage N`, `tbn_export_rdcN.py` | `export_rdc0.py`, `export_rdc1.py`, `export_rdc2.py`, new `export_rdc2p.py`, `export_rdc3.py` |
+| `dechirp_plot.py`, `plot_filter_output.py`, `doppler_time_plot.py`, `spectrogram.py` | `plot_dechirp.py`, `plot_power_delay.py`, `plot_doppler_time.py`, `plot_spectrogram.py` |
+| `phase_doppler_plot.py`, `phase_doppler_time_plot.py` | `plot_phase_doppler.py --kind delay-time / doppler-time` |
+| `array_delay_doppler.py`, `sliding_array_delay_doppler.py` | `plot_delay_doppler.py`, `sliding_delay_doppler.py` with `--beamformer` |
+| `rdc_cache.py`, `rdc_plot.py`, `rdc_plot_input.py`, `wav_rdc.py` | `rdc_io.py`, `rdc_utils.RDCView`, `wav_utils.py` |
+| `array_calibration_check.py` | `check_array_calibration.py` (positional input) |
+
+Renamed flags:
+* `--rdc0-input/--rdc1-input/--rdc2-input` are now the positional input.
+* `--stand` became `--stands`.
+* `--channel-combine` became `--combine`.
+* `--drop-bad-stands`/`--keep-bad-stands`/`--operational-only` became
+  `--bad-stands none|list|status|both`.
+* The four `--reference-gate-*` flags became `--reference-gate FREQ[,DUTY[,PHASE]]`.
+* `--dry-run-size` became `--dry-run`.
+* `--no-store-rdc1` became `--no-keep-rdc1`.
+* `--angle-plot-output`/`--angle-output` (HDF5) became `--angle-output` (PNG, or a
+  directory for videos). `--angle-top-n`/`--angle-source` became `--angle-cells N`.
+* `--angle-delay-ms`/`--angle-doppler-hz` were removed; use `--angle-cells`.
+
+Removed flags:
+* `--max-stand`, `--channel-chunk-size`, `--compression-level` (fixed at gzip
+  level 4), `--rdc0-dtype/--rdc0-compression/--rdc0-compression-level` (temporary
+  RDC0 uses lzf).
+* `--rdc0-cache/--keep-temp-rdc0`, `--rdc2-frame-index` (use `--tstart`).
+* `--auto-delay-sweeps/--auto-delay-half-width`, `--streaming`, `--interactive`,
+  `--units`, `--quiet`.
+* `--pfb` (LSL SpecMaster averaged spectrum).
+* The six `--lfm-overlay-*` manual overlay settings (`--overlay-lfm` draws the estimate).
+* `--no-estimate-lfm-gate`.
+* `--az-min/--az-max/--el-min/--el-max` (full sky; step via `--angle-step`).
+* `--angle-plot-vmin/vmax` and `--beam-pattern-vmin/vmax` (maps are dB re peak,
+  range via `--angle-range-db`).
+* `--angle-flat-fallback/--angle-flat-threshold-db`,
+  `--angle-delay-radius-bins/--angle-doppler-radius-bins/--angle-min-snapshots`
+  (cells use ±1 delay × ±2 Doppler bins).
+* `--mvdr-covariance/--mvdr-background-percentile` (MVDR beams always use the
+  quietest 80 % of cells).
+* `--frame-hop-sweeps` became `--frame-step`.
+
+Behaviour changes:
+* Array plots no longer read raw TBN; export first.
+* The auto look direction is found from the strongest cells, not the whole
+  window, and is logged to `look_directions.csv` in videos.
+* The "virtual range" axis and km rows were removed, because delays are relative.
+* Phase-Doppler estimate times are now centred on the sweeps they use
+  (previously half a sweep early).
+* `LFMWaveform.waveform` always has exactly `sweep_length` samples.

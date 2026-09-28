@@ -1,7 +1,0 @@
-"""doppler time from an RDC HDF5 cache."""
-
-from rdc_plot import main
-
-
-if __name__ == "__main__":
-    main("doppler_time")

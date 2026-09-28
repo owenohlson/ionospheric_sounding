@@ -1,4 +1,9 @@
-# simulate_lwa_rdc2.py
+"""Synthetic LWA-SV RDC2 (frames, delay, doppler, channels) with moving targets and stored truth.
+
+Note: targets are injected with the same steering_vector the processing uses, so
+this tests the plotting/tracking chain, not the steering convention itself
+(tests/test_array_forward_model.py covers that with true time delays).
+"""
 
 import argparse
 import json
@@ -6,15 +11,17 @@ import os
 
 import numpy as np
 
-from rdc_utils import (
-    cable_phase_factors,
-    BAD_LWA_STANDS,
-    get_lwasv_stand_positions,
-    metadata_json,
-    parse_stands,
-    polarization_metadata,
-    steering_vector,
-)
+from rdc_utils import polarization_summary as polarization_metadata, steering_vector
+from station_utils import BAD_LWA_STANDS, cable_phase_factors, parse_stands, stand_positions as lookup_positions
+
+
+def get_lwasv_stand_positions():
+    positions, found = lookup_positions(range(1, 257))
+    return {s: tuple(p) for s, p in zip(np.arange(1, 257)[found], positions)}
+
+
+def metadata_json(**kwargs):
+    return json.dumps(kwargs, indent=2, sort_keys=True)
 
 
 TARGET_NAMES = ["box", "radial", "cross_a", "cross_b", "fader"]
@@ -121,7 +128,9 @@ def target_state(name, frame_idx, n_frames, scenario, delay_min, delay_max, fd_m
 
 
 def select_stands(stand_spec, max_channels, drop_bad):
-    stands = parse_stands(stand_spec, max_stand=256, drop_bad=drop_bad)
+    stands = parse_stands(stand_spec)
+    if drop_bad:
+        stands = [s for s in stands if s not in BAD_LWA_STANDS]
     stand_positions = get_lwasv_stand_positions()
     stands = [stand for stand in stands if int(stand) in stand_positions]
     if max_channels is not None and max_channels > 0:

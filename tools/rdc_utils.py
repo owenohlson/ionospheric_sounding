@@ -1,940 +1,1064 @@
-# rdc_utils.py
+"""Moving data between pipeline stages: raw samples -> RDC0 -> RDC1 -> RDC2 / RDC2P -> RDC3.
 
-import csv
-import json
+Sections
+--------
+1. Channel selection
+2. Raw samples -> RDC0 (sweep packing, TBN/WAV sources)
+3. ``RDCView``: bring any stored stage to the product a plot or export needs
+4. Exports (streaming, one HDF5 file per stage, metadata + history preserved)
+5. Array processing (RDC2 -> RDC3): steering, covariance, beamforming, angle spectra
+6. Reductions used by plots (channel combining, Doppler-time, peak picking)
+
+The numerical kernels (dechirp, FFTs, pulse-pair) live in ``lfm_utils``; file
+layout lives in ``rdc_io``; LWA stand metadata in ``station_utils``.
+"""
+
+import dataclasses
 import os
-from datetime import datetime, timedelta
+import tempfile
+from datetime import timedelta
 
 import numpy as np
 
-from lfm_utils import dechirp_delay_axis_ms, window_from_arg
+import lfm_utils as lfm
+import rdc_io
+import station_utils as station
+
+CHANNEL_CHUNK = 8     # channels processed together when streaming
+PULSE_BLOCK = 64      # sweeps dechirped together when streaming from RDC0
 
 
-BAD_LWA_STANDS = [
-    10, 16, 27, 76, 108, 133, 228, 229, 232, 164,
-    93, 60, 20, 163, 155, 116, 6, 110, 178, 21,
-]
+# ===========================================================================
+# 1. Channel selection
+# ===========================================================================
 
-def get_lwasv_antennas():
-    """Index LSL antennas by physical (stand, polarization), never list order."""
-    from lsl.common import stations
-
-    result = {}
-    for antenna in stations.lwasv.antennas:
-        key = (int(antenna.stand.id), int(antenna.pol))
-        if key in result:
-            raise ValueError(f"Duplicate LWA-SV antenna mapping: {key}")
-        result[key] = antenna
-    return result
-
-
-def lwasv_selected_antennas(stands, pols):
-    if len(stands) != len(pols):
-        raise ValueError("Stand and polarization arrays must have matching lengths")
-    lookup = get_lwasv_antennas()
-    keys = [(int(s), int(p)) for s, p in zip(stands, pols)]
-    missing = [key for key in keys if key not in lookup]
-    if missing:
-        raise ValueError(f"Missing LWA-SV antenna mappings: {missing}")
-    return [lookup[key] for key in keys]
+def select_channels(stands, pols, stand_spec="all", pol="both", bad_stands="none", receiver=False):
+    """Increasing channel indices matching a stand list, polarization and bad-stand policy."""
+    stands, pols = np.asarray(stands, int), np.asarray(pols, int)
+    wanted = station.parse_stands(stand_spec, available=np.unique(stands))
+    mask = np.isin(stands, wanted)
+    if str(pol).lower() != "both":
+        mask &= np.isin(pols, station.pol_indices(pol))
+    if bad_stands != "none" and not receiver:
+        candidates = np.flatnonzero(mask)
+        mask[candidates] &= ~station.bad_stand_mask(stands[candidates], pols[candidates], bad_stands)
+    idx = np.flatnonzero(mask)
+    if not idx.size:
+        raise ValueError("No channels left after --stands/--pol/--bad-stands selection")
+    return idx
 
 
-def cable_phase_factors(stands, pols, frequency_hz):
-    """Undo relative cable phase at RF center; channel axis is last in RDCs."""
-    if frequency_hz is None or not np.isfinite(frequency_hz) or frequency_hz <= 0:
-        raise ValueError("Cable correction requires a positive carrier/tuning frequency")
-    antennas = lwasv_selected_antennas(stands, pols)
-    delays = np.array([a.cable.delay(float(frequency_hz)) for a in antennas], dtype=float)
-    if not delays.size or not np.all(np.isfinite(delays)):
-        raise ValueError("LSL returned empty or nonfinite cable delays")
-    delays -= delays.min()
-    return np.exp(2j * np.pi * float(frequency_hz) * delays)
+def polarization_summary(pols):
+    unique = sorted(int(p) for p in np.unique(pols))
+    mode = {(0,): "x", (1,): "y", (0, 1): "both"}.get(tuple(unique), "unknown")
+    return dict(polarization_mode=mode, polarization_streams=unique, n_polarizations=len(unique))
 
 
-def cached_physical_channel_ids(stands, pols, metadata):
-    """Legacy real-data exporters labeled digitizer pairs as stands."""
-    kind = metadata.get("channel_id_kind", "physical_stand" if metadata.get("synthetic") else "legacy_input_pair")
-    if kind in ("physical_stand", "receiver"):
-        return np.asarray(stands, dtype=int), np.asarray(pols, dtype=int)
-    if kind != "legacy_input_pair":
-        raise ValueError(f"Unknown cached channel ID convention: {kind}")
-    by_digitizer = {int(a.digitizer): a for a in get_lwasv_antennas().values() if a.digitizer > 0}
-    digitizers = [2 * (int(s) - 1) + int(p) + 1 for s, p in zip(stands, pols)]
-    missing = sorted(set(digitizers) - set(by_digitizer))
-    if missing:
-        raise ValueError(f"Legacy cache digitizers absent from LWA-SV metadata: {missing}")
-    antennas = [by_digitizer[d] for d in digitizers]
-    metadata["channel_id_kind"] = "physical_stand"
-    metadata["channel_digitizers"] = digitizers
-    return np.array([a.stand.id for a in antennas]), np.array([a.pol for a in antennas])
+# ===========================================================================
+# 2. Raw samples -> RDC0
+# ===========================================================================
+
+def pack_sweeps(blocks, sweep_length, skip_samples=0, adc_start=0, adc_count=None, max_pulses=None, gap_fill="nan"):
+    """Turn a stream of (channels, n) sample blocks into sweeps.
+
+    Yields ``(pulse_index, adc_block, invalid)``: ``adc_block`` is (adc_count, channels),
+    ``invalid`` counts nonfinite samples per channel before any zero fill.
+    """
+    adc_count = sweep_length - adc_start if adc_count is None else int(adc_count)
+    if adc_start < 0 or adc_count < 1 or adc_start + adc_count > sweep_length:
+        raise ValueError("--adc-start/--adc-count must select samples inside one sweep")
+    buffer = None
+    skip = int(skip_samples)
+    pulse = 0
+    for block, _ in blocks:
+        if skip:
+            drop = min(skip, block.shape[1])
+            block, skip = block[:, drop:], skip - drop
+        buffer = block if buffer is None else np.concatenate([buffer, block], axis=1)
+        while buffer.shape[1] >= sweep_length:
+            sweep = buffer[:, adc_start:adc_start + adc_count].T
+            invalid = np.count_nonzero(~np.isfinite(sweep), axis=0)
+            if gap_fill == "zero" and invalid.any():
+                sweep = np.where(np.isfinite(sweep), sweep, 0)
+            yield pulse, sweep.astype(np.complex64), invalid
+            buffer = buffer[:, sweep_length:]
+            pulse += 1
+            if max_pulses is not None and pulse >= max_pulses:
+                return
 
 
-def get_lwasv_stand_positions():
-    """Return physical stand coordinates in meters from LSL's LWA-SV metadata."""
-    try:
-        from lsl.common import stations
-    except ImportError as exc:
-        raise ImportError(
-            "LWA-SV antenna positions require LSL; run in your LSL environment."
-        ) from exc
-
-    positions = {}
-    for antenna in stations.lwasv.antennas:
-        stand = antenna.stand
-        xyz = (float(stand.x), float(stand.y), float(stand.z))
-        if stand.id in positions and positions[stand.id] != xyz:
-            raise ValueError(f"Inconsistent LSL coordinates for LWA-SV stand {stand.id}")
-        positions[int(stand.id)] = xyz
-    return positions
+@dataclasses.dataclass
+class RawSource:
+    """Everything needed to cut a raw recording into sweeps."""
+    blocks: object                    # generator of (samples[ch, n], gap_samples)
+    sample_rate: float
+    skip_samples: int
+    channel_stands: np.ndarray
+    channel_pols: np.ndarray
+    n_samples: int                    # samples available after tstart
+    metadata: dict
+    close: object = None
 
 
-def pol_to_indices(pol):
-    p = str(pol).strip().lower()
-    if p == "both":
-        return [0, 1]
-    if p in ("x", "0"):
-        return [0]
-    if p in ("y", "1"):
-        return [1]
-    raise ValueError("--pol must be both, x/y, or 0/1")
+def open_raw_source(path, sweep_frequency, tstart=None, tend=None, offset=0.0, timestamp_align=True,
+                    stands="all", pol="both", bad_stands="none", start_utc=None, carrier_frequency=None):
+    """Open a TBN or WAV recording as a ``RawSource`` aligned to the sweep grid."""
+    path = os.path.expanduser(path)
+    if path.lower().endswith(".wav"):
+        import wav_utils
+        info = wav_utils.wav_info(path)
+        fs = info["sample_rate_hz"]
+        if stands not in (None, "all") or pol != "both" or bad_stands != "none":
+            raise ValueError("A WAV file is one receiver; omit --stands/--pol/--bad-stands")
+        period = fs / sweep_frequency
+        if not np.isclose(period, round(period), atol=1e-6):
+            raise ValueError("WAV sample rate / sweep frequency must be an integer number of samples")
+        tstart = 0.0 if tstart is None else tstart
+        tend = info["duration_s"] if tend is None else tend
+        start, stop = int(round(tstart * fs)), int(round(tend * fs))
+        if not 0 <= start < stop <= info["n_samples"]:
+            raise ValueError("Requested time range lies outside the WAV recording")
+        epoch = wav_utils.parse_utc(start_utc)
+        clock = start / fs + (epoch.timestamp() if epoch else 0.0)
+        skip = 0 if not timestamp_align else lfm.sweep_alignment_samples(clock, sweep_frequency, fs, offset)
+        first_utc = epoch + timedelta(seconds=(start + skip) / fs) if epoch else None
+        meta = dict(source_format="wav", station=None, channel_id_kind="receiver", wav_layout=info["layout"],
+                    tuning_frequency_hz=carrier_frequency, sample_rate_hz=fs)
+        return RawSource(wav_utils.read_wav_blocks(path, start, stop - start), fs, skip,
+                         np.array([1]), np.array([-1]), stop - start,
+                         dict(meta, source_tstart_s=tstart, first_sweep_utc=first_utc))
+    import tbn_utils
+    idf = tbn_utils.open_tbn(path)
+    info = tbn_utils.tbn_info(idf)
+    tbn_utils.print_tbn_info(info)
+    fs = info["sample_rate_hz"]
+    tstart = 0.0 if tstart is None else tstart
+    tend = info["usable_duration_s"] if tend is None else tend
+    if not 0 <= tstart < tend:
+        raise ValueError("--tend must be greater than --tstart")
+    stand_list = station.parse_stands(stands, available=station.station_stands())
+    rows, ch_stands, ch_pols = station.tbn_stream_indices(stand_list, pol)
+    if bad_stands != "none":
+        keep = ~station.bad_stand_mask(ch_stands, ch_pols, bad_stands)
+        rows, ch_stands, ch_pols = rows[keep], ch_stands[keep], ch_pols[keep]
+    stamp = tbn_utils.probe_timestamp(path, tstart)
+    frac = tbn_utils.fractional_second(stamp) if timestamp_align else None
+    skip = lfm.sweep_alignment_samples(frac, sweep_frequency, fs, offset)
+    start_dt = tbn_utils.to_datetime(stamp)
+    first_utc = start_dt + timedelta(seconds=skip / fs) if start_dt is not None else None
+    meta = dict(source_format="tbn", station="lwasv", channel_id_kind="physical_stand",
+                channel_digitizers=(rows + 1).tolist(), tuning_frequency_hz=info["tuning_frequency_hz"],
+                sample_rate_hz=fs, source_tstart_s=tstart, first_sweep_utc=first_utc)
+    blocks = tbn_utils.read_tbn_blocks(idf, tstart, tend - tstart, rows)
+    return RawSource(blocks, fs, skip, ch_stands, ch_pols, int(round((tend - tstart) * fs)), meta, idf.close)
 
 
-def _timestamp_datetime(timestamp):
-    if timestamp is None:
+# ===========================================================================
+# 3. RDCView: any stored stage -> the product that is needed
+# ===========================================================================
+
+class RDCView:
+    """A channel/time selection of an RDC file that can produce RDC1, RDC2 frames or RDC2P.
+
+    The most-processed stored stage is used when its irreversible settings match
+    the request; otherwise the view recomputes from an earlier stored stage
+    (retained RDC1, or RDC0). Conflicting requests that cannot be honoured
+    raise ``ValueError`` instead of relabelling processed data.
+
+    Times (``tstart``/``tend``) are seconds on the file's time axis: 0 is the
+    first sweep of the original RDC0 export.
+    """
+
+    def __init__(self, path, stands="all", pol="both", bad_stands="none", tstart=None, tend=None,
+                 bandwidth=None, dechirp_window=None, reference_gate=None, gap_fill=None):
+        self.file = rdc_io.RDCFile(path)
+        self.path = self.file.path
+        self.meta = self.file.meta
+        m = self.meta
+        self.prf = float(m["sweep_frequency_hz"])
+        self.fs = float(m["sample_rate_hz"]) if m.get("sample_rate_hz") else None
+        self.fc = m.get("tuning_frequency_hz") or m.get("carrier_frequency_hz") or m.get("freq1_hz")
+        self.receiver = self.file.is_receiver
+        self.gap_fill = gap_fill or m.get("gap_fill", "nan")
+        processed = any(self.file.has(s) for s in ("rdc1", "rdc2", "rdc2p", "rdc3"))
+        self.bandwidth = _fixed(bandwidth, m.get("bandwidth_hz"), "bandwidth", float)
+        self.dechirp_window = _fixed(dechirp_window, m.get("dechirp_window"), "dechirp-window", str,
+                                     fixed=processed and not self.file.has("rdc0")) or "hann"
+        gate = lfm.parse_reference_gate(reference_gate) if reference_gate else None
+        stored_gate = m.get("reference_gate_frequency")
+        if gate and processed and not self.file.has("rdc0") and (stored_gate is None or not np.isclose(gate[0], stored_gate)):
+            raise ValueError("--reference-gate conflicts with the already-dechirped data; re-export from RDC0")
+        self.gate = gate or ((stored_gate, m.get("reference_gate_duty", 0.5), m.get("reference_gate_phase", 0.0))
+                             if stored_gate else None)
+        self.lfm = None
+        if self.bandwidth and self.fs:
+            g = self.gate or (None, 0.5, 0.0)
+            self.lfm = lfm.LFMWaveform(self.bandwidth, self.prf, self.fs, g[0], g[1], g[2])
+        self.selection = dict(stands=stands, pol=pol, bad_stands=bad_stands)
+        per_channel = [s for s in self.file.stages if s != "rdc3"]
+        self.channels = {s: select_channels(*self.file.channel_ids(s), stands, pol, bad_stands, self.receiver)
+                         for s in per_channel}
+        if self.file.has("rdc3"):
+            self.channels["rdc3"] = np.arange(self.file.shape("rdc3")[-1])
+        if not per_channel:
+            self.stands = self.pols = np.array([], int)
+            self.tstart, self.tend, self.delay_ms, self._band = tstart, tend, None, None
+            return
+        ids = self.file.channel_ids(per_channel[0])
+        base = per_channel
+        self.stands = ids[0][self.channels[base[0]]]
+        self.pols = ids[1][self.channels[base[0]]]
+        self.tstart, self.tend = tstart, tend
+        self.delay_ms = None
+        self._band = None       # FFT bins (rdc0) or slice (rdc1/rdc2)
+
+    # -- time -------------------------------------------------------------
+    def pulse_source(self):
+        """The stored per-sweep stage used for recomputation: 'rdc1' if present, else 'rdc0'."""
+        for s in ("rdc1", "rdc0"):
+            if self.file.has(s):
+                return s
         return None
-    if hasattr(timestamp, "utc_datetime"):
-        return timestamp.utc_datetime
-    if hasattr(timestamp, "datetime"):
-        return timestamp.datetime
-    return timestamp
 
+    def pulse_range(self, stage=None):
+        stage = stage or self.pulse_source()
+        origin = self.file.time_origin_s(stage)
+        n = self.file.shape(stage)[1]
+        first = 0 if self.tstart is None else int(np.ceil((self.tstart - origin) * self.prf - 1e-8))
+        last = n if self.tend is None else int(np.floor((self.tend - origin) * self.prf + 1e-8))
+        first, last = max(first, 0), min(last, n)
+        if last <= first:
+            raise ValueError(f"No complete sweeps in the requested time range "
+                             f"(file covers {origin:.3f}-{origin + n / self.prf:.3f} s)")
+        return first, last, origin
 
-def _timestamp_at(start_timestamp, seconds_after_start):
-    start_dt = _timestamp_datetime(start_timestamp)
-    if isinstance(start_dt, datetime):
-        return start_dt + timedelta(seconds=float(seconds_after_start))
-    return None
+    def utc_at(self, t):
+        zero = self.file.time_zero_utc
+        return None if zero is None else zero + timedelta(seconds=float(t))
 
+    # -- delay band -----------------------------------------------------------
+    def full_delay_axis(self, stage):
+        if stage == "rdc0":
+            if self.lfm is None:
+                raise ValueError("This RDC0 has no bandwidth; pass --bandwidth")
+            return lfm.delay_axis_ms(self.lfm, self.file.shape("rdc0")[0])
+        delay = np.asarray(self.file.axis(stage, "delay_ms"))
+        return delay, np.arange(delay.size)
 
-def _timestamp_delta_seconds(later_timestamp, earlier_timestamp):
-    later_dt = _timestamp_datetime(later_timestamp)
-    earlier_dt = _timestamp_datetime(earlier_timestamp)
-    if isinstance(later_dt, datetime) and isinstance(earlier_dt, datetime):
-        return (later_dt - earlier_dt).total_seconds()
-    return None
+    def select_delay(self, d_min=None, d_max=None, full=False, stage=None, half_width_ms=1.5):
+        """Choose the delay band; with no bounds, centre +/-1.5 ms on the strongest preview bin."""
+        stage = stage or self.pulse_source() or self.file.stages[-1]
+        delay, order = self.full_delay_axis(stage)
+        if d_min is None and d_max is None and not full:
+            peak = self._preview_peak(stage, delay, order)
+            d_min, d_max = peak - half_width_ms, peak + half_width_ms
+            print(f"Auto delay window: {d_min:.3f} to {d_max:.3f} ms (strongest bin {peak:.3f} ms)", flush=True)
+        mask = np.ones(delay.shape, bool)
+        if d_min is not None:
+            mask &= delay >= d_min
+        if d_max is not None:
+            mask &= delay <= d_max
+        if not mask.any():
+            raise ValueError(f"No delay bins in the requested band; available {delay.min():.3f}-{delay.max():.3f} ms")
+        self.delay_ms = delay[mask]
+        self._band = order[mask]
+        self._band_stage = stage
+        return self.delay_ms
 
+    def _preview_peak(self, stage, delay, order):
+        first, last, _ = self.pulse_range(stage) if stage in ("rdc0", "rdc1") else (0, 1, 0)
+        if stage in ("rdc0", "rdc1"):
+            last = min(last, first + 32)
+            power = np.zeros(delay.size)
+            bins = order if stage == "rdc0" else slice(None)
+            for _, _, block, _ in self._iter_pulse_stage(stage, self.channels[stage], first, last, bins):
+                power += np.nansum(np.abs(block) ** 2, axis=(1, 2))
+        elif stage == "rdc2p":
+            power = np.nansum(self.file.read_real("rdc2p", "power", self.channels[stage]), axis=(1, 2))
+        else:
+            frame = self.file.read(stage, channels=self.channels[stage], frames=0)
+            power = np.nansum(np.abs(frame) ** 2, axis=(1, 2))
+        if not np.any(np.isfinite(power) & (power > 0)):
+            raise ValueError("No finite signal in the preview; give --d-min/--d-max or --full-delay")
+        return float(delay[int(np.nanargmax(power))])
 
-def _format_timestamp(timestamp):
-    dt = _timestamp_datetime(timestamp)
-    if dt is None:
-        return "unknown UTC"
-    if isinstance(dt, datetime):
-        return f"{dt.strftime('%H:%M:%S.%f')[:-3]} UTC"
-    return f"{dt} UTC"
+    def _stage_band(self, stage):
+        """Band selection for ``stage``: FFT bins for rdc0, a contiguous slice for stored delay axes."""
+        if self.delay_ms is None:
+            self.select_delay(full=True, stage=stage)
+        if stage == "rdc0":
+            if self._band_stage != "rdc0":
+                delay, order = self.full_delay_axis("rdc0")
+                return order[np.isin(np.round(delay, 9), np.round(self.delay_ms, 9))]
+            return self._band
+        delay = np.asarray(self.file.axis(stage, "delay_ms"))
+        idx = np.flatnonzero((delay >= self.delay_ms[0] - 1e-9) & (delay <= self.delay_ms[-1] + 1e-9))
+        if idx.size != self.delay_ms.size:
+            raise ValueError(f"The stored {stage.upper()} delay axis does not cover the selected band")
+        return slice(int(idx[0]), int(idx[-1]) + 1)
 
-
-def _gap_warning(reason, plot_time, timestamp):
-    print(f"{reason} at local plot time {plot_time:.3f}s ({_format_timestamp(timestamp)})", flush=True)
-
-
-def _gap_fill_array(n_samples, gap_fill):
-    if gap_fill == "zero":
-        return np.zeros(n_samples, dtype=np.complex64)
-    if gap_fill == "nan":
-        return np.full(n_samples, np.nan + 1j * np.nan, dtype=np.complex64)
-    raise ValueError("--gap-fill must be 'nan' or 'zero'")
-
-
-def _gap_fill_block(n_streams, n_samples, gap_fill):
-    block = _gap_fill_array(n_samples, gap_fill)
-    if n_streams == 1:
-        return block[None, :]
-    return np.tile(block[None, :], (n_streams, 1))
-
-
-def parse_stands(stand_spec="all", max_stand=256, drop_bad=False):
-    if stand_spec is None or str(stand_spec).strip().lower() == "all":
-        stands = list(range(1, int(max_stand) + 1))
-    else:
-        stands = []
-        for part in str(stand_spec).split(","):
-            part = part.strip()
-            if not part:
-                continue
-            if "-" in part:
-                lo, hi = part.split("-", 1)
-                stands.extend(range(int(lo), int(hi) + 1))
+    # -- per-sweep data ---------------------------------------------------------
+    def _iter_pulse_stage(self, stage, channels, first, last, bins):
+        """Yield (start, stop, rdc1_block (delay, pulses, ch), invalid (pulses, ch)) per channel chunk."""
+        for start in range(0, len(channels), CHANNEL_CHUNK):
+            stop = min(start + CHANNEL_CHUNK, len(channels))
+            ch = channels[start:stop]
+            invalid = self.file.invalid_counts(stage, ch, slice(first, last))
+            if stage == "rdc1":
+                block = self.file.read("rdc1", ch, delay=bins, pulses=slice(first, last))
+                bad = ~np.isfinite(block)
+                if self.gap_fill == "zero" and bad.any():
+                    block[bad] = 0
+                nonfinite = np.count_nonzero(bad, axis=0)
             else:
-                stands.append(int(part))
-    stands = sorted(dict.fromkeys(stands))
-    if drop_bad:
-        bad = set(BAD_LWA_STANDS)
-        stands = [stand for stand in stands if stand not in bad]
-    return stands
+                parts, nonfinite = [], []
+                adc_start = int(self.meta.get("adc_start", 0))
+                for p in range(first, last, PULSE_BLOCK):
+                    q = min(p + PULSE_BLOCK, last)
+                    raw = self.file.read("rdc0", ch, pulses=slice(p, q))
+                    bad = ~np.isfinite(raw)
+                    nonfinite.append(np.count_nonzero(bad, axis=0))
+                    if self.gap_fill == "zero" and bad.any():
+                        raw[bad] = 0
+                    parts.append(lfm.dechirp_range_fft(raw, self.lfm, self.dechirp_window, adc_start, bins))
+                block, nonfinite = np.concatenate(parts, axis=1), np.concatenate(nonfinite, axis=0)
+            invalid = nonfinite if invalid is None else np.maximum(invalid, nonfinite)
+            yield start, stop, block, invalid
 
+    def iter_rdc1(self, channels=None, first=None, last=None):
+        """Stream RDC1 for the selected delay band, channel chunk by channel chunk."""
+        stage = self.pulse_source()
+        if stage is None:
+            raise ValueError("Per-sweep data (RDC0 or RDC1) is not stored in this file")
+        if stage == "rdc0" and self.lfm is None:
+            raise ValueError("Dechirping RDC0 needs a bandwidth; pass --bandwidth")
+        f0, l0, _ = self.pulse_range(stage)
+        first = f0 if first is None else first
+        last = l0 if last is None else last
+        channels = self.channels[stage] if channels is None else channels
+        yield from self._iter_pulse_stage(stage, channels, first, last, self._stage_band(stage))
 
-def channel_selection(stands, pol):
-    pol_indices = pol_to_indices(pol)
-    stream_indices = []
-    channel_stands = []
-    channel_pols = []
-    for stand in stands:
-        for pol_idx in pol_indices:
-            channel_stands.append(int(stand))
-            channel_pols.append(int(pol_idx))
-    antennas = lwasv_selected_antennas(channel_stands, channel_pols)
-    stream_indices = [int(a.digitizer) - 1 for a in antennas]
-    if any(i < 0 for i in stream_indices) or len(set(stream_indices)) != len(stream_indices):
-        raise ValueError("Selected LWA-SV antennas have invalid or duplicate digitizer mappings")
-    return np.asarray(stream_indices, dtype=int), np.asarray(channel_stands, dtype=int), np.asarray(channel_pols, dtype=int)
+    def rdc1(self):
+        """(delay, pulses, channels) for the whole selection, plus per-sweep gap flags and time axis."""
+        blocks, invalid = [], []
+        for _, _, block, inv in self.iter_rdc1():
+            blocks.append(block)
+            invalid.append(inv)
+        first, last, origin = self.pulse_range()
+        times = origin + np.arange(first, last) / self.prf
+        return np.concatenate(blocks, axis=2), np.any(np.concatenate(invalid, axis=1) > 0, axis=1), times
 
+    # -- Doppler frames ---------------------------------------------------------
+    def stored_rdc2_matches(self, integration=None, hop=None, window=None, nfft=None):
+        if not self.file.has("rdc2"):
+            return False
+        m = self.meta
+        starts = np.asarray(self.file.axis("rdc2", "frame_tstart_s"))
+        ends = np.asarray(self.file.axis("rdc2", "frame_tend_s"))
+        stored = dict(integration=float(ends[0] - starts[0]),
+                      hop=float(np.diff(starts)[0]) if starts.size > 1 else m.get("hop_time_s"),
+                      window=m.get("slow_window"), nfft=m.get("nfft_doppler"))
+        for key, value in dict(integration=integration, hop=hop, window=window, nfft=nfft).items():
+            if value is None or stored[key] is None:
+                continue
+            same = np.isclose(float(value), float(stored[key]), atol=1e-6) if key != "window" else value == stored[key]
+            if not same:
+                return False
+        return True
 
-def polarization_metadata(channel_pols):
-    channel_pols = np.asarray(channel_pols, dtype=int)
-    unique_pols = sorted(int(pol) for pol in np.unique(channel_pols))
-    if unique_pols == [0]:
-        mode = "x"
-    elif unique_pols == [1]:
-        mode = "y"
-    elif unique_pols == [0, 1]:
-        mode = "both"
-    else:
-        mode = "unknown"
-    return {
-        "polarization_mode": mode,
-        "polarization_streams": unique_pols,
-        "n_polarizations": len(unique_pols),
-    }
+    def rdc2_frames(self, integration=None, hop=None, window=None, nfft=None, fd_min=None, fd_max=None):
+        """Iterate ``dict(index, t0, t1, cube (delay, doppler, ch), doppler_hz, gaps)``.
 
+        Uses stored RDC2 frames when compatible, otherwise computes from RDC1/RDC0.
+        """
+        if self.stored_rdc2_matches(integration, hop, window, nfft) and (
+                self.pulse_source() is None or all(v is None for v in (integration, hop, window, nfft))):
+            yield from self._stored_frames("rdc2", fd_min, fd_max)
+            return
+        if self.pulse_source() is None:
+            raise ValueError("This RDC2 has no retained RDC1, so integration/hop/window/NFFT are fixed "
+                             "at their exported values; re-export to change them")
+        window = window or self.meta.get("slow_window") or "hann"
+        if window in ("synthetic_rdc2_direct", "unknown"):
+            window = "hann"
+        rdc1, gaps, times = self.rdc1()
+        n = rdc1.shape[1]
+        count = n if integration is None else int(round(integration * self.prf))
+        stride = count if hop is None else int(round(hop * self.prf))
+        if count < 1 or stride < 1 or count > n:
+            raise ValueError(f"Integration must cover 1..{n} sweeps and hop at least one sweep")
+        nfft = lfm.default_nfft(count) if nfft is None else int(nfft)
+        fd = lfm.doppler_axis_hz(nfft, self.prf)
+        keep = range_mask(fd, fd_min, fd_max, "Doppler")
+        for i, s in enumerate(range(0, n - count + 1, stride)):
+            cube, _ = lfm.doppler_fft(rdc1[:, s:s + count], self.prf, window, nfft)
+            yield dict(index=i, t0=float(times[s]), t1=float(times[s] + count / self.prf),
+                       cube=cube[:, keep], doppler_hz=fd[keep], gaps=bool(gaps[s:s + count].any()),
+                       integration=count / self.prf, hop=stride / self.prf, window=window, nfft=nfft)
 
-def estimate_rdc0_bytes(adc_count, pulses, channels, dtype=np.float32):
-    return int(adc_count) * int(pulses) * int(channels) * np.dtype(dtype).itemsize * 2
+    def _stored_frames(self, stage, fd_min=None, fd_max=None):
+        fd = np.asarray(self.file.axis(stage, "doppler_hz"))
+        keep = range_mask(fd, fd_min, fd_max, "Doppler")
+        dsel = slice(int(np.flatnonzero(keep)[0]), int(np.flatnonzero(keep)[-1]) + 1)
+        starts = np.asarray(self.file.axis(stage, "frame_tstart_s"))
+        ends = np.asarray(self.file.axis(stage, "frame_tend_s"))
+        band = self._stage_band(stage)
+        lo = -np.inf if self.tstart is None else self.tstart - 1e-8
+        hi = np.inf if self.tend is None else self.tend + 1e-8
+        frames = np.flatnonzero((starts >= lo) & (ends <= hi))
+        if not frames.size:
+            raise ValueError("No stored frame lies inside the requested time range")
+        m = self.meta
+        for i, f in enumerate(frames):
+            cube = self.file.read(stage, channels=self.channels[stage], frames=int(f), delay=band, doppler=dsel)
+            bad = ~np.isfinite(cube)
+            if self.gap_fill == "zero" and bad.any():
+                cube[bad] = 0
+            inv = self.file.invalid_counts(stage, self.channels[stage], int(f)) if stage == "rdc2" else None
+            yield dict(index=i, t0=float(starts[f]), t1=float(ends[f]), cube=cube, doppler_hz=fd[dsel],
+                       gaps=bool(bad.any() or (inv is not None and np.any(inv > 0))),
+                       integration=float(ends[f] - starts[f]), hop=m.get("hop_time_s"),
+                       window=m.get("slow_window"), nfft=m.get("nfft_doppler"))
 
+    def rdc3_frames(self, beam=0, fd_min=None, fd_max=None):
+        self.channels["rdc3"] = np.array([beam])
+        yield from self._stored_frames("rdc3", fd_min, fd_max)
 
-def estimate_rdc2_bytes(frames, delay_bins, doppler_bins, channels, dtype=np.float32):
-    return int(frames) * int(delay_bins) * int(doppler_bins) * int(channels) * np.dtype(dtype).itemsize * 2
+    # -- phase-derived Doppler ------------------------------------------------
+    def rdc2p(self, estimator_sweeps=1):
+        """Return dict(lag1, power, n_valid (delay, est, ch), times (est,), gaps (est,))."""
+        e = int(estimator_sweeps)
+        if self.file.has("rdc2p") and int(self.meta.get("estimator_sweeps", 1)) == e and self.pulse_source() is None:
+            band = self._stage_band("rdc2p")
+            ch = self.channels["rdc2p"]
+            lag1 = self.file.read("rdc2p", ch, delay=band)
+            power = self.file.read_real("rdc2p", "power", ch, delay=band)
+            n_valid = self.file.read_real("rdc2p", "n_valid", ch, delay=band)
+            times = np.asarray(self.file.axis("rdc2p", "time_s"))
+            keep = np.ones(times.size, bool)
+            if self.tstart is not None:
+                keep &= times >= self.tstart
+            if self.tend is not None:
+                keep &= times <= self.tend
+            gaps = np.any(n_valid < e, axis=(0, 2))
+            return dict(lag1=lag1[:, keep], power=power[:, keep], n_valid=n_valid[:, keep],
+                        times=times[keep], gaps=gaps[keep])
+        if self.file.has("rdc2p") and self.pulse_source() is None:
+            raise ValueError("Stored RDC2P used a different --estimator-sweeps; re-export it")
+        rdc1, gaps, times = self.rdc1()
+        lag1, power, n_valid = lfm.pulse_pair(rdc1, e)
+        t = times[0] + lfm.pulse_pair_time_s(lag1.shape[1], e, self.prf)
+        g = np.array([gaps[i:i + e + 1].any() for i in range(lag1.shape[1])])
+        return dict(lag1=lag1, power=power, n_valid=n_valid, times=t, gaps=g)
 
+    # -- raw samples ----------------------------------------------------------
+    def raw_samples(self, channels=None):
+        """(channels, samples) concatenated sweeps for spectra; needs complete RDC0 sweeps."""
+        if not self.file.has("rdc0"):
+            raise ValueError("Spectra need raw samples (RDC0); this file holds only processed stages")
+        if int(self.meta.get("adc_start", 0)) != 0 or self.file.shape("rdc0")[0] != int(round(self.fs / self.prf)):
+            raise ValueError("Spectra need complete sweeps; this RDC0 was cropped with --adc-start/--adc-count")
+        first, last, origin = self.pulse_range("rdc0")
+        channels = self.channels["rdc0"] if channels is None else channels
+        cube = self.file.read("rdc0", channels, pulses=slice(first, last))
+        gaps = ~np.isfinite(cube)
+        if self.gap_fill == "zero":
+            cube[gaps] = 0
+        return cube.transpose(2, 1, 0).reshape(len(channels), -1), origin + first / self.prf, bool(gaps.any())
 
-def format_bytes(n_bytes):
-    units = ["B", "KB", "MB", "GB", "TB"]
-    value = float(n_bytes)
-    for unit in units:
-        if value < 1024.0 or unit == units[-1]:
-            return f"{value:.2f} {unit}"
-        value /= 1024.0
-
-
-def reshape_samples_to_rdc0(samples, sweep_length, start_offset_samples=0, adc_start=0, adc_count=None):
-    samples = np.asarray(samples)
-    if samples.ndim == 1:
-        samples = samples[None, :]
-    if samples.ndim != 2:
-        raise ValueError("samples must be 1D or 2D (channels, samples)")
-    if start_offset_samples < 0:
-        raise ValueError("start_offset_samples must be >= 0")
-    if adc_start < 0:
-        raise ValueError("adc_start must be >= 0")
-    if adc_count is None:
-        adc_count = sweep_length - adc_start
-    if adc_count <= 0 or adc_start + adc_count > sweep_length:
-        raise ValueError("adc_start/adc_count must select samples inside one sweep")
-
-    samples = samples[:, start_offset_samples:]
-    pulses = samples.shape[-1] // sweep_length
-    trimmed = samples[:, :pulses * sweep_length]
-    cube = trimmed.reshape(samples.shape[0], pulses, sweep_length)
-    cube = cube[:, :, adc_start:adc_start + adc_count]
-    return np.transpose(cube, (2, 1, 0))
-
-
-def dechirp_range_fft_rdc0(rdc0, lfm_config, window="hann", adc_start=0):
-    """RDC0 (adc, pulses, channels) -> RDC1 (ranges, pulses, channels)."""
-    rdc0 = np.asarray(rdc0)
-    if rdc0.ndim != 3:
-        raise ValueError("rdc0 must have shape (adc, pulses, channels)")
-    adc_len = rdc0.shape[0]
-    reference = lfm_config.waveform[int(adc_start):int(adc_start) + adc_len].astype(rdc0.dtype, copy=False)
-    if reference.size != adc_len:
-        raise ValueError("adc_start plus RDC0 ADC length exceeds the reference sweep length")
-    w = window_from_arg(adc_len, window).astype(np.float32, copy=False)
-    coherent_gain = np.mean(w)
-    if coherent_gain == 0:
-        raise ValueError(f"Window '{window}' has zero coherent gain")
-
-    beat = rdc0 * np.conj(reference)[:, None, None]
-    return np.fft.fftshift(np.fft.fft(beat * w[:, None, None], axis=0) / coherent_gain, axes=0).astype(np.complex64)
-
-
-def dechirp_range_fft_delay_band_rdc0(rdc0, lfm_config, d_min, d_max, window="hann", adc_start=0):
-    """RDC0 -> selected RDC1 delay band without keeping the full RDC1 after selection."""
-    rdc0 = np.asarray(rdc0)
-    if rdc0.ndim != 3:
-        raise ValueError("rdc0 must have shape (adc, pulses, channels)")
-    if d_min is None or d_max is None:
-        raise ValueError("d_min and d_max are required for delay-band RDC1 processing")
-
-    adc_len = rdc0.shape[0]
-    delay_ms, delay_order = dechirp_delay_axis_ms(lfm_config, n_bins=adc_len)
-    mask = (delay_ms >= float(d_min)) & (delay_ms <= float(d_max))
-    if not np.any(mask):
-        raise ValueError(
-            "No delay bins selected. "
-            f"Available delay range is {delay_ms.min():.3f} to {delay_ms.max():.3f} ms."
-        )
-
-    reference = lfm_config.waveform[int(adc_start):int(adc_start) + adc_len].astype(rdc0.dtype, copy=False)
-    if reference.size != adc_len:
-        raise ValueError("adc_start plus RDC0 ADC length exceeds the reference sweep length")
-    w = window_from_arg(adc_len, window).astype(np.float32, copy=False)
-    coherent_gain = np.mean(w)
-    if coherent_gain == 0:
-        raise ValueError(f"Window '{window}' has zero coherent gain")
-
-    beat = rdc0 * np.conj(reference)[:, None, None]
-    spectra = np.fft.fftshift(np.fft.fft(beat * w[:, None, None], axis=0) / coherent_gain, axes=0)
-    return spectra[delay_order[mask], :, :].astype(np.complex64), delay_ms[mask]
-
-
-def select_rdc1_delay_band(rdc1, lfm_config, d_min=None, d_max=None):
-    delay_ms, delay_order = dechirp_delay_axis_ms(lfm_config, n_bins=rdc1.shape[0])
-    ordered = rdc1[delay_order, :, :]
-    mask = np.ones(delay_ms.shape, dtype=bool)
-    if d_min is not None:
-        mask &= delay_ms >= d_min
-    if d_max is not None:
-        mask &= delay_ms <= d_max
-    if not np.any(mask):
-        raise ValueError(
-            "No delay bins selected. "
-            f"Available delay range is {delay_ms.min():.3f} to {delay_ms.max():.3f} ms."
-        )
-    return ordered[mask, :, :], delay_ms[mask]
-
-
-def doppler_fft_rdc1(rdc1, prf, window="hann", nfft=None):
-    """RDC1 (ranges, pulses, channels) -> RDC2 (ranges, doppler, channels)."""
-    rdc1 = np.asarray(rdc1)
-    if rdc1.ndim != 3:
-        raise ValueError("rdc1 must have shape (ranges, pulses, channels)")
-    pulses = rdc1.shape[1]
-    if nfft is None:
-        nfft = 1 << int(np.ceil(np.log2(max(pulses, 1))))
-    if nfft < pulses:
-        raise ValueError(
-            f"Doppler FFT length ({nfft}) must be >= the number of sweeps ({pulses}); "
-            "a shorter FFT truncates the slow-time window. Increase --nfft-doppler or omit it."
-        )
-    w = window_from_arg(pulses, window).astype(np.float32, copy=False)
-    coherent_gain = np.mean(w)
-    if coherent_gain == 0:
-        raise ValueError(f"Window '{window}' has zero coherent gain")
-    x = rdc1 * (w[None, :, None] / coherent_gain)
-    rdc2 = np.fft.fftshift(np.fft.fft(x, n=nfft, axis=1), axes=1).astype(np.complex64)
-    fd_hz = np.fft.fftshift(np.fft.fftfreq(nfft, d=1.0 / float(prf)))
-    return rdc2, fd_hz
-
-
-def delay_doppler_power_db(rdc2, combine="sum"):
-    power = np.abs(rdc2) ** 2
-    if combine == "sum":
-        out = np.sum(power, axis=2)
-    elif combine == "mean":
-        out = np.mean(power, axis=2)
-    elif combine == "max":
-        out = np.max(power, axis=2)
-    else:
-        raise ValueError("--channel-combine must be one of: sum, mean, max")
-    return 10.0 * np.log10(out + 1e-12)
-
-
-def load_lwa_antenna_positions(channel_stands, strict=True, return_mask=False):
-    stand_positions = get_lwasv_stand_positions()
-    positions = []
-    missing = []
-    mask = []
-    for stand in channel_stands:
-        stand = int(stand)
-        if stand not in stand_positions:
-            missing.append(stand)
-            mask.append(False)
+    # -- description ------------------------------------------------------------
+    def info_rows(self, t0=None, t1=None):
+        m = self.meta
+        rows = [("File", os.path.basename(self.path)),
+                ("Stored stages", ", ".join(s.upper() for s in self.file.stages)),
+                ("Tuning freq", "unknown" if not self.fc else f"{float(self.fc) / 1e6:.6f} MHz")]
+        if self.receiver:
+            rows.append(("Receiver", "WAV I/Q"))
         else:
-            positions.append(stand_positions[stand])
-            mask.append(True)
-    if missing and strict:
-        raise ValueError(
-            "LSL LWA-SV metadata is missing physical stand(s): "
-            f"{sorted(set(missing))}."
-        )
-    positions = np.asarray(positions, dtype=np.float64).reshape(-1, 3)
-    if return_mask:
-        return positions, np.asarray(mask, dtype=bool), sorted(set(missing))
-    return positions
+            n = len(np.unique(self.stands))
+            rows.append(("Channels", f"{len(self.stands)} ({n} stand{'s' if n != 1 else ''}, "
+                                     f"pol {polarization_summary(self.pols)['polarization_mode']})"))
+            if n <= 4:
+                rows.append(("Stands", ", ".join(str(s) for s in np.unique(self.stands))))
+        if t0 is not None:
+            rows.append(("Plot span", f"{t0:.3f}-{t1:.3f} s"))
+        if self.fs:
+            rows.append(("Sample rate", f"{self.fs / 1e3:.3f} kHz"))
+        rows.append(("Sweep freq", f"{self.prf:.8g} Hz"))
+        if self.bandwidth:
+            rows.append(("Bandwidth", f"{self.bandwidth / 1e3:.6g} kHz"))
+        if self.gate:
+            rows.append(("Ref. gate", f"{self.gate[0]:.6g} Hz, duty {self.gate[1] * 100:.0f}%, phase {self.gate[2] * 1e3:.2f} ms"))
+        rows.append(("Dechirp window", self.dechirp_window))
+        if m.get("sweep_offset_s") not in (None, 0, 0.0):
+            rows.append(("Sweep offset", f"{float(m['sweep_offset_s']) * 1e3:.3f} ms"))
+        rows.append(("Gap fill", self.gap_fill))
+        return rows
+
+    def utc_note(self, t0, t1):
+        a, b = self.utc_at(t0), self.utc_at(t1)
+        if a is None:
+            return None
+        return f"UTC start: {a.isoformat(timespec='milliseconds')}\nUTC end: {b.isoformat(timespec='milliseconds')}"
 
 
-def load_antenna_positions_csv(path, channel_stands):
-    positions_by_stand = {}
-    with open(path, newline="") as fh:
-        reader = csv.DictReader(fh)
-        for row in reader:
-            stand = int(row["stand"])
-            positions_by_stand[stand] = [float(row["x_m"]), float(row["y_m"]), float(row.get("z_m", 0.0))]
-    positions = []
-    missing = []
-    for stand in channel_stands:
-        if int(stand) not in positions_by_stand:
-            missing.append(int(stand))
-        else:
-            positions.append(positions_by_stand[int(stand)])
-    if missing:
-        raise ValueError(f"Antenna position CSV is missing stand(s): {sorted(set(missing))}")
-    return np.asarray(positions, dtype=np.float64)
+def _fixed(requested, stored, flag, cast, fixed=True):
+    if requested is not None and stored is not None and fixed:
+        same = np.isclose(cast(requested), cast(stored), rtol=1e-10) if cast is float else cast(requested) == cast(stored)
+        if not same:
+            raise ValueError(f"--{flag} {requested} conflicts with the stored value {stored}; re-export from an earlier stage")
+    value = requested if requested is not None else stored
+    return None if value is None else cast(value)
+
+
+def range_mask(values, lo, hi, name):
+    mask = np.ones(np.shape(values), bool)
+    if lo is not None:
+        mask &= values >= lo
+    if hi is not None:
+        mask &= values <= hi
+    if not mask.any():
+        raise ValueError(f"No {name} bins in the requested range")
+    return mask
+
+
+# ===========================================================================
+# 4. Exports
+# ===========================================================================
+
+@dataclasses.dataclass
+class ExportSettings:
+    # raw input
+    sweep_frequency: float = None
+    offset: float = 0.0
+    timestamp_align: bool = True
+    start_utc: str = None
+    carrier_frequency: float = None
+    adc_start: int = 0
+    adc_count: int = None
+    # selection
+    tstart: float = None
+    tend: float = None
+    stands: str = "all"
+    pol: str = "both"
+    bad_stands: str = "none"
+    gap_fill: str = None
+    # range processing
+    bandwidth: float = None
+    dechirp_window: str = None
+    reference_gate: str = None
+    d_min: float = None
+    d_max: float = None
+    # Doppler processing
+    integration_time: float = None
+    hop_time: float = None
+    slow_window: str = "hann"
+    nfft_doppler: int = None
+    fd_min: float = None
+    fd_max: float = None
+    keep_rdc1: bool = True
+    estimator_sweeps: int = 1
+    # storage
+    dtype: str = "float32"
+    compression: str = "gzip"
+    dry_run: bool = False
+
+
+def export(input_path, target, output, s, tool=None):
+    """Export ``input_path`` (raw TBN/WAV or any RDC file) to ``target`` stage in ``output``."""
+    target = rdc_io.stage_name(target)
+    input_path = os.path.expanduser(input_path)
+    if os.path.realpath(input_path) == os.path.realpath(os.path.expanduser(output)):
+        raise ValueError("The output must not overwrite the input")
+    tool = tool or f"export_{target}"
+    if not input_path.lower().endswith((".h5", ".hdf5")):
+        if target == "rdc0":
+            return export_rdc0(input_path, output, s, tool)
+        with tempfile.TemporaryDirectory(prefix="rdc0_") as tmp:
+            temp = os.path.join(tmp, "rdc0.h5")
+            quick = dataclasses.replace(s, compression="lzf", dtype="float32", dry_run=False)
+            export_rdc0(input_path, temp, quick, tool, temporary=True)
+            chained = dataclasses.replace(s, tstart=None, tend=None, stands="all", pol="both", bad_stands="none")
+            return export(temp, target, output, chained, tool)
+    if target == "rdc0":
+        raise ValueError("RDC0 is made from a raw TBN/WAV recording")
+    if target == "rdc3":
+        raise ValueError("Use export_rdc3.py (array settings) for RDC3")
+    view = RDCView(input_path, s.stands, s.pol, s.bad_stands, s.tstart, s.tend,
+                   s.bandwidth, s.dechirp_window, s.reference_gate, s.gap_fill)
+    if view.pulse_source() is None:
+        raise ValueError(f"{target.upper()} needs per-sweep data (RDC0 or RDC1) in the input")
+    view.select_delay(s.d_min, s.d_max, full=s.d_min is None and s.d_max is None)
+    return _export_processed(view, target, output, s, tool)
+
+
+def export_rdc0(raw_path, output, s, tool="export_rdc0", temporary=False):
+    if not s.sweep_frequency or s.sweep_frequency <= 0:
+        raise ValueError("--sweep-frequency is required for raw input")
+    src = open_raw_source(raw_path, s.sweep_frequency, s.tstart, s.tend, s.offset, s.timestamp_align,
+                          s.stands, s.pol, s.bad_stands, s.start_utc, s.carrier_frequency)
+    try:
+        fs = src.sample_rate
+        sweep = int(round(fs / s.sweep_frequency))
+        adc_count = sweep - s.adc_start if s.adc_count is None else s.adc_count
+        n_pulses = (src.n_samples - src.skip_samples) // sweep
+        if n_pulses < 1:
+            raise ValueError("The selection does not contain one complete sweep after alignment")
+        n_ch = len(src.channel_stands)
+        size = 2 * adc_count * n_pulses * n_ch * np.dtype(s.dtype).itemsize
+        print(f"RDC0 shape (adc, pulses, channels) = ({adc_count}, {n_pulses}, {n_ch}); "
+              f"{size / 1e9:.2f} GB uncompressed", flush=True)
+        if s.dry_run:
+            return None
+        gap_fill = s.gap_fill or "nan"
+        with rdc_io.atomic_output(output) as tmp:
+            with rdc_io._h5py().File(tmp, "w") as h5:
+                w = rdc_io.StageWriter(h5, "rdc0", (adc_count, n_pulses, n_ch), s.dtype, s.compression,
+                                       maxshape=(adc_count, None, n_ch))
+                invalid = w.dataset("invalid_counts", shape=(n_pulses, n_ch), dtype="int64", maxshape=(None, n_ch))
+                written = 0
+                for p, sweep_block, inv in pack_sweeps(src.blocks, sweep, src.skip_samples, s.adc_start,
+                                                        adc_count, n_pulses, gap_fill):
+                    w.write((slice(None), p, slice(None)), sweep_block)
+                    invalid[p] = inv
+                    written = p + 1
+                    if not temporary and written % 20 == 0:
+                        print(f"  RDC0 sweep {written}/{n_pulses}", flush=True)
+                if written < n_pulses:
+                    print(f"Input ended early: {written} of {n_pulses} sweeps written", flush=True)
+                    w.resize((adc_count, written, n_ch))
+                    invalid.resize((written, n_ch))
+                w.channels(src.channel_stands, src.channel_pols)
+                w.dataset("adc_sample_index", np.arange(s.adc_start, s.adc_start + adc_count))
+                meta = dict(src.metadata)
+                first = meta.pop("first_sweep_utc", None)
+                meta.update(
+                    format_version=rdc_io.FORMAT_VERSION, rdc_stage=0, sweep_frequency_hz=float(s.sweep_frequency),
+                    bandwidth_hz=s.bandwidth, sweep_length_samples=sweep, adc_start=s.adc_start, adc_count=adc_count,
+                    start_offset_samples=int(src.skip_samples), sweep_offset_s=float(s.offset or 0.0),
+                    timestamp_aligned=bool(s.timestamp_align), gap_fill=gap_fill, tstart=0.0,
+                    time_zero_utc=first.isoformat() if first else None,
+                    pulse0_utc=first.isoformat() if first else None,
+                    source_file=os.path.basename(raw_path), n_channels=n_ch, dtype=s.dtype,
+                    **polarization_summary(src.channel_pols),
+                    history=[rdc_io.history_entry(tool, stage="rdc0", source=os.path.basename(raw_path),
+                                                  tstart=s.tstart, tend=s.tend, offset=s.offset,
+                                                  timestamp_align=s.timestamp_align, stands=s.stands, pol=s.pol,
+                                                  bad_stands=s.bad_stands, adc_start=s.adc_start,
+                                                  adc_count=adc_count, gap_fill=gap_fill)])
+                rdc_io.write_metadata(h5, meta)
+    finally:
+        if src.close:
+            src.close()
+    if not temporary:
+        print(f"Wrote {output}", flush=True)
+    return output
+
+
+def _export_processed(view, target, output, s, tool):
+    stage = view.pulse_source()
+    first, last, origin = view.pulse_range(stage)
+    n_pulses = last - first
+    channels = view.channels[stage]
+    stands, pols = view.file.channel_ids(stage)
+    stands, pols = stands[channels], pols[channels]
+    n_ch, n_delay = len(channels), view.delay_ms.size
+    prf = view.prf
+
+    if target in ("rdc2",):
+        count = n_pulses if s.integration_time is None else int(round(s.integration_time * prf))
+        stride = count if s.hop_time is None else int(round(s.hop_time * prf))
+        if count < 1 or stride < 1 or count > n_pulses:
+            raise ValueError(f"Integration must cover 1..{n_pulses} sweeps and hop at least one sweep")
+        nfft = lfm.default_nfft(count) if s.nfft_doppler is None else int(s.nfft_doppler)
+        if nfft < count:
+            raise ValueError("--nfft-doppler must be >= the sweeps per integration")
+        fd = lfm.doppler_axis_hz(nfft, prf)
+        fd_keep = range_mask(fd, s.fd_min, s.fd_max, "Doppler")
+        starts = np.arange(0, n_pulses - count + 1, stride)
+        rdc2_shape = (len(starts), n_delay, int(fd_keep.sum()), n_ch)
+    if target == "rdc2p":
+        e = int(s.estimator_sweeps)
+        n_est = n_pulses - e
+        if n_est < 1:
+            raise ValueError(f"Need more than {e} sweeps for phase-derived Doppler")
+
+    item = np.dtype(s.dtype).itemsize * 2
+    sizes = {"rdc1": n_delay * n_pulses * n_ch * item}
+    if target == "rdc2":
+        sizes["rdc2"] = int(np.prod(rdc2_shape)) * item
+        if not s.keep_rdc1:
+            sizes.pop("rdc1")
+    if target == "rdc2p":
+        sizes = {"rdc2p": n_delay * n_est * n_ch * (item + 8)}
+    print(f"{target.upper()} from {stage.upper()}: {n_delay} delay bins "
+          f"({view.delay_ms[0]:.3f}-{view.delay_ms[-1]:.3f} ms), {n_pulses} sweeps, {n_ch} channels; "
+          f"{sum(sizes.values()) / 1e9:.2f} GB uncompressed", flush=True)
+    if s.dry_run:
+        return None
+
+    t0 = origin + first / prf
+    source_meta = dict(view.meta)
+    source_meta.pop("history", None)
+    history = list(view.meta.get("history", []))
+    with rdc_io.atomic_output(output) as tmp:
+        with rdc_io._h5py().File(tmp, "w") as h5:
+            w1 = w2 = wp = None
+            if "rdc1" in sizes:
+                w1 = rdc_io.StageWriter(h5, "rdc1", (n_delay, n_pulses, n_ch), s.dtype, s.compression)
+                inv1 = w1.dataset("invalid_counts", shape=(n_pulses, n_ch), dtype="int64")
+                w1.group.attrs["tstart_s"] = t0
+                w1.group.attrs["sweep_frequency_hz"] = prf
+            if target == "rdc2":
+                w2 = rdc_io.StageWriter(h5, "rdc2", rdc2_shape, s.dtype, s.compression)
+                inv2 = w2.dataset("invalid_counts", shape=(len(starts), n_ch), dtype="int64")
+            if target == "rdc2p":
+                wp = rdc_io.StageWriter(h5, "rdc2p", (n_delay, n_est, n_ch), s.dtype, s.compression)
+                pow_ds = wp.dataset("power", shape=(n_delay, n_est, n_ch), dtype="float32")
+                nv_ds = wp.dataset("n_valid", shape=(n_delay, n_est, n_ch), dtype="int16")
+                wp.group.attrs["tstart_s"] = t0
+            for a, b, block, invalid in view.iter_rdc1(channels, first, last):
+                cs = slice(a, b)
+                if w1 is not None:
+                    w1.write((slice(None), slice(None), cs), block)
+                    inv1[:, cs] = invalid
+                if w2 is not None:
+                    for i, p in enumerate(starts):
+                        cube, _ = lfm.doppler_fft(block[:, p:p + count], prf, s.slow_window, nfft)
+                        w2.write((i, slice(None), slice(None), cs), cube[:, fd_keep])
+                        inv2[i, cs] = invalid[p:p + count].sum(axis=0)
+                if wp is not None:
+                    lag1, power, n_valid = lfm.pulse_pair(block, e)
+                    wp.write((slice(None), slice(None), cs), lag1)
+                    pow_ds[:, :, cs] = power
+                    nv_ds[:, :, cs] = n_valid
+                print(f"  channels {b}/{n_ch}", flush=True)
+            meta = dict(source_meta)
+            meta.update(format_version=rdc_io.FORMAT_VERSION, rdc_stage=int(target[3]) if target != "rdc2p" else "2p",
+                        bandwidth_hz=view.bandwidth,
+                        dechirp_window=view.dechirp_window, gap_fill=view.gap_fill,
+                        d_min_ms=float(view.delay_ms[0]), d_max_ms=float(view.delay_ms[-1]),
+                        tstart=t0, tend=t0 + n_pulses / prf, n_channels=n_ch,
+                        selected_stands=stands.tolist(), dtype=s.dtype,
+                        time_zero_utc=(view.file.time_zero_utc.isoformat() if view.file.time_zero_utc else None),
+                        **polarization_summary(pols))
+            if view.gate:
+                meta.update(reference_gate_frequency=view.gate[0], reference_gate_duty=view.gate[1],
+                            reference_gate_phase=view.gate[2])
+            params = dict(stage=target, source=os.path.basename(view.path), source_stage=stage,
+                          tstart=t0, tend=t0 + n_pulses / prf, stands=s.stands, pol=s.pol,
+                          bad_stands=s.bad_stands, d_min_ms=meta["d_min_ms"], d_max_ms=meta["d_max_ms"],
+                          dechirp_window=view.dechirp_window, reference_gate=view.gate, gap_fill=view.gap_fill)
+            for writer in (w1, w2, wp):
+                if writer is not None:
+                    writer.channels(stands, pols)
+                    writer.dataset("delay_ms", view.delay_ms)
+            if w2 is not None:
+                w2.dataset("doppler_hz", fd[fd_keep])
+                w2.dataset("frame_tstart_s", t0 + starts / prf)
+                w2.dataset("frame_tend_s", t0 + (starts + count) / prf)
+                meta.update(integration_time_s=count / prf, hop_time_s=stride / prf, slow_window=s.slow_window,
+                            nfft_doppler=nfft, fd_min_hz=s.fd_min, fd_max_hz=s.fd_max, retains_rdc1=w1 is not None)
+                params.update(integration_time_s=count / prf, hop_time_s=stride / prf, slow_window=s.slow_window,
+                              nfft_doppler=nfft, fd_min_hz=s.fd_min, fd_max_hz=s.fd_max, keep_rdc1=w1 is not None)
+            if wp is not None:
+                wp.dataset("time_s", t0 + lfm.pulse_pair_time_s(n_est, e, prf))
+                meta.update(estimator_sweeps=e)
+                params.update(estimator_sweeps=e)
+            meta["history"] = history + [rdc_io.history_entry(tool, **params)]
+            rdc_io.write_metadata(h5, meta)
+    print(f"Wrote {output}", flush=True)
+    return output
+
+
+def export_rdc3(view, output, processor, looks=None, frame_settings=None, dtype="float32",
+                compression="gzip", tool="export_rdc3"):
+    """Beamform RDC2 frames into RDC3 (frames, delay, doppler, beams).
+
+    ``looks``: list of (az, el); None = one beam auto-steered per frame to the
+    strongest signal (its direction is stored per frame).
+    """
+    frames = list(view.rdc2_frames(**(frame_settings or {})))
+    if not frames:
+        raise ValueError("No RDC2 frames in the selection")
+    n_beams = 1 if looks is None else len(looks)
+    shape = (len(frames),) + frames[0]["cube"].shape[:2] + (n_beams,)
+    beam_az = np.zeros((len(frames), n_beams))
+    beam_el = np.zeros((len(frames), n_beams))
+    with rdc_io.atomic_output(output) as tmp:
+        with rdc_io._h5py().File(tmp, "w") as h5:
+            w = rdc_io.StageWriter(h5, "rdc3", shape, dtype, compression)
+            for i, fr in enumerate(frames):
+                cube = processor.prepare(fr["cube"])
+                directions = looks or [processor.look_direction(cube)]
+                for b, (az, el) in enumerate(directions):
+                    w.write((i, slice(None), slice(None), b), processor.beamform(cube, az, el))
+                    beam_az[i, b], beam_el[i, b] = az, el
+                print(f"  frame {i + 1}/{len(frames)}: beams " +
+                      ", ".join(f"({a:.1f}, {e:.1f})" for a, e in directions), flush=True)
+            w.dataset("delay_ms", view.delay_ms)
+            w.dataset("doppler_hz", frames[0]["doppler_hz"])
+            w.dataset("frame_tstart_s", [f["t0"] for f in frames])
+            w.dataset("frame_tend_s", [f["t1"] for f in frames])
+            w.dataset("beam_az_deg", beam_az)
+            w.dataset("beam_el_deg", beam_el)
+            meta = dict(view.meta)
+            history = list(meta.pop("history", []))
+            params = dict(stage="rdc3", source=os.path.basename(view.path), beamformer=processor.method,
+                          looks="auto per frame" if looks is None else looks, cable_correction=processor.cable_note,
+                          carrier_frequency_hz=processor.fc, diagonal_loading=processor.loading,
+                          stands=processor.stands.tolist(), pol=int(processor.pols[0]),
+                          d_min_ms=float(view.delay_ms[0]), d_max_ms=float(view.delay_ms[-1]),
+                          integration_time_s=frames[0]["integration"], hop_time_s=frames[0]["hop"],
+                          slow_window=frames[0]["window"], nfft_doppler=frames[0]["nfft"])
+            meta.update(format_version=rdc_io.FORMAT_VERSION, rdc_stage=3, beamformer=processor.method,
+                        cable_phase_corrected=True, array_stands=processor.stands.tolist(),
+                        integration_time_s=frames[0]["integration"], hop_time_s=frames[0]["hop"],
+                        slow_window=frames[0]["window"], nfft_doppler=frames[0]["nfft"],
+                        d_min_ms=float(view.delay_ms[0]), d_max_ms=float(view.delay_ms[-1]),
+                        history=history + [rdc_io.history_entry(tool, **params)])
+            rdc_io.write_metadata(h5, meta)
+    print(f"Wrote {output}", flush=True)
+    return output
+
+
+# ===========================================================================
+# 5. Array processing (RDC2 -> RDC3)
+# ===========================================================================
+
+def unit_vectors(az_deg, el_deg):
+    az, el = np.deg2rad(np.asarray(az_deg, float)), np.deg2rad(np.asarray(el_deg, float))
+    return np.stack([np.cos(el) * np.sin(az), np.cos(el) * np.cos(az), np.sin(el)], axis=-1)
 
 
 def steering_vector(positions_m, wavelength_m, az_deg, el_deg):
-    az = np.deg2rad(az_deg)
-    el = np.deg2rad(el_deg)
-    direction = np.array([
-        np.cos(el) * np.sin(az),
-        np.cos(el) * np.cos(az),
-        np.sin(el),
-    ])
-    phase = 2.0 * np.pi / wavelength_m * (positions_m @ direction)
-    return np.exp(1j * phase)
+    """Plane-wave response exp(+j 2 pi r.u / lambda); u points toward the source (az from north, clockwise)."""
+    return np.exp(2j * np.pi / wavelength_m * (np.asarray(positions_m) @ unit_vectors(az_deg, el_deg)))
 
 
-def capon_mvdr_spectrum(
-    snapshot,
-    positions_m,
-    wavelength_m,
-    az_grid_deg,
-    el_grid_deg,
-    diagonal_loading=1e-2,
-    method="mvdr",
-):
-    """Spatial spectrum from one or more snapshots for a range-Doppler cell."""
-    x = np.asarray(snapshot, dtype=np.complex128)
-    if x.ndim == 1:
-        x = x[None, :]
-    elif x.ndim != 2:
-        x = x.reshape(-1, x.shape[-1])
-
-    good_snapshots = np.all(np.isfinite(x.real) & np.isfinite(x.imag), axis=1)
-    if np.count_nonzero(good_snapshots) < 1:
-        return np.full((len(el_grid_deg), len(az_grid_deg)), np.nan, dtype=np.float32)
-    x = x[good_snapshots]
-
-    good_channels = np.all(np.isfinite(x.real) & np.isfinite(x.imag), axis=0)
-    if np.count_nonzero(good_channels) < 2:
-        return np.full((len(el_grid_deg), len(az_grid_deg)), np.nan, dtype=np.float32)
-    x = x[:, good_channels]
-    pos = np.asarray(positions_m)[good_channels]
-
-    R = (x.T @ np.conj(x)) / max(x.shape[0], 1)
-    loading = float(diagonal_loading) * (np.trace(R).real / max(R.shape[0], 1) + 1e-12)
-    R = R + loading * np.eye(R.shape[0])
-    method = str(method).lower()
-    R_inv = np.linalg.pinv(R) if method == "mvdr" else None
-
-    spec = np.empty((len(el_grid_deg), len(az_grid_deg)), dtype=np.float32)
-    for ei, el in enumerate(el_grid_deg):
-        for ai, az in enumerate(az_grid_deg):
-            a = steering_vector(pos, wavelength_m, az, el)
-            if method == "mvdr":
-                denom = np.conj(a) @ R_inv @ a
-                spec[ei, ai] = float(1.0 / np.maximum(np.real(denom), 1e-30))
-            elif method == "conventional":
-                spec[ei, ai] = float(np.real(np.conj(a) @ R @ a) / max(len(a) ** 2, 1))
-            else:
-                raise ValueError("angle spectrum method must be mvdr or conventional")
-    return spec
+def steering_matrix(positions_m, frequency_hz, az_deg, el_deg):
+    """Rows are steering vectors for each (az, el) pair."""
+    u = unit_vectors(az_deg, el_deg).reshape(-1, 3)
+    return np.exp(2j * np.pi * frequency_hz / lfm.C_M_PER_S * (u @ np.asarray(positions_m, float).T))
 
 
-def write_complex_dataset(group, name, array, compression="gzip", compression_opts=4):
-    compression_arg = None if compression == "none" else compression
-    opts = None if compression in ("none", "lzf") else compression_opts
-    group.create_dataset(f"{name}_real", data=np.asarray(array.real), compression=compression_arg, compression_opts=opts)
-    group.create_dataset(f"{name}_imag", data=np.asarray(array.imag), compression=compression_arg, compression_opts=opts)
+def spatial_covariance(snapshots, loading=0.1, max_power_percentile=None):
+    """R = E[x x^H] from (K, N) snapshots, with diagonal loading relative to mean channel power."""
+    x = np.asarray(snapshots, np.complex128).reshape(-1, np.shape(snapshots)[-1])
+    x = x[np.all(np.isfinite(x), axis=1)]
+    if max_power_percentile is not None and len(x) > 2 * x.shape[1]:
+        p = np.mean(np.abs(x) ** 2, axis=1)
+        quiet = p <= np.percentile(p, float(max_power_percentile))
+        if quiet.sum() >= 2:
+            x = x[quiet]
+    if len(x) < 2:
+        raise ValueError("Not enough finite snapshots to estimate a spatial covariance")
+    R = x.T @ x.conj() / len(x)
+    return R + float(loading) * (np.trace(R).real / R.shape[0] + 1e-30) * np.eye(R.shape[0])
 
 
-def read_complex_dataset(group, name):
-    return group[f"{name}_real"][...] + 1j * group[f"{name}_imag"][...]
+def angle_spectrum(R, positions_m, frequency_hz, az_grid, el_grid, method="conventional", block=2048):
+    """(len(el_grid), len(az_grid)) spatial spectrum: conventional a^H R a / N^2 or MVDR 1 / a^H R^-1 a."""
+    AZ, EL = np.meshgrid(np.asarray(az_grid, float), np.asarray(el_grid, float))
+    az, el = AZ.ravel(), EL.ravel()
+    M = np.linalg.pinv(R) if method == "mvdr" else R
+    n = R.shape[0]
+    out = np.empty(az.size)
+    for i in range(0, az.size, block):
+        A = steering_matrix(positions_m, frequency_hz, az[i:i + block], el[i:i + block])
+        q = np.real(np.sum((A.conj() @ M) * A, axis=1))
+        out[i:i + block] = 1.0 / np.maximum(q, 1e-30) if method == "mvdr" else q / n ** 2
+    if method not in ("mvdr", "conventional"):
+        raise ValueError("angle method must be conventional or mvdr")
+    return out.reshape(AZ.shape)
 
 
-def _open_hdf5_read(path, h5py):
-    path = os.path.expanduser(path)
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"RDC0 HDF5 file not found: {path}")
-    try:
-        return h5py.File(path, "r")
-    except OSError as exc:
-        raise OSError(
-            f"Could not open RDC HDF5 file '{path}'. This usually means the file is "
-            "not a valid HDF5/RDC cache, is truncated/corrupted, or was written by a job "
-            "that did not finish cleanly. Re-run the RDC exporter or point the input "
-            "flag at a valid .h5 file."
-        ) from exc
+def peak_direction(R, positions_m, frequency_hz, method="conventional", step=2.0, fine=0.1,
+                   el_min=0.0, el_max=90.0):
+    """Grid search followed by local refinement. Returns (az, el, value)."""
+    az = np.arange(-180.0, 180.0, step)
+    el = np.arange(el_min, el_max + 0.5 * step, step)
+    spec = angle_spectrum(R, positions_m, frequency_hz, az, el, method)
+    ei, ai = np.unravel_index(np.argmax(spec), spec.shape)
+    az_f = np.arange(az[ai] - step, az[ai] + step + 1e-9, fine)
+    el_f = np.clip(np.arange(el[ei] - step, el[ei] + step + 1e-9, fine), el_min, el_max)
+    spec_f = angle_spectrum(R, positions_m, frequency_hz, az_f, el_f, method)
+    ei, ai = np.unravel_index(np.argmax(spec_f), spec_f.shape)
+    return float((az_f[ai] + 180) % 360 - 180), float(el_f[ei]), float(spec_f[ei, ai])
 
 
-def _rdc0_group(h5, path):
-    if "rdc0" not in h5:
-        raise ValueError(f"HDF5 file '{path}' does not contain the required '/rdc0' group")
-    grp = h5["rdc0"]
-    required = ("real", "imag", "channel_stands", "channel_pols")
-    missing = [name for name in required if name not in grp]
-    if missing:
-        raise ValueError(f"HDF5 file '{path}' is missing required RDC0 dataset(s): {', '.join(missing)}")
-    if grp["real"].shape != grp["imag"].shape:
-        raise ValueError(f"HDF5 file '{path}' has mismatched RDC0 real/imag dataset shapes")
-    return grp
+def beam_weights(positions_m, frequency_hz, az_deg, el_deg, method="conventional", R=None):
+    a = steering_matrix(positions_m, frequency_hz, [az_deg], [el_deg])[0]
+    if method == "conventional":
+        return a / a.size
+    if method == "mvdr":
+        if R is None:
+            raise ValueError("MVDR weights need a covariance matrix")
+        Ri_a = np.linalg.pinv(R) @ a
+        return Ri_a / (a.conj() @ Ri_a)
+    raise ValueError("beamformer must be conventional or mvdr")
 
 
-def _rdc2_group(h5, path):
-    if "rdc2" not in h5:
-        raise ValueError(f"HDF5 file '{path}' does not contain the required '/rdc2' group")
-    grp = h5["rdc2"]
-    required = (
-        "real",
-        "imag",
-        "delay_ms",
-        "doppler_hz",
-        "frame_tstart_s",
-        "frame_tend_s",
-        "channel_stands",
-        "channel_pols",
-    )
-    missing = [name for name in required if name not in grp]
-    if missing:
-        raise ValueError(f"HDF5 file '{path}' is missing required RDC2 dataset(s): {', '.join(missing)}")
-    if grp["real"].shape != grp["imag"].shape:
-        raise ValueError(f"HDF5 file '{path}' has mismatched RDC2 real/imag dataset shapes")
-    if len(grp["real"].shape) not in (3, 4):
-        raise ValueError(f"HDF5 file '{path}' RDC2 datasets must have shape (delay, doppler, channels) or (frames, delay, doppler, channels)")
-    return grp
+def beam_pattern(positions_m, frequency_hz, look_az, look_el, az_grid, el_grid):
+    """|w^H a|^2 of conventional weights steered to (look_az, look_el); peak = 1."""
+    w = beam_weights(positions_m, frequency_hz, look_az, look_el)
+    AZ, EL = np.meshgrid(az_grid, el_grid)
+    A = steering_matrix(positions_m, frequency_hz, AZ.ravel(), EL.ravel())
+    return (np.abs(A @ w.conj()) ** 2).reshape(AZ.shape)
 
 
-def _rdc1_group(h5, path):
-    if "rdc1" not in h5:
-        raise ValueError(f"HDF5 file '{path}' does not contain '/rdc1'")
-    grp = h5["rdc1"]
-    for name in ("real", "imag", "delay_ms", "channel_stands", "channel_pols"):
-        if name not in grp:
-            raise ValueError(f"Missing RDC1 dataset: {name}")
-    shape = grp["real"].shape
-    if len(shape) != 3 or shape != grp["imag"].shape or any(n == 0 for n in shape):
-        raise ValueError("RDC1 real/imag must have matching nonempty (delay, pulses, channels) shapes")
-    for name, count in (("delay_ms", shape[0]), ("channel_stands", shape[2]), ("channel_pols", shape[2])):
-        if grp[name].shape != (count,):
-            raise ValueError(f"RDC1 {name} does not match cube dimensions")
-    return grp
+def pick_cells(power, n, delay_guard=3, doppler_guard=5):
+    """Strongest (delay, Doppler) cells with non-maximum suppression."""
+    work = np.where(np.isfinite(power), power, -np.inf).astype(float)
+    cells = []
+    for _ in range(int(n)):
+        flat = int(np.argmax(work))
+        if not np.isfinite(work.flat[flat]):
+            break
+        r, c = np.unravel_index(flat, work.shape)
+        cells.append((int(r), int(c)))
+        work[max(0, r - delay_guard):r + delay_guard + 1, max(0, c - doppler_guard):c + doppler_guard + 1] = -np.inf
+    return cells
 
 
-def load_rdc1_hdf5_metadata(path):
-    """Read standalone RDC1 or the retained RDC1 inside an RDC2 cache."""
-    import h5py
+class ArrayProcessor:
+    """Calibrated beamforming and angle spectra for one channel set.
 
-    path = os.path.expanduser(path)
-    with _open_hdf5_read(path, h5py) as h5:
-        grp = _rdc1_group(h5, path)
-        metadata = json.loads(h5.attrs.get("metadata_json", "{}"))
-        for attr, key in (("tstart_s", "tstart"), ("sweep_frequency_hz", "sweep_frequency_hz")):
-            if attr in grp.attrs:
-                value = float(grp.attrs[attr])
-                if key in metadata and not np.isclose(value, metadata[key], rtol=1e-10, atol=1e-10):
-                    raise ValueError(f"Conflicting RDC1 metadata for {key}")
-                metadata[key] = value
-        for key in ("sample_rate_hz", "sweep_frequency_hz", "bandwidth_hz"):
-            value = metadata.get(key)
-            if value is None or not np.isfinite(value) or value == 0 or (key != "bandwidth_hz" and value < 0):
-                raise ValueError(f"Missing or invalid RDC1 metadata: {key}")
-        delay_ms = grp["delay_ms"][...]
-        if not np.all(np.isfinite(delay_ms)) or np.any(np.diff(delay_ms) <= 0):
-            raise ValueError("RDC1 delay_ms must be finite and strictly increasing")
-        stands, pols = cached_physical_channel_ids(grp["channel_stands"][...], grp["channel_pols"][...], metadata)
-        return dict(shape=grp["real"].shape, delay_ms=delay_ms,
-                    channel_stands=stands, channel_pols=pols, metadata=metadata)
+    ``positions``: (N, 3) metres; ``fc``: steering frequency (the tuning frequency,
+    correct for dechirped data); ``cable``: per-channel correction factors.
+    """
 
-
-def iter_rdc1_hdf5_channel_chunks(path, channel_chunk_size=8, channel_indices=None,
-                                  pulse_start=None, pulse_stop=None, delay_selection=None):
-    yield from iter_rdc0_hdf5_channel_chunks(
-        path, channel_chunk_size, channel_indices, pulse_start, pulse_stop,
-        _stage=1, _delay_selection=delay_selection,
-    )
-
-
-def load_rdc0_hdf5(path):
-    try:
-        import h5py
-    except ImportError as exc:
-        raise RuntimeError("h5py is required to load RDC HDF5 files") from exc
-    path = os.path.expanduser(path)
-    with _open_hdf5_read(path, h5py) as h5:
-        grp = _rdc0_group(h5, path)
-        rdc0 = grp["real"][...] + 1j * grp["imag"][...]
-        channel_stands = grp["channel_stands"][...]
-        channel_pols = grp["channel_pols"][...]
-        adc_sample_index = grp["adc_sample_index"][...] if "adc_sample_index" in grp else np.arange(rdc0.shape[0])
-        metadata = {}
-        if "metadata_json" in h5.attrs:
-            metadata = json.loads(h5.attrs["metadata_json"])
-    channel_stands, channel_pols = cached_physical_channel_ids(channel_stands, channel_pols, metadata)
-    return {
-        "rdc0": rdc0.astype(np.complex64, copy=False),
-        "channel_stands": channel_stands,
-        "channel_pols": channel_pols,
-        "adc_sample_index": adc_sample_index,
-        "metadata": metadata,
-    }
-
-
-def load_rdc0_hdf5_metadata(path):
-    try:
-        import h5py
-    except ImportError as exc:
-        raise RuntimeError("h5py is required to load RDC HDF5 files") from exc
-    path = os.path.expanduser(path)
-    with _open_hdf5_read(path, h5py) as h5:
-        grp = _rdc0_group(h5, path)
-        shape = tuple(grp["real"].shape)
-        channel_stands = grp["channel_stands"][...]
-        channel_pols = grp["channel_pols"][...]
-        adc_sample_index = grp["adc_sample_index"][...] if "adc_sample_index" in grp else np.arange(shape[0])
-        metadata = {}
-        if "metadata_json" in h5.attrs:
-            metadata = json.loads(h5.attrs["metadata_json"])
-    channel_stands, channel_pols = cached_physical_channel_ids(channel_stands, channel_pols, metadata)
-    return {
-        "shape": shape,
-        "channel_stands": channel_stands,
-        "channel_pols": channel_pols,
-        "adc_sample_index": adc_sample_index,
-        "metadata": metadata,
-    }
-
-
-def iter_rdc0_hdf5_channel_chunks(
-    path,
-    channel_chunk_size=8,
-    channel_indices=None,
-    pulse_start=None,
-    pulse_stop=None,
-    *,
-    _stage=0,
-    _delay_selection=None,
-):
-    try:
-        import h5py
-    except ImportError as exc:
-        raise RuntimeError("h5py is required to load RDC HDF5 files") from exc
-    path = os.path.expanduser(path)
-    channel_chunk_size = int(channel_chunk_size)
-    if channel_chunk_size < 1:
-        raise ValueError("channel_chunk_size must be >= 1")
-
-    with _open_hdf5_read(path, h5py) as h5:
-        grp = _rdc0_group(h5, path) if _stage == 0 else _rdc1_group(h5, path)
-        real = grp["real"]
-        imag = grp["imag"]
-        n_channels = real.shape[2]
-        pulse_start = 0 if pulse_start is None else int(pulse_start)
-        pulse_stop = real.shape[1] if pulse_stop is None else int(pulse_stop)
-        if pulse_start < 0 or pulse_stop > real.shape[1] or pulse_stop <= pulse_start:
-            raise ValueError("pulse_start/pulse_stop select an invalid RDC0 pulse range")
-        if channel_indices is None:
-            selected = np.arange(n_channels, dtype=int)
+    def __init__(self, stands, pols, fc, method="conventional", cable_correction="auto", metadata=None,
+                 loading=0.1, background_percentile=80.0):
+        metadata = metadata or {}
+        if fc is None:
+            raise ValueError("Array processing needs the tuning frequency; pass --carrier-frequency")
+        if len(np.unique(pols)) != 1:
+            raise ValueError("Array processing uses one polarization at a time; pass --pol x or --pol y")
+        positions, found = station.stand_positions(stands)
+        if not found.all():
+            print(f"Dropping stands without LSL positions: {np.asarray(stands)[~found].tolist()}", flush=True)
+        self.keep = found
+        self.stands, self.pols = np.asarray(stands)[found], np.asarray(pols)[found]
+        self.positions = positions
+        self.fc = float(fc)
+        self.method = method
+        self.loading = loading
+        self.background_percentile = background_percentile
+        corrected = metadata.get("cable_phase_corrected", False)
+        ideal_sim = metadata.get("synthetic", False) and not metadata.get("cable_delays_injected", False)
+        if cable_correction == "off" or corrected or (cable_correction == "auto" and ideal_sim):
+            self.cable = np.ones(len(self.stands), complex)
+            self.cable_note = "already corrected" if corrected else ("ideal simulation" if ideal_sim else "off")
         else:
-            selected = np.asarray(channel_indices, dtype=int)
-            if selected.ndim != 1:
-                raise ValueError("channel_indices must be a 1D sequence")
-            if selected.size and (np.min(selected) < 0 or np.max(selected) >= n_channels):
-                raise ValueError("channel_indices contains an out-of-range channel")
-        for start in range(0, selected.size, channel_chunk_size):
-            stop = min(start + channel_chunk_size, selected.size)
-            idx = selected[start:stop]
-            band = slice(None) if _delay_selection is None else _delay_selection
-            chunk = real[band, pulse_start:pulse_stop, idx] + 1j * imag[band, pulse_start:pulse_stop, idx]
-            yield start, stop, chunk.astype(np.complex64, copy=False)
+            self.cable = station.cable_phase_factors(self.stands, self.pols, self.fc)
+            self.cable_note = f"LSL LWA-SV at {self.fc / 1e6:.6f} MHz"
+
+    def prepare(self, cube):
+        """Drop channels without positions and apply cable correction. cube: (..., channels)."""
+        return cube[..., self.keep] * self.cable.astype(np.complex64)
+
+    def signal_covariance(self, cube, top_fraction=0.01, min_cells=16):
+        """Covariance from the strongest delay-Doppler cells (the signal), for look-direction search."""
+        x = cube.reshape(-1, cube.shape[-1])
+        p = np.nansum(np.abs(x) ** 2, axis=1)
+        n = max(min_cells, int(top_fraction * len(p)))
+        top = np.argsort(np.where(np.isfinite(p), p, -np.inf))[::-1][:n]
+        return spatial_covariance(x[top], self.loading)
+
+    def look_direction(self, cube, step=2.0):
+        az, el, _ = peak_direction(self.signal_covariance(cube), self.positions, self.fc, "conventional", step)
+        return az, el
+
+    def beamform(self, cube, az, el):
+        """cube (delay, doppler, channels) -> complex beam (delay, doppler)."""
+        R = None
+        if self.method == "mvdr":
+            R = spatial_covariance(cube.reshape(-1, cube.shape[-1]), self.loading, self.background_percentile)
+        w = beam_weights(self.positions, self.fc, az, el, self.method, R)
+        return np.tensordot(cube, w.conj(), axes=([-1], [0]))
+
+    def angle_map(self, snapshots, az_grid, el_grid, method=None):
+        R = spatial_covariance(snapshots, self.loading)
+        return angle_spectrum(R, self.positions, self.fc, az_grid, el_grid, method or self.method), R
 
 
-def load_rdc2_hdf5_metadata(path):
-    try:
-        import h5py
-    except ImportError as exc:
-        raise RuntimeError("h5py is required to load RDC HDF5 files") from exc
-    path = os.path.expanduser(path)
-    with _open_hdf5_read(path, h5py) as h5:
-        grp = _rdc2_group(h5, path)
-        metadata = {}
-        if "metadata_json" in h5.attrs:
-            metadata = json.loads(h5.attrs["metadata_json"])
-        channel_stands, channel_pols = cached_physical_channel_ids(
-            grp["channel_stands"][...], grp["channel_pols"][...], metadata,
-        )
-        return {
-            "shape": ((1,) + grp["real"].shape if grp["real"].ndim == 3 else grp["real"].shape),
-            "storage_shape": grp["real"].shape,
-            "has_rdc1": "rdc1" in h5,
-            "delay_ms": grp["delay_ms"][...],
-            "doppler_hz": grp["doppler_hz"][...],
-            "frame_tstart_s": grp["frame_tstart_s"][...],
-            "frame_tend_s": grp["frame_tend_s"][...],
-            "channel_stands": channel_stands,
-            "channel_pols": channel_pols,
-            "metadata": metadata,
-        }
+# ===========================================================================
+# 6. Reductions used by plots
+# ===========================================================================
+
+def incoherent_power(cube, combine="sum"):
+    """Combine channels (last axis) by power: sum, mean or max."""
+    p = np.abs(cube) ** 2
+    return {"sum": np.nansum, "mean": np.nanmean, "max": np.nanmax}[combine](p, axis=-1)
 
 
-def iter_rdc2_hdf5_channel_chunks(
-    path,
-    channel_chunk_size=8,
-    channel_indices=None,
-    frame_start=None,
-    frame_stop=None,
-    delay_selection=None,
-    doppler_selection=None,
-):
-    try:
-        import h5py
-    except ImportError as exc:
-        raise RuntimeError("h5py is required to load RDC HDF5 files") from exc
-    path = os.path.expanduser(path)
-    channel_chunk_size = int(channel_chunk_size)
-    if channel_chunk_size < 1:
-        raise ValueError("channel_chunk_size must be >= 1")
+def to_db(power):
+    return 10.0 * np.log10(np.asarray(power) + 1e-12)
 
-    with _open_hdf5_read(path, h5py) as h5:
-        grp = _rdc2_group(h5, path)
-        real = grp["real"]
-        imag = grp["imag"]
-        n_frames = 1 if real.ndim == 3 else real.shape[0]
-        n_channels = real.shape[-1]
-        frame_start = 0 if frame_start is None else int(frame_start)
-        frame_stop = n_frames if frame_stop is None else int(frame_stop)
-        if frame_start < 0 or frame_stop > n_frames or frame_stop <= frame_start:
-            raise ValueError("frame_start/frame_stop select an invalid RDC2 frame range")
-        delay_selection = slice(None) if delay_selection is None else delay_selection
-        doppler_selection = slice(None) if doppler_selection is None else doppler_selection
-        if channel_indices is None:
-            selected = np.arange(n_channels, dtype=int)
+
+def strongest_delays(power, delay_ms, n=5, min_separation_ms=None):
+    """Up to ``n`` strongest delays (ms) of a (..., delay) power array, separated by at least 0.5 ms."""
+    power = np.asarray(power, float)
+    per_delay = power if power.ndim == 1 else np.nanmax(power.reshape(-1, power.shape[-1]), axis=0)
+    if min_separation_ms is None:
+        step = float(np.median(np.abs(np.diff(delay_ms)))) if len(delay_ms) > 1 else 0.0
+        min_separation_ms = max(0.5, 3 * step)
+    work, peaks = per_delay.copy(), []
+    for _ in range(n):
+        if not np.any(np.isfinite(work)):
+            break
+        i = int(np.nanargmax(work))
+        peaks.append(float(delay_ms[i]))
+        work[np.abs(delay_ms - delay_ms[i]) <= min_separation_ms] = np.nan
+    return peaks
+
+
+def doppler_time(rdc1, prf, integration, hop, window="hann", nfft=None, combine="incoherent"):
+    """Doppler spectra of a delay band vs time. Returns (times from band start, fd, power (time, fd)).
+
+    combine: incoherent (mean over delay of channel-summed power), coherent
+    (sum channels complex first) or peak (strongest delay bin only).
+    """
+    n = rdc1.shape[1]
+    count = int(round(integration * prf))
+    stride = int(round(hop * prf))
+    if count < 1 or stride < 1 or count > n:
+        raise ValueError(f"Integration must cover 1..{n} sweeps and hop at least one sweep")
+    starts = np.arange(0, n - count + 1, stride)
+    power, fd = [], None
+    for s in starts:
+        X, fd = lfm.doppler_fft(rdc1[:, s:s + count], prf, window, nfft)
+        if combine == "incoherent":
+            power.append(np.mean(np.sum(np.abs(X) ** 2, axis=2), axis=0))
+        elif combine == "coherent":
+            power.append(np.sum(np.abs(np.sum(X, axis=2)) ** 2, axis=0) / X.shape[2])
+        elif combine == "peak":
+            strongest = int(np.argmax(np.sum(np.abs(rdc1[:, s:s + count]) ** 2, axis=(1, 2))))
+            power.append(np.sum(np.abs(X[strongest]) ** 2, axis=1))
         else:
-            selected = np.asarray(channel_indices, dtype=int)
-            if selected.ndim != 1:
-                raise ValueError("channel_indices must be a 1D sequence")
-            if selected.size and (np.min(selected) < 0 or np.max(selected) >= n_channels):
-                raise ValueError("channel_indices contains an out-of-range channel")
-        for start in range(0, selected.size, channel_chunk_size):
-            stop = min(start + channel_chunk_size, selected.size)
-            idx = selected[start:stop]
-            if real.ndim == 3:
-                chunk = (real[delay_selection, doppler_selection, idx]
-                         + 1j * imag[delay_selection, doppler_selection, idx])[None, ...]
-            else:
-                chunk = (
-                    real[frame_start:frame_stop, delay_selection, doppler_selection, idx]
-                    + 1j * imag[frame_start:frame_stop, delay_selection, doppler_selection, idx]
-                )
-            yield start, stop, chunk.astype(np.complex64, copy=False)
+            raise ValueError("combine must be incoherent, coherent or peak")
+    return (starts + count / 2.0) / prf, fd, np.array(power)
 
 
-def metadata_json(**kwargs):
-    return json.dumps(kwargs, indent=2, sort_keys=True)
-
-
-def export_tbn_rdc0_hdf5(
-    idf,
-    output_file,
-    tstart,
-    duration,
-    sweep_frequency,
-    stands,
-    pol,
-    start_offset_samples=0,
-    adc_start=0,
-    adc_count=None,
-    gap_fill="nan",
-    dtype="float32",
-    compression="gzip",
-    compression_level=4,
-    chunk_pulses=1,
-):
-    try:
-        import h5py
-    except ImportError as exc:
-        raise RuntimeError("h5py is required for RDC HDF5 export") from exc
-
-    fs = float(idf.get_info("sample_rate"))
-    try:
-        tuning_frequency_hz = float(idf.get_info("freq1"))
-    except Exception:
-        tuning_frequency_hz = None
-    sweep_length = int(round(fs / float(sweep_frequency)))
-    if adc_count is None:
-        adc_count = sweep_length - int(adc_start)
-    total_pulses = int(np.floor((duration * fs - start_offset_samples) / sweep_length))
-    if total_pulses < 1:
-        raise ValueError("Requested duration does not contain one complete sweep after alignment")
-
-    stream_indices, channel_stands, channel_pols = channel_selection(stands, pol)
-    n_channels = len(stream_indices)
-    out_dtype = np.dtype(dtype)
-    chunks = (int(adc_count), int(chunk_pulses), min(n_channels, 32))
-    compression_arg = None if compression == "none" else compression
-    opts = None if compression in ("none", "lzf") else int(compression_level)
-
-    output_file = os.path.expanduser(output_file)
-    os.makedirs(os.path.dirname(os.path.abspath(output_file)) or ".", exist_ok=True)
-    idf.offset(float(tstart))
-    chunk_seconds = min(0.25, float(duration))
-    target_seconds = float(duration)
-    timestamp_gap_tolerance = max(2.0 / fs, 0.001)
-    timetag_skip_seconds = 0.002
-
-    buffer = np.empty((n_channels, 0), dtype=np.complex64)
-    got = 0.0
-    timeline_elapsed = 0.0
-    first_timestamp = None
-    first_requested_timestamp = None
-    pulse_idx = 0
-    offset_pending = int(start_offset_samples)
-    gap_info = {"mode": gap_fill, "events": 0, "samples": 0, "sample_rate": fs}
-
-    with h5py.File(output_file, "w") as h5:
-        grp = h5.create_group("rdc0")
-        dset_real = grp.create_dataset(
-            "real",
-            shape=(int(adc_count), total_pulses, n_channels),
-            maxshape=(int(adc_count), total_pulses, n_channels),
-            dtype=out_dtype,
-            chunks=chunks,
-            compression=compression_arg,
-            compression_opts=opts,
-        )
-        dset_imag = grp.create_dataset(
-            "imag",
-            shape=(int(adc_count), total_pulses, n_channels),
-            maxshape=(int(adc_count), total_pulses, n_channels),
-            dtype=out_dtype,
-            chunks=chunks,
-            compression=compression_arg,
-            compression_opts=opts,
-        )
-        invalid_counts = grp.create_dataset("invalid_counts", (total_pulses, n_channels), dtype="int64",
-                                            maxshape=(total_pulses, n_channels))
-
-        while got < target_seconds and pulse_idx < total_pulses:
-            try:
-                readT, start_timestamp, data = idf.read(min(chunk_seconds, target_seconds - got))
-                if first_timestamp is None:
-                    if got > 0:
-                        first_timestamp = _timestamp_at(start_timestamp, -got)
-                        first_requested_timestamp = first_timestamp
-                    else:
-                        first_timestamp = start_timestamp
-                        first_requested_timestamp = start_timestamp
-                else:
-                    observed_elapsed = _timestamp_delta_seconds(start_timestamp, first_timestamp)
-                    if observed_elapsed is not None:
-                        timestamp_gap = observed_elapsed - timeline_elapsed
-                        if timestamp_gap > timestamp_gap_tolerance:
-                            gap_samples = int(round(min(timestamp_gap, target_seconds - got) * fs))
-                            if gap_samples > 0:
-                                _gap_warning("Timestamp gap; inserting RDC0 fill", tstart + got, _timestamp_at(first_requested_timestamp, got))
-                                buffer = np.concatenate([buffer, _gap_fill_block(n_channels, gap_samples, "nan")], axis=-1)
-                                gap_info["events"] += 1
-                                gap_info["samples"] += gap_samples
-                                gap_seconds = gap_samples / fs
-                                got += gap_seconds
-                                timeline_elapsed += gap_seconds
-            except RuntimeError as exc:
-                if "Invalid timetag skip" not in str(exc):
-                    raise
-                gap_seconds = min(timetag_skip_seconds, target_seconds - got)
-                gap_samples = int(round(gap_seconds * fs))
-                _gap_warning("Invalid timetag skip; inserting RDC0 fill", tstart + got, _timestamp_at(first_requested_timestamp, got))
-                buffer = np.concatenate([buffer, _gap_fill_block(n_channels, gap_samples, "nan")], axis=-1)
-                gap_info["events"] += 1
-                gap_info["samples"] += gap_samples
-                got += gap_seconds
-                timeline_elapsed += gap_seconds
-                idf.offset(gap_seconds)
-                continue
-
-            if data.ndim != 2:
-                raise RuntimeError(f"Unexpected data shape from idf.read(): {data.shape}")
-            if np.max(stream_indices) >= data.shape[0]:
-                raise ValueError(f"Requested stream index {np.max(stream_indices)} but read data has {data.shape[0]} antpols")
-            keep_samples = min(data.shape[1], int(round((target_seconds - got) * fs)))
-            if keep_samples <= 0:
-                break
-            buffer = np.concatenate([buffer, data[stream_indices, :keep_samples].astype(np.complex64, copy=False)], axis=-1)
-            del data
-
-            read_seconds = keep_samples / fs
-            got += read_seconds
-            timeline_elapsed += read_seconds
-
-            if offset_pending > 0 and buffer.shape[1] > 0:
-                drop = min(offset_pending, buffer.shape[1])
-                buffer = buffer[:, drop:]
-                offset_pending -= drop
-
-            while buffer.shape[1] >= sweep_length and pulse_idx < total_pulses:
-                sweep = buffer[:, :sweep_length]
-                adc = sweep[:, adc_start:adc_start + adc_count].T
-                invalid_counts[pulse_idx] = np.count_nonzero(~np.isfinite(adc), axis=0)
-                if gap_fill == "zero":
-                    adc = np.where(np.isfinite(adc), adc, 0)
-                dset_real[:, pulse_idx, :] = adc.real.astype(out_dtype, copy=False)
-                dset_imag[:, pulse_idx, :] = adc.imag.astype(out_dtype, copy=False)
-                buffer = buffer[:, sweep_length:]
-                pulse_idx += 1
-                if pulse_idx % 10 == 0:
-                    print(f"Wrote RDC0 pulse {pulse_idx}/{total_pulses}", flush=True)
-
-        if pulse_idx < total_pulses:
-            invalid_counts.resize((pulse_idx, n_channels))
-            dset_real.resize((int(adc_count), pulse_idx, n_channels))
-            dset_imag.resize((int(adc_count), pulse_idx, n_channels))
-
-        grp.create_dataset("channel_stands", data=channel_stands)
-        grp.create_dataset("channel_pols", data=channel_pols)
-        grp.create_dataset("adc_sample_index", data=np.arange(adc_start, adc_start + adc_count, dtype=np.int32))
-        grp.create_dataset("pulse_index", data=np.arange(pulse_idx, dtype=np.int32))
-        h5.attrs["metadata_json"] = metadata_json(
-            rdc_stage=0,
-            dimension_order=["adc", "pulses", "channels"],
-            gap_fill=gap_fill,
-            dtype=str(out_dtype),
-            compression=compression,
-            compression_level=compression_level,
-            shape_adc_pulses_channels=[int(adc_count), int(pulse_idx), int(n_channels)],
-            station="lwasv",
-            source_format="tbn",
-            pulse0_utc=(_timestamp_at(first_requested_timestamp, start_offset_samples / fs).isoformat()
-                        if _timestamp_at(first_requested_timestamp, start_offset_samples / fs) is not None else None),
-            channel_id_kind="physical_stand",
-            channel_digitizers=(stream_indices + 1).tolist(),
-            cable_phase_corrected=False,
-            tstart=float(tstart),
-            duration_requested_s=float(duration),
-            sample_rate_hz=fs,
-            tuning_frequency_hz=tuning_frequency_hz,
-            sweep_frequency_hz=float(sweep_frequency),
-            sweep_length_samples=int(sweep_length),
-            start_offset_samples=int(start_offset_samples),
-            adc_start=int(adc_start),
-            adc_count=int(adc_count),
-            stands=[int(s) for s in stands],
-            pol=str(pol),
-            n_channels=int(n_channels),
-            n_stands=int(len(np.unique(channel_stands))),
-            **polarization_metadata(channel_pols),
-            gap_info=gap_info,
-        )
-
-    return {
-        "output_file": output_file,
-        "shape": (int(adc_count), int(pulse_idx), int(n_channels)),
-        "bytes_uncompressed": estimate_rdc0_bytes(adc_count, pulse_idx, n_channels, out_dtype),
-        "gap_info": gap_info,
-    }
+def phase_doppler_histogram(fd_hz, power_db, fd_edges, combine="max", power_floor_db=None):
+    """Bin per-delay phase-Doppler estimates (time, delay) into (time, fd bins)."""
+    n_t, n_b = fd_hz.shape[0], len(fd_edges) - 1
+    out = np.full((n_t, n_b), np.nan)
+    for t in range(n_t):
+        ok = np.isfinite(fd_hz[t]) & np.isfinite(power_db[t]) & (fd_hz[t] >= fd_edges[0]) & (fd_hz[t] <= fd_edges[-1])
+        if power_floor_db is not None:
+            ok &= power_db[t] >= power_floor_db
+        if not ok.any():
+            continue
+        idx = np.clip(np.digitize(fd_hz[t, ok], fd_edges) - 1, 0, n_b - 1)
+        if combine == "max":
+            np.fmax.at(out[t], idx, power_db[t, ok])
+        else:
+            lin = np.zeros(n_b)
+            cnt = np.zeros(n_b)
+            np.add.at(lin, idx, 10 ** (power_db[t, ok] / 10))
+            np.add.at(cnt, idx, 1)
+            val = lin if combine == "sum" else lin / np.maximum(cnt, 1)
+            out[t] = np.where(cnt > 0, to_db(val), np.nan)
+    return out

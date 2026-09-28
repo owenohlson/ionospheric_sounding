@@ -20,30 +20,22 @@ Stands whose residuals are consistent across many independent cells are
 candidates for mapping or calibration problems (or a self-calibration offset).
 
 Example:
-    python tools/array_calibration_check.py --rdc2-input 4747_rdc2_x.h5 --pol x \
+    python tools/check_array_calibration.py 4747_rdc2_x.h5 --pol x \
         --top-cells 20 --csv stand_residuals.csv
 """
 
 import argparse
 import csv
 import os
-import types
 
 import numpy as np
 
 C = 299_792_458.0
 
 
-def unit_vectors(az_deg, el_deg):
-    az = np.deg2rad(np.asarray(az_deg, dtype=float))
-    el = np.deg2rad(np.asarray(el_deg, dtype=float))
-    return np.stack([np.cos(el) * np.sin(az), np.cos(el) * np.cos(az), np.sin(el)], axis=-1)
-
-
 def steering_matrix(positions_m, frequency_hz, az_deg, el_deg):
-    """Rows are steering vectors with the same convention as rdc_utils.steering_vector."""
-    u = unit_vectors(az_deg, el_deg)
-    return np.exp(1j * 2.0 * np.pi * frequency_hz / C * (u @ np.asarray(positions_m, dtype=float).T))
+    from rdc_utils import steering_matrix as sm
+    return sm(positions_m, frequency_hz, az_deg, el_deg)
 
 
 def pick_cells(power, n_cells, delay_guard=3, doppler_guard=5):
@@ -166,20 +158,19 @@ def print_report(results, per_stand, n_channels):
 
 
 def main():
+    import itertools
     import sys
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from rdc_cache import prepare_rdc2_view, iter_rdc2_view_chunks
-    from rdc_utils import lwasv_selected_antennas
-    from array_delay_doppler import contiguous_axis_selection, select_array_channels
+    import station_utils
+    from rdc_utils import ArrayProcessor, RDCView
 
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--rdc2-input", required=True)
+    p.add_argument("input", help="RDC file with an array (RDC2, or RDC1/RDC0)")
     p.add_argument("--frame-index", type=int, default=0)
     p.add_argument("--integration-time", type=float, default=None)
     p.add_argument("--hop-time", type=float, default=None)
-    p.add_argument("--pol", default="x", choices=["x", "y", "0", "1"])
-    p.add_argument("--keep-bad-stands", action="store_true")
-    p.add_argument("--operational-only", action="store_true")
+    p.add_argument("--pol", default="x", choices=["x", "y"])
+    p.add_argument("--bad-stands", default="list", choices=["none", "list", "status", "both"])
     p.add_argument("--d-min", type=float, default=None)
     p.add_argument("--d-max", type=float, default=None)
     p.add_argument("--fd-min", type=float, default=None)
@@ -189,28 +180,19 @@ def main():
     p.add_argument("--csv", default=None, help="Optional per-stand residual CSV")
     args = p.parse_args()
 
-    view_args = types.SimpleNamespace(rdc2_input=args.rdc2_input, integration_time=args.integration_time,
-                                      hop_time=args.hop_time, tstart=None, tend=None, duration=None,
-                                      nfft_doppler=None, slow_window="hann", gap_fill="zero")
-    view = prepare_rdc2_view(view_args)
-    meta = view["metadata"]
-    fc = args.carrier_frequency or meta.get("tuning_frequency_hz") or meta.get("carrier_frequency_hz")
-    if fc is None:
-        raise ValueError("No tuning frequency in metadata; pass --carrier-frequency")
-    idx, stands, pols, positions, _ = select_array_channels(
-        view["channel_stands"], view["channel_pols"], args.pol,
-        drop_bad=not args.keep_bad_stands, require_positions=True, operational_only=args.operational_only)
-    dsel, _ = contiguous_axis_selection(view["delay_ms"], args.d_min, args.d_max, "delay")
-    fsel, _ = contiguous_axis_selection(view["doppler_hz"], args.fd_min, args.fd_max, "Doppler")
-    chunks = [ch[0] for _, _, ch in iter_rdc2_view_chunks(view, 16, channel_indices=idx,
-                                                         frame_start=args.frame_index, frame_stop=args.frame_index + 1,
-                                                         delay_selection=dsel, doppler_selection=fsel)]
-    rdc2 = np.concatenate(chunks, axis=2)
-    if meta.get("cable_phase_corrected", False):
+    view = RDCView(args.input, "all", args.pol, args.bad_stands)
+    view.select_delay(args.d_min, args.d_max)   # default: +/-1.5 ms around the strongest echo
+    frames = view.rdc2_frames(args.integration_time, args.hop_time, fd_min=args.fd_min, fd_max=args.fd_max)
+    frame = next(itertools.islice(frames, args.frame_index, None))
+    fc = float(args.carrier_frequency or view.fc)
+    array = ArrayProcessor(view.stands, view.pols, fc, cable_correction="off", metadata=view.meta)
+    rdc2 = frame["cube"][..., array.keep]
+    if view.meta.get("cable_phase_corrected", False):
         print("NOTE: metadata says cable phase is already corrected; the 'none' variant is the corrected data.")
-    delays = np.array([a.cable.delay(float(fc)) for a in lwasv_selected_antennas(stands, pols)])
-    results, per_stand = calibration_report(rdc2, positions, float(fc), delays, stands, n_cells=args.top_cells)
-    print(f"File {args.rdc2_input}, frame {args.frame_index}, fc {float(fc) / 1e6:.6f} MHz, cube {rdc2.shape}")
+    delays = station_utils.cable_delays_s(array.stands, array.pols, fc)
+    results, per_stand = calibration_report(rdc2, array.positions, fc, delays, array.stands, n_cells=args.top_cells)
+    print(f"File {args.input}, frame {args.frame_index} ({frame['t0']:.3f}-{frame['t1']:.3f} s), "
+          f"fc {fc / 1e6:.6f} MHz, cube {rdc2.shape}")
     print_report(results, per_stand, rdc2.shape[2])
     if args.csv:
         with open(args.csv, "w", newline="") as fh:
