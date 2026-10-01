@@ -43,9 +43,9 @@ def add_selection(p, array=False, default_stands="all"):
     g.add_argument("-s", "--stands", "--stand", dest="stands", default=default_stands,
                    help='Stands to use: "5", "1-10,20", "first" (lowest stand in the input) or "all"')
     g.add_argument("-p", "--pol", choices=["both", "x", "y"], default=None if array is None else ("x" if array else "both"))
-    g.add_argument("--bad-stands", choices=["none", "list", "status", "both"],
-                   default=None if array is None else ("list" if array else "none"),
-                   help="Drop stands: 'list' = known-bad list, 'status' = LSL/SSMIF status flags, 'both'")
+    g.add_argument("--bad-stands", choices=["none", "status"],
+                   default=None if array is None else ("status" if array else "none"),
+                   help="Drop stands: 'status' = flagged in the SSMIF (use --ssmif for the observation date)")
     g.add_argument("--gap-fill", choices=["nan", "zero"], default=None,
                    help="Default: the policy stored in the input")
     g.add_argument("--ssmif", default=None,
@@ -102,6 +102,7 @@ def add_array(p):
     g.add_argument("--cable-correction", choices=["auto", "on", "off"], default="auto",
                    help="auto skips ideal simulations and already-corrected inputs")
     g.add_argument("--diagonal-loading", type=float, default=0.1)
+    add_calibration(g)
     g.add_argument("--angle-output", default=None,
                    help="Also write angle (sky) maps: a PNG, or a directory for sliding videos")
     g.add_argument("--angle-cells", type=int, default=0,
@@ -112,8 +113,20 @@ def add_array(p):
     g.add_argument("--beam-pattern-output", default=None, help="PNG of the array beam pattern for the look direction")
 
 
+def add_calibration(g):
+    g.add_argument("--calibration", default=None, metavar="CAL.h5",
+                   help="Per-stand self-calibration from calibrate_array.py (phases applied, flagged stands dropped)")
+
+
+def load_calibration(args):
+    if not getattr(args, "calibration", None):
+        return None
+    from calibration_utils import ArrayCalibration
+    return ArrayCalibration.load(args.calibration)
+
+
 def resolve_selection(args):
-    """Defaults for plots that can be single-receiver or array: array -> all stands, x pol, drop bad list;
+    """Defaults for plots that can be single-receiver or array: array -> all stands, x pol, drop SSMIF-flagged;
     otherwise the first stand, both pols, nothing dropped."""
     array = uses_array(args)
     if args.stands is None:
@@ -121,7 +134,7 @@ def resolve_selection(args):
     if args.pol is None:
         args.pol = "x" if array else "both"
     if args.bad_stands is None:
-        args.bad_stands = "list" if array else "none"
+        args.bad_stands = "status" if array else "none"
     return array
 
 

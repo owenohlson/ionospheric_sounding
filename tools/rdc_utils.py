@@ -810,6 +810,8 @@ def export_rdc3(view, output, processor, looks=None, frame_settings=None, dtype=
                           looks="auto per frame" if looks is None else looks, cable_correction=processor.cable_note,
                           carrier_frequency_hz=processor.fc, diagonal_loading=processor.loading,
                           stands=processor.stands.tolist(), pol=int(processor.pols[0]),
+                          ssmif=lwa.SSMIF_PATH,
+                          calibration=None if processor.calibration is None else processor.calibration.path,
                           d_min_ms=float(view.delay_ms[0]), d_max_ms=float(view.delay_ms[-1]),
                           integration_time_s=frames[0]["integration"], hop_time_s=frames[0]["hop"],
                           slow_window=frames[0]["window"], nfft_doppler=frames[0]["nfft"])
@@ -927,11 +929,14 @@ class ArrayProcessor:
     """Calibrated beamforming and angle spectra for one channel set.
 
     ``positions``: (N, 3) metres; ``fc``: steering frequency (the tuning frequency,
-    correct for dechirped data); ``cable``: per-channel correction factors.
+    correct for dechirped data); ``cable``: per-channel correction factors (SSMIF
+    cable delays, times the self-calibration phases when ``calibration`` is given).
+    ``calibration``: a ``calibration_utils.ArrayCalibration``; its flagged stands and
+    stands it does not cover are dropped.
     """
 
     def __init__(self, stands, pols, fc, method="conventional", cable_correction="auto", metadata=None,
-                 loading=0.1, background_percentile=80.0):
+                 loading=0.1, background_percentile=80.0, calibration=None):
         metadata = metadata or {}
         if fc is None:
             raise ValueError("Array processing needs the tuning frequency; pass --carrier-frequency")
@@ -954,7 +959,22 @@ class ArrayProcessor:
             self.cable_note = "already corrected" if corrected else ("ideal simulation" if ideal_sim else "off")
         else:
             self.cable = lwa.cable_phase_factors(self.stands, self.pols, self.fc)
-            self.cable_note = f"LSL LWA-SV at {self.fc / 1e6:.6f} MHz"
+            self.cable_note = f"{os.path.basename(lwa.SSMIF_PATH) if lwa.SSMIF_PATH else 'LSL LWA-SV'} " \
+                              f"at {self.fc / 1e6:.6f} MHz"
+        self.calibration = calibration
+        if calibration is not None:
+            calibration.check_station(lwa.SSMIF_PATH)
+            factors, ok = calibration.factors(self.stands, self.pols, self.fc)
+            if not ok.all():
+                print(f"Self-calibration drops stands {self.stands[~ok].tolist()} (flagged or not calibrated)",
+                      flush=True)
+            kept = np.flatnonzero(self.keep)
+            self.keep[kept[~ok]] = False
+            self.stands, self.pols, self.positions = self.stands[ok], self.pols[ok], self.positions[ok]
+            self.cable = self.cable[ok] * factors[ok]
+            self.cable_note += f" + {calibration.describe()}"
+        if not len(self.stands):
+            raise ValueError("No stands left for array processing")
 
     def prepare(self, cube):
         """Drop channels without positions and apply cable correction. cube: (..., channels)."""

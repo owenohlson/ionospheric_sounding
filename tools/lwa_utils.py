@@ -3,7 +3,7 @@
 Station
     ``parse_stands``/``pol_indices``, antenna lookup by physical (stand, pol),
     positions, cable delays and phase factors, digitizer rows for TBN,
-    bad stands (known list or SSMIF status), legacy channel labels.
+    bad stands (SSMIF status flags), legacy channel labels.
 TBN
     ``open_tbn``/``tbn_info``/``probe_timestamp``, the gap-aware sample reader
     ``read_tbn_blocks``, and capture alignment/copying for ``preprocess_tbn.py``.
@@ -22,11 +22,6 @@ import numpy as np
 # ===========================================================================
 # Station metadata
 # ===========================================================================
-
-
-# Stands known to misbehave in the 2023-12-09 LWA-SV data. The SSMIF status
-# flags (``--bad-stands status``) are a complementary, date-independent source.
-BAD_LWA_STANDS = [6, 10, 16, 20, 21, 27, 60, 76, 93, 108, 110, 116, 133, 155, 163, 164, 178, 228, 229, 232]
 
 
 def parse_stands(spec="all", available=None):
@@ -187,18 +182,23 @@ def cable_phase_factors(stands, pols, frequency_hz):
     return np.exp(2j * np.pi * float(frequency_hz) * (d - d.min()))
 
 
-def bad_stand_mask(stands, pols, mode="list"):
-    """True for channels to drop. mode: none, list (BAD_LWA_STANDS), status (SSMIF), both."""
+def bad_stand_mask(stands, pols, mode="status"):
+    """True for channels to drop. mode: none, or status (SSMIF status flags, 33 = OK).
+
+    The hand-made stand list was removed: it was built under a different station
+    description and named the wrong stands under the dated SSMIF. Use the SSMIF for
+    the observation (``--ssmif``) plus the flags from a self-calibration file.
+    """
     stands = np.asarray(stands, int)
-    bad = np.zeros(stands.shape, bool)
     if mode in ("list", "both"):
-        bad |= np.isin(stands, BAD_LWA_STANDS)
-    if mode in ("status", "both"):
-        antennas = selected_antennas(stands, pols)
-        bad |= np.array([a.combined_status != 33 for a in antennas])
-    if mode not in ("none", "list", "status", "both"):
-        raise ValueError("--bad-stands must be none, list, status or both")
-    return bad
+        raise ValueError("--bad-stands list/both were removed; use 'status' (SSMIF flags) "
+                         "and the flags in a calibration file (--calibration)")
+    if mode not in ("none", "status"):
+        raise ValueError("--bad-stands must be none or status")
+    if mode == "none":
+        return np.zeros(stands.shape, bool)
+    antennas = selected_antennas(stands, pols)
+    return np.array([a.combined_status != 33 for a in antennas], bool)
 
 
 # ===========================================================================

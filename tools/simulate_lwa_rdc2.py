@@ -12,7 +12,7 @@ import os
 import numpy as np
 
 from rdc_utils import polarization_summary as polarization_metadata, steering_vector
-from lwa_utils import BAD_LWA_STANDS, cable_phase_factors, parse_stands, stand_positions as lookup_positions
+from lwa_utils import bad_stand_mask, cable_phase_factors, parse_stands, stand_positions as lookup_positions
 
 
 def get_lwasv_stand_positions():
@@ -127,12 +127,12 @@ def target_state(name, frame_idx, n_frames, scenario, delay_min, delay_max, fd_m
     return None
 
 
-def select_stands(stand_spec, max_channels, drop_bad):
-    stands = parse_stands(stand_spec)
-    if drop_bad:
-        stands = [s for s in stands if s not in BAD_LWA_STANDS]
+def select_stands(stand_spec, max_channels, bad_stands="status"):
     stand_positions = get_lwasv_stand_positions()
-    stands = [stand for stand in stands if int(stand) in stand_positions]
+    stands = [stand for stand in parse_stands(stand_spec) if int(stand) in stand_positions]
+    if bad_stands != "none" and stands:
+        bad = bad_stand_mask(stands, [0] * len(stands), bad_stands)
+        stands = [s for s, b in zip(stands, bad) if not b]
     if max_channels is not None and max_channels > 0:
         stands = stands[: int(max_channels)]
     if not stands:
@@ -199,9 +199,8 @@ def main():
     parser.add_argument("--stands", default="all")
     parser.add_argument("--max-channels", type=int, default=64,
                         help="Cap selected stands for a compact test file; use 0 for every selected stand")
-    parser.add_argument("--drop-bad-stands", action="store_true", default=True,
-                        help=f"Drop known bad stands: {BAD_LWA_STANDS}")
-    parser.add_argument("--keep-bad-stands", action="store_false", dest="drop_bad_stands")
+    parser.add_argument("--bad-stands", choices=["none", "status"], default="status",
+                        help="'status' drops stands flagged in the SSMIF")
     parser.add_argument("-p", "--pol", choices=["both", "x", "y", "0", "1"], default="x")
 
     parser.add_argument("--carrier-frequency", type=float, default=24.55e6)
@@ -236,7 +235,7 @@ def main():
     rng = np.random.default_rng(args.seed)
     delay_ms = grid_from_bounds(args.delay_min, args.delay_max, args.delay_step_ms)
     doppler_hz = grid_from_bounds(args.fd_min, args.fd_max, args.fd_step_hz)
-    stands = select_stands(args.stands, args.max_channels, args.drop_bad_stands)
+    stands = select_stands(args.stands, args.max_channels, args.bad_stands)
     pols = selected_pols(args.pol)
 
     channel_stands = np.repeat(np.asarray(stands, dtype=np.int32), len(pols))
@@ -399,7 +398,7 @@ def main():
             selected_stands=[int(s) for s in channel_stands],
             stands=[int(s) for s in stands],
             pol=str(args.pol),
-            drop_bad_stands=bool(args.drop_bad_stands),
+            bad_stands=str(args.bad_stands),
             n_channels=int(n_channels),
             n_stands=int(len(np.unique(channel_stands))),
             simulator="simulate_lwa_rdc2.py",

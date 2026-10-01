@@ -14,6 +14,8 @@ variants so the sign convention and the LSL delays can be compared on real data:
     lsl         the pipeline's correction, exp(+j 2 pi f d)
     lsl_flip    the opposite sign, exp(-j 2 pi f d)
     conj_lsl    conjugated I/Q followed by the pipeline's correction
+    selfcal     lsl plus the per-stand phases of --calibration (calibrate_array.py);
+                stands it flags are left out of every variant
 
 It also reports per-stand phase residuals after removing the best plane wave.
 Stands whose residuals are consistent across many independent cells are
@@ -76,20 +78,23 @@ def best_plane_wave(x, positions_m, frequency_hz, coarse_step=2.0, fine_step=0.2
     return eta, float(((AZ.ravel()[i] + 180.0) % 360.0) - 180.0), float(EL.ravel()[i])
 
 
-def correction_variants(x, cable_delays_s, frequency_hz):
+def correction_variants(x, cable_delays_s, frequency_hz, selfcal=None):
     d = np.asarray(cable_delays_s, dtype=float)
     d = d - np.nanmin(d)
     lsl = np.exp(2j * np.pi * frequency_hz * d)
-    return {
+    out = {
         "none": x,
         "lsl": x * lsl,
         "lsl_flip": x * np.conj(lsl),
         "conj_lsl": np.conj(x) * lsl,
     }
+    if selfcal is not None:
+        out["selfcal"] = x * lsl * selfcal
+    return out
 
 
 def calibration_report(rdc2, positions_m, frequency_hz, cable_delays_s, stands,
-                       n_cells=20, n_noise=20, seed=0):
+                       n_cells=20, n_noise=20, seed=0, selfcal=None):
     """rdc2: (delay, doppler, channels) complex, channel order matching positions/cables/stands."""
     rdc2 = np.asarray(rdc2)
     finite = np.all(np.isfinite(rdc2.real) & np.isfinite(rdc2.imag), axis=2)
@@ -106,7 +111,7 @@ def calibration_report(rdc2, positions_m, frequency_hz, cable_delays_s, stands,
     results = {}
     for label, cell_list in (("signal", cells), ("noise", noise_cells)):
         for r, c in cell_list:
-            for name, xv in correction_variants(rdc2[r, c, :], cable_delays_s, frequency_hz).items():
+            for name, xv in correction_variants(rdc2[r, c, :], cable_delays_s, frequency_hz, selfcal).items():
                 eta, _, _ = best_plane_wave(xv, positions_m, frequency_hz)
                 eta_phase, az, el = best_plane_wave(xv / (np.abs(xv) + 1e-30), positions_m, frequency_hz)
                 results.setdefault((label, name), []).append(
@@ -115,14 +120,15 @@ def calibration_report(rdc2, positions_m, frequency_hz, cable_delays_s, stands,
 
     # Per-stand residual phase after removing each strong cell's best plane wave (pipeline correction).
     # Only cells that are clearly plane-wave-like are used, so noise cells do not dominate.
-    noise_eta = np.nanmedian([r["eta_phase"] for r in results.get(("noise", "lsl"), [])] or [np.nan])
+    ref = "selfcal" if selfcal is not None else "lsl"     # residuals after the best available correction
+    noise_eta = np.nanmedian([r["eta_phase"] for r in results.get(("noise", ref), [])] or [np.nan])
     eta_min = max(0.3, min(3.0 * noise_eta, 0.9)) if np.isfinite(noise_eta) else 0.3
     resid = []
-    for rec in results[("signal", "lsl")]:
+    for rec in results[("signal", ref)]:
         if not rec["eta_phase"] >= eta_min:
             continue
         r, c = rec["cell"]
-        xv = correction_variants(rdc2[r, c, :], cable_delays_s, frequency_hz)["lsl"]
+        xv = correction_variants(rdc2[r, c, :], cable_delays_s, frequency_hz, selfcal)[ref]
         a = steering_matrix(positions_m, frequency_hz, [rec["az"]], [rec["el"]])[0]
         z = xv * np.conj(a)
         z = z / (np.abs(z) + 1e-30)
@@ -170,7 +176,7 @@ def print_report(results, per_stand, n_channels):
     print("eta: power-weighted; eta_ph: phases only (each channel scaled to unit amplitude), robust to loud stands")
     print(f"{'cells':7s} {'variant':9s} {'eta':>7s} {'eta_ph':>7s} {'max_ph':>7s} {'SNR dB':>7s}   best directions (az, el), first 5 cells")
     for label in ("signal", "noise"):
-        for name in ("none", "lsl", "lsl_flip", "conj_lsl"):
+        for name in ("none", "lsl", "lsl_flip", "conj_lsl", "selfcal"):
             recs = results.get((label, name), [])
             if not recs:
                 continue
@@ -207,10 +213,13 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("input", help="RDC file with an array (RDC2, or RDC1/RDC0)")
     p.add_argument("--frame-index", type=int, default=0)
+    p.add_argument("--tstart", type=float, default=None, help="Start time [s] on the file's time axis")
+    p.add_argument("--tend", type=float, default=None, help="End time [s] on the file's time axis")
     p.add_argument("--integration-time", type=float, default=None)
     p.add_argument("--hop-time", type=float, default=None)
     p.add_argument("--pol", default="x", choices=["x", "y"])
-    p.add_argument("--bad-stands", default="list", choices=["none", "list", "status", "both"])
+    p.add_argument("--bad-stands", default="status", choices=["none", "status"],
+                   help="'status' drops stands flagged in the SSMIF")
     p.add_argument("--d-min", type=float, default=None)
     p.add_argument("--d-max", type=float, default=None)
     p.add_argument("--fd-min", type=float, default=None)
@@ -219,21 +228,33 @@ def main():
     p.add_argument("--carrier-frequency", type=float, default=None)
     p.add_argument("--csv", default=None, help="Optional per-stand residual CSV")
     p.add_argument("--ssmif", default=None, help="SSMIF or metadata .tgz for the observation date")
+    p.add_argument("--calibration", default=None, help="Self-calibration file to test as the 'selfcal' variant "
+                   "(use cells it was not fitted on, e.g. another --frame-index or time range, for a fair test)")
     args = p.parse_args()
     if args.ssmif:
         lwa_utils.use_ssmif(args.ssmif)
 
-    view = RDCView(args.input, "all", args.pol, args.bad_stands, gap_fill="zero")
+    view = RDCView(args.input, "all", args.pol, args.bad_stands, args.tstart, args.tend, gap_fill="zero")
     view.select_delay(args.d_min, args.d_max)   # default: +/-1.5 ms around the strongest echo
     frames = view.rdc2_frames(args.integration_time, args.hop_time, fd_min=args.fd_min, fd_max=args.fd_max)
     frame = next(itertools.islice(frames, args.frame_index, None))
     fc = float(args.carrier_frequency or view.fc)
     array = ArrayProcessor(view.stands, view.pols, fc, cable_correction="off", metadata=view.meta)
     rdc2 = frame["cube"][..., array.keep]
+    stands, pols, positions = array.stands, array.pols, array.positions
+    selfcal = None
+    if args.calibration:
+        from calibration_utils import ArrayCalibration
+        cal = ArrayCalibration.load(args.calibration)
+        cal.check_station(lwa_utils.SSMIF_PATH)
+        selfcal, ok = cal.factors(stands, pols, fc)
+        print(f"Self-calibration {args.calibration}: leaving out {int((~ok).sum())} flagged/uncovered stand(s)")
+        rdc2, stands, pols, positions, selfcal = rdc2[..., ok], stands[ok], pols[ok], positions[ok], selfcal[ok]
     if view.meta.get("cable_phase_corrected", False):
         print("NOTE: metadata says cable phase is already corrected; the 'none' variant is the corrected data.")
-    delays = lwa_utils.cable_delays_s(array.stands, array.pols, fc)
-    results, per_stand = calibration_report(rdc2, array.positions, fc, delays, array.stands, n_cells=args.top_cells)
+    delays = lwa_utils.cable_delays_s(stands, pols, fc)
+    results, per_stand = calibration_report(rdc2, positions, fc, delays, stands, n_cells=args.top_cells,
+                                            selfcal=selfcal)
     print(f"File {args.input}, frame {args.frame_index} ({frame['t0']:.3f}-{frame['t1']:.3f} s), "
           f"fc {fc / 1e6:.6f} MHz, cube {rdc2.shape}, station {lwa_utils.SSMIF_PATH or 'LSL bundled LWA-SV'}")
     print_report(results, per_stand, rdc2.shape[2])
@@ -241,7 +262,7 @@ def main():
     noi = [r["cell"] for r in results[("noise", "lsl")][:5]]
     print("\nPair coherence |gamma| (median over stand pairs; calibration- and mapping-independent):")
     for label, cells in (("signal", sig), ("noise", noi)):
-        table, edges = pair_coherence(rdc2, array.positions, cells)
+        table, edges = pair_coherence(rdc2, positions, cells)
         bins = ", ".join(f"{lo:g}-{hi:g} m: {v:.2f}" for lo, hi, v in zip(edges[:-1], edges[1:], np.nanmedian(table[:, :-1], axis=0)))
         print(f"  {label:6s} ({int(table[0, -1])} snapshots/cell)  {bins}")
     print("  High signal |gamma| at all baselines with low eta_ph means the wavefield is coherent but the\n"

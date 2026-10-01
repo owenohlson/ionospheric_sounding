@@ -106,6 +106,8 @@ class ArrayTests(unittest.TestCase):
         rows, s, p = lwa_utils.tbn_stream_indices([1, 24], "both")
         self.assertEqual(rows.tolist(), [46, 47, 0, 1])
         self.assertEqual(ru.select_channels([1], [-1], "first", "both").tolist(), [0])
+        with self.assertRaises(ValueError):          # the hand-made list was removed
+            ru.select_channels(stands, pols, "all", "x", "list")
 
     def test_dated_ssmif_remaps_channels_by_digitizer(self):
         x = received(self.station.positions[:3], 0.0, 90.0, 0.004, sweeps=2)

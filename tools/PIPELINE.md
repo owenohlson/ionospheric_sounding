@@ -13,6 +13,8 @@ raw WAV (mono real / stereo I/Q) ────────────┤
              Doppler FFT                           sweep-to-sweep phase (lag-1) products
                   ▼
       export_rdc3.py  RDC3 (frames, delay, doppler, beams)   array beamforming
+                  ▲
+      calibrate_array.py  per-stand phase self-calibration (CAL.h5), used via --calibration
 ```
 
 Every export writes one HDF5 file. Its root attribute `metadata_json` holds
@@ -36,10 +38,11 @@ path.
 | Module | Contents |
 | --- | --- |
 | `lfm_utils.py` | Maths only: reference chirp and windows, dechirp/range FFT, delay axis, Doppler FFT, pulse-pair (phase) Doppler, sweep alignment, STFT, LFM estimation from a spectrogram |
-| `lwa_utils.py` | Everything LWA-specific: LWA-SV stand positions, cable delays and phase factors, digitizer mapping, bad stands (list or SSMIF status), legacy channel labels; TBN open/metadata/timestamps, gap-aware sample reader, frame-header scan and trimming for `preprocess_tbn.py` |
+| `lwa_utils.py` | Everything LWA-specific: LWA-SV stand positions, cable delays and phase factors, digitizer mapping, bad stands (SSMIF status), legacy channel labels; TBN open/metadata/timestamps, gap-aware sample reader, frame-header scan and trimming for `preprocess_tbn.py` |
 | `wav_utils.py` | WAV only: info, block reader, UTC parsing |
 | `rdc_io.py` | HDF5 layout: `RDCFile` reader (all stages, legacy formats), `StageWriter`, metadata/history, atomic output |
 | `rdc_utils.py` | Stage-to-stage processing: channel selection, sweep packing, `RDCView` (brings any stored stage to the product a plot needs), exports, array processing (`ArrayProcessor`, covariance, steering, angle spectra, beam pattern), plot reductions |
+| `calibration_utils.py` | Array self-calibration: plane-wave fit, phase-gain estimation (alternating fit, ramp kept out), held-out validation, the calibration file (`ArrayCalibration`) |
 | `plotting_utils.py` | Figures only (arrays → PNG) and video assembly |
 | `cli.py` | Shared command-line flag groups and the export command line |
 
@@ -53,6 +56,7 @@ path.
 | `plot_delay_doppler.py` / `sliding_delay_doppler.py` | ✓ | ✓ | ✓ | | ✓ |
 | `plot_doppler_time.py` | ✓ | ✓ | ✓ * | | |
 | `plot_phase_doppler.py` (`--kind delay-time` or `doppler-time`) / `sliding_phase_doppler.py` | ✓ | ✓ | ✓ * | ✓ | |
+| `calibrate_array.py` | ✓ | ✓ | ✓ | | |
 | `check_array_calibration.py` | ✓ | ✓ | ✓ | | |
 
 \* uses the RDC1 retained inside the RDC2 file.
@@ -69,10 +73,11 @@ recordings first.
   same instant keeps the same time in every later file. `--tstart/--tend` use
   this axis. UTC is shown when known (TBN always; WAV only with `--start-utc`).
 * **Channels.** `--stands` accepts `"5"`, `"1-10,20"`, `first` or `all`; `--pol`
-  accepts x, y or both; `--bad-stands` accepts none, list, status or both.
+  accepts x, y or both; `--bad-stands` accepts none or status (stands flagged in the SSMIF).
   * Single-receiver plots default to the first stand, both pols, incoherently summed.
   * Array processing (`--beamformer conventional|mvdr`, `--angle-output`,
-    `--beam-pattern-output`) defaults to all stands, x pol, and drops the known-bad list.
+    `--beam-pattern-output`) defaults to all stands, x pol, and drops SSMIF-flagged stands.
+    With `--calibration CAL.h5` it also drops the stands that calibration flagged.
 * **Station description.** Stand identities (via TBN digitizer), positions,
   cable delays and status come from LSL's bundled LWA-SV SSMIF unless
   `--ssmif FILE` (an SSMIF or an observation metadata `.tgz`) or `$LWA_SSMIF`
@@ -87,6 +92,40 @@ recordings first.
   Export with `--offset` ≈ observed delay − a few ms to put echoes near 0 ms.
   The offset is recorded in the metadata.
 
+## Array calibration
+
+Phases across the array come from three places, applied in this order:
+
+1. **Station description** (`--ssmif`, or `$LWA_SSMIF`): stand positions and cable
+   delays for the observation date. Without the right file the array is not
+   coherent (2023-12-09: eta_ph 0.03 with LSL's bundled file, 0.34 with
+   `LD021_0001.tgz`).
+2. **Self-calibration** (`calibrate_array.py`, then `--calibration CAL.h5`): one
+   phase per stand measured from the strongest echo cells, for whatever the SSMIF
+   does not capture. The fit alternates between finding each cell's plane-wave
+   direction and averaging the per-stand residual phase. Stands whose noise power
+   is far from the median (`--max-power-db`, default 10 dB) or whose phase does not
+   follow the fit (consistency below half the median) are flagged and dropped
+   when the file is applied. Only phases are corrected; equalising amplitudes
+   would amplify the noise of weak channels.
+
+What self-calibration cannot do:
+
+* **Change the pointing.** A linear phase ramp across the array looks exactly
+  like a different arrival direction. It is kept out of the gains, so absolute
+  directions still rest on the SSMIF geometry. Check them against a known
+  transmitter.
+* **Transfer between frequencies.** A calibration file is valid at its tuning
+  frequency (±1 kHz), and best for the same observation. Cable phases drift with
+  temperature, so recalibrate per session.
+* **Separate errors that only show up for one direction.** A wrong stand position
+  is corrected exactly only near the direction it was calibrated on.
+
+`calibrate_array.py` reports the plane-wave fit on held-out cells (fitted on
+alternate frames, or alternate cells for one frame) before and after
+calibration. The in-sample number is always optimistic. `check_array_calibration.py
+--calibration CAL.h5` adds a `selfcal` variant, for testing on another time range.
+
 ## Examples
 
 ```bash
@@ -94,7 +133,7 @@ python tools/preprocess_tbn.py raw.dat --report-only
 python tools/preprocess_tbn.py raw.dat --tstart 60 --tend 960 --output clean.dat
 
 python tools/export_rdc2.py clean.dat --sweep-frequency 2 --bandwidth=-99.259377e3 \
-  --pol x --bad-stands list --d-min 217.5 --d-max 219.5 --gap-fill zero \
+  --pol x --bad-stands status --d-min 217.5 --d-max 219.5 --gap-fill zero \
   --integration-time 120 --hop-time 30 --output clean_rdc2.h5
 
 python tools/plot_delay_doppler.py clean_rdc2.h5 --stands 5 --output dd_stand5.png
@@ -103,6 +142,11 @@ python tools/sliding_delay_doppler.py clean_rdc2.h5 --beamformer conventional \
 python tools/plot_delay_doppler.py clean_rdc2.h5 --integration-time 30 --output dd_30s.png
 python tools/export_rdc3.py clean_rdc2.h5 --look 166,58 --output clean_rdc3.h5
 python tools/check_array_calibration.py clean_rdc2.h5 --pol x
+
+export LWA_SSMIF=data/LD021_0001.tgz      # station description for 2023-12-09
+python tools/calibrate_array.py clean_rdc2.h5 --output cal_13p5.h5 --csv cal_13p5.csv
+python tools/plot_delay_doppler.py clean_rdc2.h5 --beamformer conventional \
+  --calibration cal_13p5.h5 --angle-output sky_cal.png --output dd_cal.png
 ```
 
 Tests: `lwa_env/bin/python -m unittest discover -s tests` (needs h5py and
@@ -125,7 +169,10 @@ Renamed flags:
 * `--stand` became `--stands`.
 * `--channel-combine` became `--combine`.
 * `--drop-bad-stands`/`--keep-bad-stands`/`--operational-only` became
-  `--bad-stands none|list|status|both`.
+  `--bad-stands none|status`. The hand-made `BAD_LWA_STANDS` list (and
+  `--bad-stands list/both`) was removed: it was built under a different station
+  description and named the wrong stands under the dated SSMIF. Use the SSMIF
+  status flags plus the flags in a calibration file.
 * The four `--reference-gate-*` flags became `--reference-gate FREQ[,DUTY[,PHASE]]`.
 * `--dry-run-size` became `--dry-run`.
 * `--no-store-rdc1` became `--no-keep-rdc1`.

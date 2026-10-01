@@ -85,7 +85,8 @@ def run(args, video=False):
     if array:
         processor = ru.ArrayProcessor(view.stands, view.pols, args.carrier_frequency or view.fc,
                                       "conventional" if args.beamformer == "incoherent" else args.beamformer,
-                                      args.cable_correction, view.meta, args.diagonal_loading)
+                                      args.cable_correction, view.meta, args.diagonal_loading,
+                                      calibration=cli.load_calibration(args))
     grid = (np.arange(-180, 180, args.angle_step), np.arange(0, 90 + 0.5 * args.angle_step, args.angle_step))
     title = args.title or ("Delay-Doppler" + (f" ({args.beamformer} beam)" if array and args.beamformer != "incoherent" else ""))
     dd_video = plots.FrameVideo(args.output, "delay_doppler", args.framerate, args.keep_frames) if video else None
