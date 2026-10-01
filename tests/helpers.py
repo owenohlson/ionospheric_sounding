@@ -38,7 +38,7 @@ def write_wav(path, fs=2000, sweep_frequency=2.0, bandwidth=-1985.1875, sweeps=4
 
 
 class FakeStation:
-    """Patch station_utils.lwasv_antennas with a small random array."""
+    """Patch lwa_utils.lwasv_antennas with a small random array."""
 
     def __init__(self, n=24, seed=5, bad_status=()):
         rng = np.random.default_rng(seed)
@@ -57,5 +57,5 @@ class FakeStation:
                     cable=types.SimpleNamespace(delay=lambda f, d=self.delays[i, pol]: d))
 
     def patch(self):
-        import station_utils
-        return patch.object(station_utils, "lwasv_antennas", return_value=self.lookup)
+        import lwa_utils
+        return patch.object(lwa_utils, "lwasv_antennas", return_value=self.lookup)

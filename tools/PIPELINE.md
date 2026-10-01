@@ -36,9 +36,8 @@ path.
 | Module | Contents |
 | --- | --- |
 | `lfm_utils.py` | Maths only: reference chirp and windows, dechirp/range FFT, delay axis, Doppler FFT, pulse-pair (phase) Doppler, sweep alignment, STFT, LFM estimation from a spectrogram |
-| `tbn_utils.py` | TBN only: LSL open/metadata/timestamps, gap-aware sample reader, frame realignment for `preprocess_tbn.py` |
+| `lwa_utils.py` | Everything LWA-specific: LWA-SV stand positions, cable delays and phase factors, digitizer mapping, bad stands (list or SSMIF status), legacy channel labels; TBN open/metadata/timestamps, gap-aware sample reader, frame-header scan and trimming for `preprocess_tbn.py` |
 | `wav_utils.py` | WAV only: info, block reader, UTC parsing |
-| `station_utils.py` | LWA-SV stand positions, cable delays and phase factors, digitizer mapping, bad stands (list or SSMIF status), legacy channel labels |
 | `rdc_io.py` | HDF5 layout: `RDCFile` reader (all stages, legacy formats), `StageWriter`, metadata/history, atomic output |
 | `rdc_utils.py` | Stage-to-stage processing: channel selection, sweep packing, `RDCView` (brings any stored stage to the product a plot needs), exports, array processing (`ArrayProcessor`, covariance, steering, angle spectra, beam pattern), plot reductions |
 | `plotting_utils.py` | Figures only (arrays → PNG) and video assembly |
@@ -86,6 +85,7 @@ recordings first.
 ## Examples
 
 ```bash
+python tools/preprocess_tbn.py raw.dat --report-only
 python tools/preprocess_tbn.py raw.dat --tstart 60 --tend 960 --output clean.dat
 
 python tools/export_rdc2.py clean.dat --sweep-frequency 2 --bandwidth=-99.259377e3 \
@@ -100,14 +100,14 @@ python tools/export_rdc3.py clean_rdc2.h5 --look 166,58 --output clean_rdc3.h5
 python tools/check_array_calibration.py clean_rdc2.h5 --pol x
 ```
 
-Tests: `python -m pytest tests` (needs h5py and soundfile; LSL is not needed,
-because a fake station is used).
+Tests: `lwa_env/bin/python -m unittest discover -s tests` (needs h5py and
+soundfile; LSL is not needed, because a fake station and synthetic TBN bytes are used).
 
 ## Migrating from the previous scripts
 
 | Old | New |
 | --- | --- |
-| `splitTBNfix.py` | `preprocess_tbn.py` (`--tend` is now an end time; output next to the input; captures are verified and resynchronised; `-r/-d` became `--chunk`) |
+| `splitTBNfix.py` | `preprocess_tbn.py`. It scans frame headers without LSL and finds captures from timetags rather than stand 1/pol 0 (frame order inside a capture varies). It drops bad-sync frames and partial edge captures, and reports missing or incomplete captures (`--report-only` to only check). `--tend` is now an end time, output goes next to the input, and `-r/-d` became `--chunk`. |
 | `rdc_export.py --stage N`, `tbn_export_rdcN.py` | `export_rdc0.py`, `export_rdc1.py`, `export_rdc2.py`, new `export_rdc2p.py`, `export_rdc3.py` |
 | `dechirp_plot.py`, `plot_filter_output.py`, `doppler_time_plot.py`, `spectrogram.py` | `plot_dechirp.py`, `plot_power_delay.py`, `plot_doppler_time.py`, `plot_spectrogram.py` |
 | `phase_doppler_plot.py`, `phase_doppler_time_plot.py` | `plot_phase_doppler.py --kind delay-time / doppler-time` |

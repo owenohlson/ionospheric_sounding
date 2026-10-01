@@ -15,7 +15,7 @@ import h5py
 import lfm_utils as lfm
 import rdc_io
 import rdc_utils as ru
-import station_utils
+import lwa_utils
 
 FS, SF, BW, FC = 100e3, 2.0, -99.259377e3, 24.55e6
 
@@ -103,13 +103,13 @@ class ArrayTests(unittest.TestCase):
         stands, pols = np.repeat(self.stands, 2), np.tile([0, 1], 24)
         idx = ru.select_channels(stands, pols, "1-5", "x", "status")
         self.assertEqual(stands[idx].tolist(), [1, 2, 4, 5])
-        rows, s, p = station_utils.tbn_stream_indices([1, 24], "both")
+        rows, s, p = lwa_utils.tbn_stream_indices([1, 24], "both")
         self.assertEqual(rows.tolist(), [46, 47, 0, 1])
         self.assertEqual(ru.select_channels([1], [-1], "first", "both").tolist(), [0])
 
     def test_legacy_digitizer_labels_are_resolved(self):
         meta = {}
-        s, p = station_utils.resolve_legacy_channel_ids([24, 24, 1, 1], [0, 1, 0, 1], meta)
+        s, p = lwa_utils.resolve_legacy_channel_ids([24, 24, 1, 1], [0, 1, 0, 1], meta)
         self.assertEqual(s.tolist(), [1, 1, 24, 24])
         self.assertEqual(meta["channel_id_kind"], "physical_stand")
 

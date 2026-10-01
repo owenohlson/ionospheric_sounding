@@ -93,7 +93,10 @@ def calibration_report(rdc2, positions_m, frequency_hz, cable_delays_s, stands,
     """rdc2: (delay, doppler, channels) complex, channel order matching positions/cables/stands."""
     rdc2 = np.asarray(rdc2)
     finite = np.all(np.isfinite(rdc2.real) & np.isfinite(rdc2.imag), axis=2)
-    power = np.where(finite, np.sum(np.abs(rdc2) ** 2, axis=2), np.nan)
+    chan_power = np.nanmedian(np.where(finite[..., None], np.abs(rdc2) ** 2, np.nan), axis=(0, 1))
+    # Normalize each channel by its median power so a few loud (RFI/faulty) stands cannot
+    # decide which cells are "signal".
+    power = np.where(finite, np.sum(np.abs(rdc2) ** 2 / np.maximum(chan_power, 1e-30), axis=2), np.nan)
     cells = pick_cells(power, n_cells)
     rng = np.random.default_rng(seed)
     quiet = np.argwhere(finite & (power <= np.nanpercentile(power, 50)))
@@ -104,17 +107,19 @@ def calibration_report(rdc2, positions_m, frequency_hz, cable_delays_s, stands,
     for label, cell_list in (("signal", cells), ("noise", noise_cells)):
         for r, c in cell_list:
             for name, xv in correction_variants(rdc2[r, c, :], cable_delays_s, frequency_hz).items():
-                eta, az, el = best_plane_wave(xv, positions_m, frequency_hz)
+                eta, _, _ = best_plane_wave(xv, positions_m, frequency_hz)
+                eta_phase, az, el = best_plane_wave(xv / (np.abs(xv) + 1e-30), positions_m, frequency_hz)
                 results.setdefault((label, name), []).append(
-                    dict(cell=(r, c), eta=eta, az=az, el=el, snr_db=10 * np.log10(power[r, c] / floor)))
+                    dict(cell=(r, c), eta=eta, eta_phase=eta_phase, az=az, el=el,
+                         snr_db=10 * np.log10(power[r, c] / floor)))
 
     # Per-stand residual phase after removing each strong cell's best plane wave (pipeline correction).
     # Only cells that are clearly plane-wave-like are used, so noise cells do not dominate.
-    noise_eta = np.nanmedian([r["eta"] for r in results.get(("noise", "lsl"), [])] or [np.nan])
+    noise_eta = np.nanmedian([r["eta_phase"] for r in results.get(("noise", "lsl"), [])] or [np.nan])
     eta_min = max(0.3, 3.0 * noise_eta) if np.isfinite(noise_eta) else 0.3
     resid = []
     for rec in results[("signal", "lsl")]:
-        if not rec["eta"] >= eta_min:
+        if not rec["eta_phase"] >= eta_min:
             continue
         r, c = rec["cell"]
         xv = correction_variants(rdc2[r, c, :], cable_delays_s, frequency_hz)["lsl"]
@@ -130,24 +135,34 @@ def calibration_report(rdc2, positions_m, frequency_hz, cable_delays_s, stands,
                       consistency=float(np.abs(m)),
                       rms_residual_deg=float(np.degrees(np.sqrt(np.mean(np.angle(resid[:, i]) ** 2)))) if resid.size else np.nan)
                  for i, (s, m) in enumerate(zip(stands, mean_vec))]
+    for d, pw in zip(per_stand, chan_power):
+        d["power_db_re_median"] = float(10 * np.log10(pw / np.nanmedian(chan_power)))
     return results, per_stand
 
 
 def print_report(results, per_stand, n_channels):
     print(f"\nChannels: {n_channels}   (eta = 1 for a perfect plane wave; ~1/N = {1.0 / n_channels:.4f} for random phases)")
-    print(f"{'cells':7s} {'variant':9s} {'median eta':>11s} {'max eta':>8s}   best directions (az, el) of first 5 cells")
+    print("eta: power-weighted; eta_ph: phases only (each channel scaled to unit amplitude), robust to loud stands")
+    print(f"{'cells':7s} {'variant':9s} {'eta':>7s} {'eta_ph':>7s} {'max_ph':>7s} {'SNR dB':>7s}   best directions (az, el), first 5 cells")
     for label in ("signal", "noise"):
         for name in ("none", "lsl", "lsl_flip", "conj_lsl"):
             recs = results.get((label, name), [])
             if not recs:
                 continue
-            etas = np.array([r["eta"] for r in recs])
+            eta = np.nanmedian([r["eta"] for r in recs])
+            ph = np.array([r["eta_phase"] for r in recs])
+            snr = np.nanmedian([r["snr_db"] for r in recs])
             dirs = ", ".join(f"({r['az']:.0f},{r['el']:.0f})" for r in recs[:5])
-            print(f"{label:7s} {name:9s} {np.nanmedian(etas):11.4f} {np.nanmax(etas):8.4f}   {dirs}")
-    print("\nInterpretation: 'lsl' should give the largest signal eta, clearly above the noise cells, "
-          "with best directions that agree between cells of the same propagation mode.")
+            print(f"{label:7s} {name:9s} {eta:7.4f} {np.nanmedian(ph):7.4f} {np.nanmax(ph):7.4f} {snr:7.1f}   {dirs}")
+    print("\nInterpretation: with working calibration, 'lsl' eta_ph for signal cells is far above the noise"
+          " cells (tens of percent or more), and cells of one propagation mode agree on direction.")
+    pw = np.array([d["power_db_re_median"] for d in per_stand])
+    order = np.argsort(pw)
+    print(f"\nChannel power spread: {np.sum(np.abs(pw) > 10)} of {len(pw)} stands differ from the median by more than 10 dB")
+    print("  loudest: " + ", ".join(f"{per_stand[i]['stand']} ({pw[i]:+.1f})" for i in order[::-1][:8]))
+    print("  quietest: " + ", ".join(f"{per_stand[i]['stand']} ({pw[i]:+.1f})" for i in order[:8]))
     if not per_stand or per_stand[0]["cells_used"] == 0:
-        print("\nNo cell was plane-wave-like enough (eta >= max(0.3, 3x noise)) to estimate per-stand residuals.")
+        print("\nNo cell was plane-wave-like enough (eta_ph >= max(0.3, 3x noise)) to estimate per-stand residuals.")
         return
     print(f"\nPer-stand residuals use {per_stand[0]['cells_used']} plane-wave-like cell(s).")
     ranked = sorted(per_stand, key=lambda d: -d["consistency"] * abs(d["mean_residual_deg"]))
@@ -161,7 +176,7 @@ def main():
     import itertools
     import sys
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    import station_utils
+    import lwa_utils
     from rdc_utils import ArrayProcessor, RDCView
 
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -189,7 +204,7 @@ def main():
     rdc2 = frame["cube"][..., array.keep]
     if view.meta.get("cable_phase_corrected", False):
         print("NOTE: metadata says cable phase is already corrected; the 'none' variant is the corrected data.")
-    delays = station_utils.cable_delays_s(array.stands, array.pols, fc)
+    delays = lwa_utils.cable_delays_s(array.stands, array.pols, fc)
     results, per_stand = calibration_report(rdc2, array.positions, fc, delays, array.stands, n_cells=args.top_cells)
     print(f"File {args.input}, frame {args.frame_index} ({frame['t0']:.3f}-{frame['t1']:.3f} s), "
           f"fc {fc / 1e6:.6f} MHz, cube {rdc2.shape}")

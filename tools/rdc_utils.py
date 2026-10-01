@@ -10,7 +10,7 @@ Sections
 6. Reductions used by plots (channel combining, Doppler-time, peak picking)
 
 The numerical kernels (dechirp, FFTs, pulse-pair) live in ``lfm_utils``; file
-layout lives in ``rdc_io``; LWA stand metadata in ``station_utils``.
+layout lives in ``rdc_io``; LWA station and TBN specifics in ``lwa_utils``.
 """
 
 import dataclasses
@@ -22,7 +22,7 @@ import numpy as np
 
 import lfm_utils as lfm
 import rdc_io
-import station_utils as station
+import lwa_utils as lwa
 
 CHANNEL_CHUNK = 8     # channels processed together when streaming
 PULSE_BLOCK = 64      # sweeps dechirped together when streaming from RDC0
@@ -35,13 +35,13 @@ PULSE_BLOCK = 64      # sweeps dechirped together when streaming from RDC0
 def select_channels(stands, pols, stand_spec="all", pol="both", bad_stands="none", receiver=False):
     """Increasing channel indices matching a stand list, polarization and bad-stand policy."""
     stands, pols = np.asarray(stands, int), np.asarray(pols, int)
-    wanted = station.parse_stands(stand_spec, available=np.unique(stands))
+    wanted = lwa.parse_stands(stand_spec, available=np.unique(stands))
     mask = np.isin(stands, wanted)
     if str(pol).lower() != "both":
-        mask &= np.isin(pols, station.pol_indices(pol))
+        mask &= np.isin(pols, lwa.pol_indices(pol))
     if bad_stands != "none" and not receiver:
         candidates = np.flatnonzero(mask)
-        mask[candidates] &= ~station.bad_stand_mask(stands[candidates], pols[candidates], bad_stands)
+        mask[candidates] &= ~lwa.bad_stand_mask(stands[candidates], pols[candidates], bad_stands)
     idx = np.flatnonzero(mask)
     if not idx.size:
         raise ValueError("No channels left after --stands/--pol/--bad-stands selection")
@@ -127,29 +127,28 @@ def open_raw_source(path, sweep_frequency, tstart=None, tend=None, offset=0.0, t
         return RawSource(wav_utils.read_wav_blocks(path, start, stop - start), fs, skip,
                          np.array([1]), np.array([-1]), stop - start,
                          dict(meta, source_tstart_s=tstart, first_sweep_utc=first_utc))
-    import tbn_utils
-    idf = tbn_utils.open_tbn(path)
-    info = tbn_utils.tbn_info(idf)
-    tbn_utils.print_tbn_info(info)
+    idf = lwa.open_tbn(path)
+    info = lwa.tbn_info(idf)
+    lwa.print_tbn_info(info)
     fs = info["sample_rate_hz"]
     tstart = 0.0 if tstart is None else tstart
     tend = info["usable_duration_s"] if tend is None else tend
     if not 0 <= tstart < tend:
         raise ValueError("--tend must be greater than --tstart")
-    stand_list = station.parse_stands(stands, available=station.station_stands())
-    rows, ch_stands, ch_pols = station.tbn_stream_indices(stand_list, pol)
+    stand_list = lwa.parse_stands(stands, available=lwa.station_stands())
+    rows, ch_stands, ch_pols = lwa.tbn_stream_indices(stand_list, pol)
     if bad_stands != "none":
-        keep = ~station.bad_stand_mask(ch_stands, ch_pols, bad_stands)
+        keep = ~lwa.bad_stand_mask(ch_stands, ch_pols, bad_stands)
         rows, ch_stands, ch_pols = rows[keep], ch_stands[keep], ch_pols[keep]
-    stamp = tbn_utils.probe_timestamp(path, tstart)
-    frac = tbn_utils.fractional_second(stamp) if timestamp_align else None
+    stamp = lwa.probe_timestamp(path, tstart)
+    frac = lwa.fractional_second(stamp) if timestamp_align else None
     skip = lfm.sweep_alignment_samples(frac, sweep_frequency, fs, offset)
-    start_dt = tbn_utils.to_datetime(stamp)
+    start_dt = lwa.to_datetime(stamp)
     first_utc = start_dt + timedelta(seconds=skip / fs) if start_dt is not None else None
     meta = dict(source_format="tbn", station="lwasv", channel_id_kind="physical_stand",
                 channel_digitizers=(rows + 1).tolist(), tuning_frequency_hz=info["tuning_frequency_hz"],
                 sample_rate_hz=fs, source_tstart_s=tstart, first_sweep_utc=first_utc)
-    blocks = tbn_utils.read_tbn_blocks(idf, tstart, tend - tstart, rows)
+    blocks = lwa.read_tbn_blocks(idf, tstart, tend - tstart, rows)
     return RawSource(blocks, fs, skip, ch_stands, ch_pols, int(round((tend - tstart) * fs)), meta, idf.close)
 
 
@@ -935,7 +934,7 @@ class ArrayProcessor:
             raise ValueError("Array processing needs the tuning frequency; pass --carrier-frequency")
         if len(np.unique(pols)) != 1:
             raise ValueError("Array processing uses one polarization at a time; pass --pol x or --pol y")
-        positions, found = station.stand_positions(stands)
+        positions, found = lwa.stand_positions(stands)
         if not found.all():
             print(f"Dropping stands without LSL positions: {np.asarray(stands)[~found].tolist()}", flush=True)
         self.keep = found
@@ -951,7 +950,7 @@ class ArrayProcessor:
             self.cable = np.ones(len(self.stands), complex)
             self.cable_note = "already corrected" if corrected else ("ideal simulation" if ideal_sim else "off")
         else:
-            self.cable = station.cable_phase_factors(self.stands, self.pols, self.fc)
+            self.cable = lwa.cable_phase_factors(self.stands, self.pols, self.fc)
             self.cable_note = f"LSL LWA-SV at {self.fc / 1e6:.6f} MHz"
 
     def prepare(self, cube):

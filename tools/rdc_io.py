@@ -184,7 +184,7 @@ class RDCFile:
         for s, (stands, pols) in raw_ids.items():
             if self.meta.get("channel_id_kind") == "legacy_input_pair" or (
                     "channel_id_kind" not in self.meta and not self.meta.get("synthetic")):
-                from station_utils import resolve_legacy_channel_ids
+                from lwa_utils import resolve_legacy_channel_ids
                 stands, pols = resolve_legacy_channel_ids(stands, pols, dict(self.meta))
             self._ids[s] = (np.asarray(stands, int), np.asarray(pols, int))
         if "rdc1" in self.stages:

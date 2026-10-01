@@ -1,62 +1,59 @@
-"""Repair and trim a raw TBN recording before export (replaces splitTBNfix.py).
+"""Check, repair and trim a raw TBN recording before export (replaces splitTBNfix.py).
 
-1. Skip forward to the first complete capture (a frame from stand 1, pol 0).
-2. Probe captures until the stream metadata is readable with a ~100 kHz sample rate.
-3. Copy whole captures for [--tstart, --tend), checking that every capture starts
-   on stand 1 / pol 0 and resynchronising (dropping the partial capture) if not.
+The file is scanned by frame header only (fast, no LSL needed):
 
-Missing or corrupted samples are not reconstructed; later stages fill timing
-gaps with NaN/zero. Output goes next to the input unless --output is given.
+* captures are found as groups of frames sharing a timetag (the order of
+  ant/pol frames inside a capture is not fixed, so stand 1 / pol 0 is not
+  used as a boundary);
+* the sample rate and frames per capture come from the timetags;
+* frames with a bad sync word are dropped, as are incomplete captures at the
+  start and end of the file (and anywhere with --drop-incomplete);
+* the report lists incomplete captures, missing captures (timetag jumps) and
+  bad frames, so corrupted stretches are visible before processing.
+
+Missing samples are not reconstructed; later stages fill timing gaps with NaN/zero.
+Output goes next to the input unless --output is given.
 """
 
 import os
 import time
 
 import cli
+import lwa_utils
 
 
 def main():
     p = cli.parser(__doc__)
     p.add_argument("input", help="Raw TBN file")
     p.add_argument("--output", default=None, help="Output TBN file (default: <input>_<tstart>-<tend>s.dat)")
-    p.add_argument("--tstart", type=float, default=0.0, help="Seconds to skip from the start of the file")
-    p.add_argument("--tend", type=float, default=None, help="End time [s] from the start of the file (default: end)")
-    p.add_argument("--chunk", type=float, default=None,
-                   help="Instead of one output, write consecutive files of this many seconds")
-    p.add_argument("--no-verify", action="store_true", help="Copy captures without checking frame alignment")
+    p.add_argument("--tstart", type=float, default=0.0, help="Start [s] after the first capture")
+    p.add_argument("--tend", type=float, default=None, help="End [s] after the first capture (default: end of file)")
+    p.add_argument("--chunk", type=float, default=None, help="Write consecutive files of this many seconds instead")
+    p.add_argument("--drop-incomplete", action="store_true", help="Drop every capture with missing/extra frames")
+    p.add_argument("--report-only", action="store_true", help="Only scan and report; write nothing")
     args = p.parse_args()
-    from lsl.reader import tbn
-    import tbn_utils
 
-    size = os.path.getsize(args.input)
-    with open(args.input, "rb") as fh:
-        skipped = tbn_utils.find_capture_start(fh)
-        if skipped:
-            print(f"Skipped {skipped} frame(s) to reach the first capture boundary")
-        pos, rate, per_capture = tbn_utils.probe_stream_layout(fh)
-        capture_s = tbn_utils.TBN_SAMPLES_PER_FRAME / rate
-        available = (size - pos) // (tbn.FRAME_SIZE * per_capture)
-        print(f"Sample rate {rate / 1e3:.3f} kHz, {per_capture} frames per capture, "
-              f"{available} captures ({available * capture_s:.3f} s) from byte {pos}")
-        first = int(round(args.tstart / capture_s))
-        last = available if args.tend is None else min(available, int(round(args.tend / capture_s)))
-        if last <= first:
-            p.error("--tend must be after --tstart and inside the file")
-        fh.seek(pos + first * tbn.FRAME_SIZE * per_capture)
-        step = last - first if args.chunk is None else max(1, int(round(args.chunk / capture_s)))
-        base = os.path.splitext(args.input)[0]
-        for k, start in enumerate(range(first, last, step)):
-            n = min(step, last - start)
-            t0, t1 = start * capture_s, (start + n) * capture_s
-            out = args.output if (args.output and args.chunk is None) else (
-                (os.path.splitext(args.output)[0] if args.output else base) + f"_{t0:.0f}-{t1:.0f}s.dat")
-            began = time.time()
-            with open(out, "wb") as fo:
-                stats = tbn_utils.copy_captures(fh, fo, n, per_capture, verify=not args.no_verify)
-            mb = os.path.getsize(out) / 1024 ** 2
-            print(f"Wrote {out}: {stats['captures']} captures ({t0:.3f}-{t1:.3f} s), "
-                  f"{stats['resyncs']} resync(s), {mb:.1f} MB in {time.time() - began:.1f} s")
+    began = time.time()
+    scan = lwa_utils.scan_tbn(args.input)
+    info = lwa_utils.summarize_tbn_scan(scan)
+    print(f"Scanned {scan['n_frames']} frames in {time.time() - began:.1f} s")
+    for key, value in info.items():
+        print(f"  {key:20s} {value:.6g}" if isinstance(value, float) else f"  {key:20s} {value}")
+    if args.report_only:
+        return
+    end = info["duration_s"] if args.tend is None else min(args.tend, info["duration_s"])
+    if end <= args.tstart:
+        p.error("--tend must be after --tstart and inside the file")
+    step = end - args.tstart if args.chunk is None else args.chunk
+    base = os.path.splitext(args.output or args.input)[0]
+    t0 = args.tstart
+    while t0 < end - 1e-9:
+        t1 = min(t0 + step, end)
+        out = args.output if (args.output and args.chunk is None) else f"{base}_{t0:.0f}-{t1:.0f}s.dat"
+        captures, frames = lwa_utils.write_tbn_range(args.input, out, scan, t0, t1, args.drop_incomplete)
+        print(f"Wrote {out}: {captures} captures, {frames} frames ({t0:.3f}-{t1:.3f} s)")
+        t0 = t1
 
 
 if __name__ == "__main__":
-    main()
+    cli.run(main)

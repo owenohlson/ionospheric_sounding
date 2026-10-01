@@ -12,7 +12,7 @@ import os
 import numpy as np
 
 from rdc_utils import polarization_summary as polarization_metadata, steering_vector
-from station_utils import BAD_LWA_STANDS, cable_phase_factors, parse_stands, stand_positions as lookup_positions
+from lwa_utils import BAD_LWA_STANDS, cable_phase_factors, parse_stands, stand_positions as lookup_positions
 
 
 def get_lwasv_stand_positions():
