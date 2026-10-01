@@ -117,9 +117,11 @@ class StageWriter:
         self.real.resize(shape)
         self.imag.resize(shape)
 
-    def channels(self, stands, pols):
+    def channels(self, stands, pols, digitizers=None):
         self.dataset("channel_stands", np.asarray(stands, np.int32))
         self.dataset("channel_pols", np.asarray(pols, np.int32))
+        if digitizers is not None:
+            self.dataset("channel_digitizers", np.asarray(digitizers, np.int32))
 
 
 def _default_chunks(stage, ndim):
@@ -177,15 +179,25 @@ class RDCFile:
                 self._has_invalid = {s: "invalid_counts" in h5[s] for s in self.stages}
                 raw_ids = {s: (h5[s]["channel_stands"][...], h5[s]["channel_pols"][...])
                            for s in self.stages if "channel_stands" in h5[s]}
+                digitizers = {s: h5[s]["channel_digitizers"][...] for s in self.stages
+                              if "channel_digitizers" in h5[s]}
         except OSError as exc:
             raise OSError(f"Could not open '{self.path}' as HDF5 (truncated or not an RDC file?)") from exc
         self._normalize()
-        self._ids = {}
+        self._ids, self._digitizers = {}, {}
         for s, (stands, pols) in raw_ids.items():
             if self.meta.get("channel_id_kind") == "legacy_input_pair" or (
                     "channel_id_kind" not in self.meta and not self.meta.get("synthetic")):
                 from lwa_utils import resolve_legacy_channel_ids
                 stands, pols = resolve_legacy_channel_ids(stands, pols, dict(self.meta))
+            digs = digitizers.get(s)
+            if digs is None and s == "rdc0" and len(self.meta.get("channel_digitizers") or []) == len(stands):
+                digs = np.asarray(self.meta["channel_digitizers"])
+            if digs is not None:
+                import lwa_utils
+                if lwa_utils.SSMIF_PATH is not None:      # re-derive identities under a dated SSMIF
+                    stands, pols = lwa_utils.ids_from_digitizers(digs)
+                self._digitizers[s] = np.asarray(digs, int)
             self._ids[s] = (np.asarray(stands, int), np.asarray(pols, int))
         if "rdc1" in self.stages:
             for attr, key in (("tstart_s", "rdc1_tstart_s"), ("sweep_frequency_hz", "sweep_frequency_hz")):
@@ -236,6 +248,10 @@ class RDCFile:
 
     def channel_ids(self, stage):
         return self._ids[stage_name(stage)]
+
+    def channel_digitizers(self, stage):
+        """TBN digitizer number of each channel, when known (None otherwise)."""
+        return self._digitizers.get(stage_name(stage))
 
     @property
     def is_receiver(self):

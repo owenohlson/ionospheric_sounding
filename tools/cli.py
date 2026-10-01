@@ -48,6 +48,9 @@ def add_selection(p, array=False, default_stands="all"):
                    help="Drop stands: 'list' = known-bad list, 'status' = LSL/SSMIF status flags, 'both'")
     g.add_argument("--gap-fill", choices=["nan", "zero"], default=None,
                    help="Default: the policy stored in the input")
+    g.add_argument("--ssmif", default=None,
+                   help="LWA station description (SSMIF or observation metadata .tgz) for the observation date; "
+                        "default: LSL's bundled LWA-SV file (or $LWA_SSMIF)")
 
 
 def add_delay(p):
@@ -138,8 +141,15 @@ def validate(p, args):
         p.error("--d-min must be below --d-max")
 
 
+def apply_ssmif(args):
+    if getattr(args, "ssmif", None):
+        import lwa_utils
+        lwa_utils.use_ssmif(args.ssmif)
+
+
 def view_from_args(args):
     from rdc_utils import RDCView
+    apply_ssmif(args)
     return RDCView(args.input, stands=args.stands, pol=args.pol, bad_stands=args.bad_stands,
                    tstart=args.tstart, tend=args.tend, gap_fill=args.gap_fill,
                    bandwidth=getattr(args, "bandwidth", None), dechirp_window=getattr(args, "dechirp_window", None),
@@ -221,6 +231,7 @@ def export_main(stage, argv=None):
         fd_min=getattr(args, "fd_min", None), fd_max=getattr(args, "fd_max", None),
         keep_rdc1=not getattr(args, "no_keep_rdc1", False), estimator_sweeps=getattr(args, "estimator_sweeps", 1),
         dtype=args.dtype, compression=args.compression, dry_run=args.dry_run)
+    apply_ssmif(args)
     raw = not args.input.lower().endswith((".h5", ".hdf5"))
     if not raw:
         for flag in ("sweep_frequency", "start_utc", "carrier_frequency"):

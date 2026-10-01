@@ -12,6 +12,8 @@ Channels are always identified by physical (stand, polarization); list order
 in LSL or in a file is never used as an identity.
 """
 
+import functools
+import os
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -62,14 +64,39 @@ def pol_indices(pol):
     raise ValueError("--pol must be both, x/y, or 0/1")
 
 
-def lwasv_antennas():
-    """Map (stand, pol) -> LSL Antenna for LWA-SV."""
+SSMIF_PATH = os.environ.get("LWA_SSMIF") or None
+
+
+def use_ssmif(path):
+    """Use this station description instead of LSL's bundled LWA-SV one.
+
+    ``path`` may be an SSMIF file or an observation metadata tarball (.tgz).
+    The SSMIF must match the observation date: digitizer wiring, cable lengths
+    and stand status change over time.
+    """
+    global SSMIF_PATH
+    SSMIF_PATH = None if path is None else os.path.expanduser(path)
+    _station.cache_clear()
+
+
+@functools.lru_cache(maxsize=1)
+def _station():
     try:
         from lsl.common import stations
     except ImportError as exc:
         raise ImportError("LWA-SV station metadata requires LSL; run in your LSL environment") from exc
+    if SSMIF_PATH is None:
+        return stations.lwasv
+    if SSMIF_PATH.endswith((".tgz", ".tar.gz", ".tar")):
+        from lsl.common import metabundle
+        return metabundle.get_station(SSMIF_PATH)
+    return stations.parse_ssmif(SSMIF_PATH)
+
+
+def lwasv_antennas():
+    """Map (stand, pol) -> LSL Antenna for LWA-SV (bundled SSMIF unless ``use_ssmif`` was called)."""
     result = {}
-    for antenna in stations.lwasv.antennas:
+    for antenna in _station().antennas:
         key = (int(antenna.stand.id), int(antenna.pol))
         if key in result:
             raise ValueError(f"Duplicate LWA-SV antenna mapping: {key}")
@@ -102,6 +129,16 @@ def tbn_stream_indices(stands, pol):
     if any(r < 0 for r in rows) or len(set(rows)) != len(rows):
         raise ValueError("Selected LWA-SV antennas have invalid or duplicate digitizer mappings")
     return np.asarray(rows, int), np.asarray(channel_stands, int), np.asarray(channel_pols, int)
+
+
+def ids_from_digitizers(digitizers):
+    """Physical (stands, pols) for TBN digitizer numbers under the current station description."""
+    by_digitizer = {int(a.digitizer): a for a in lwasv_antennas().values() if a.digitizer > 0}
+    missing = sorted(set(int(d) for d in digitizers) - set(by_digitizer))
+    if missing:
+        raise ValueError(f"Digitizers absent from the station description: {missing}")
+    antennas = [by_digitizer[int(d)] for d in digitizers]
+    return np.array([a.stand.id for a in antennas], int), np.array([a.pol for a in antennas], int)
 
 
 def resolve_legacy_channel_ids(stands, pols, metadata):

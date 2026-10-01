@@ -107,6 +107,19 @@ class ArrayTests(unittest.TestCase):
         self.assertEqual(rows.tolist(), [46, 47, 0, 1])
         self.assertEqual(ru.select_channels([1], [-1], "first", "both").tolist(), [0])
 
+    def test_dated_ssmif_remaps_channels_by_digitizer(self):
+        x = received(self.station.positions[:3], 0.0, 90.0, 0.004, sweeps=2)
+        write_rdc0(self.d / "m.h5", x, [1, 2, 3], [0, 0, 0])
+        with h5py.File(self.d / "m.h5", "r+") as h5:
+            h5["rdc0"].create_dataset("channel_digitizers", data=np.array([47, 45, 43]))
+        self.assertEqual(rdc_io.RDCFile(self.d / "m.h5").channel_ids("rdc0")[0].tolist(), [1, 2, 3])
+        lwa_utils.SSMIF_PATH = "dated.ssmif"          # identities now come from digitizers
+        try:
+            self.station.lookup[(1, 0)].digitizer, self.station.lookup[(2, 0)].digitizer = 45, 47
+            self.assertEqual(rdc_io.RDCFile(self.d / "m.h5").channel_ids("rdc0")[0].tolist(), [2, 1, 3])
+        finally:
+            lwa_utils.SSMIF_PATH = None
+
     def test_legacy_digitizer_labels_are_resolved(self):
         meta = {}
         s, p = lwa_utils.resolve_legacy_channel_ids([24, 24, 1, 1], [0, 1, 0, 1], meta)

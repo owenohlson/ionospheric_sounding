@@ -73,6 +73,11 @@ recordings first.
   * Single-receiver plots default to the first stand, both pols, incoherently summed.
   * Array processing (`--beamformer conventional|mvdr`, `--angle-output`,
     `--beam-pattern-output`) defaults to all stands, x pol, and drops the known-bad list.
+* **Station description.** Stand identities (via TBN digitizer), positions,
+  cable delays and status come from LSL's bundled LWA-SV SSMIF unless
+  `--ssmif FILE` (an SSMIF or an observation metadata `.tgz`) or `$LWA_SSMIF`
+  gives one for the observation date. Files store each channel's digitizer, so
+  a dated SSMIF re-derives stand identities without re-exporting.
 * **Delay window.** The default is ±1.5 ms around the strongest delay in a
   preview; `--d-min/--d-max` set it explicitly and `--full-delay` shows
   everything stored. Delays are relative to the sweep reference timing, not

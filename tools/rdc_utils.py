@@ -627,7 +627,8 @@ def export_rdc0(raw_path, output, s, tool="export_rdc0", temporary=False):
                     print(f"Input ended early: {written} of {n_pulses} sweeps written", flush=True)
                     w.resize((adc_count, written, n_ch))
                     invalid.resize((written, n_ch))
-                w.channels(src.channel_stands, src.channel_pols)
+                digs = src.metadata.get("channel_digitizers")
+                w.channels(src.channel_stands, src.channel_pols, digs)
                 w.dataset("adc_sample_index", np.arange(s.adc_start, s.adc_start + adc_count))
                 meta = dict(src.metadata)
                 first = meta.pop("first_sweep_utc", None)
@@ -661,6 +662,8 @@ def _export_processed(view, target, output, s, tool):
     channels = view.channels[stage]
     stands, pols = view.file.channel_ids(stage)
     stands, pols = stands[channels], pols[channels]
+    digs = view.file.channel_digitizers(stage)
+    digs = None if digs is None else digs[channels]
     n_ch, n_delay = len(channels), view.delay_ms.size
     prf = view.prf
 
@@ -750,7 +753,7 @@ def _export_processed(view, target, output, s, tool):
                           dechirp_window=view.dechirp_window, reference_gate=view.gate, gap_fill=view.gap_fill)
             for writer in (w1, w2, wp):
                 if writer is not None:
-                    writer.channels(stands, pols)
+                    writer.channels(stands, pols, digs)
                     writer.dataset("delay_ms", view.delay_ms)
             if w2 is not None:
                 w2.dataset("doppler_hz", fd[fd_keep])

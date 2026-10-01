@@ -116,7 +116,7 @@ def calibration_report(rdc2, positions_m, frequency_hz, cable_delays_s, stands,
     # Per-stand residual phase after removing each strong cell's best plane wave (pipeline correction).
     # Only cells that are clearly plane-wave-like are used, so noise cells do not dominate.
     noise_eta = np.nanmedian([r["eta_phase"] for r in results.get(("noise", "lsl"), [])] or [np.nan])
-    eta_min = max(0.3, 3.0 * noise_eta) if np.isfinite(noise_eta) else 0.3
+    eta_min = max(0.3, min(3.0 * noise_eta, 0.9)) if np.isfinite(noise_eta) else 0.3
     resid = []
     for rec in results[("signal", "lsl")]:
         if not rec["eta_phase"] >= eta_min:
@@ -138,6 +138,31 @@ def calibration_report(rdc2, positions_m, frequency_hz, cable_delays_s, stands,
     for d, pw in zip(per_stand, chan_power):
         d["power_db_re_median"] = float(10 * np.log10(pw / np.nanmedian(chan_power)))
     return results, per_stand
+
+
+def pair_coherence(rdc2, positions_m, cells, radius=(2, 2)):
+    """Median |coherence| between channel pairs over a neighbourhood of each cell, by baseline length.
+
+    |coherence| ignores per-channel phase offsets and channel identity, so it is
+    high for a single plane wave even when calibration or stand mapping is wrong,
+    and low when the field is several sources, diffuse, or noise.
+    """
+    pos = np.asarray(positions_m)
+    baseline = np.linalg.norm(pos[:, None, :2] - pos[None, :, :2], axis=-1)
+    iu = np.triu_indices(len(pos), 1)
+    edges = [0, 20, 50, 100, np.inf]
+    out = []
+    for r, c in cells:
+        x = rdc2[max(r - radius[0], 0):r + radius[0] + 1, max(c - radius[1], 0):c + radius[1] + 1]
+        x = x.reshape(-1, x.shape[-1])
+        x = x[np.all(np.isfinite(x), axis=1)]
+        R = x.T @ x.conj()
+        d = np.sqrt(np.real(np.diag(R)))
+        g = np.abs(R) / np.maximum(np.outer(d, d), 1e-30)
+        vals, lengths = g[iu], baseline[iu]
+        out.append([float(np.median(vals[(lengths >= lo) & (lengths < hi)])) if np.any((lengths >= lo) & (lengths < hi))
+                    else np.nan for lo, hi in zip(edges[:-1], edges[1:])] + [len(x)])
+    return np.array(out), edges
 
 
 def print_report(results, per_stand, n_channels):
@@ -162,7 +187,7 @@ def print_report(results, per_stand, n_channels):
     print("  loudest: " + ", ".join(f"{per_stand[i]['stand']} ({pw[i]:+.1f})" for i in order[::-1][:8]))
     print("  quietest: " + ", ".join(f"{per_stand[i]['stand']} ({pw[i]:+.1f})" for i in order[:8]))
     if not per_stand or per_stand[0]["cells_used"] == 0:
-        print("\nNo cell was plane-wave-like enough (eta_ph >= max(0.3, 3x noise)) to estimate per-stand residuals.")
+        print("\nNo cell was plane-wave-like enough (eta_ph >= 0.3 and well above the noise cells) to estimate per-stand residuals.")
         return
     print(f"\nPer-stand residuals use {per_stand[0]['cells_used']} plane-wave-like cell(s).")
     ranked = sorted(per_stand, key=lambda d: -d["consistency"] * abs(d["mean_residual_deg"]))
@@ -193,9 +218,12 @@ def main():
     p.add_argument("--top-cells", type=int, default=20)
     p.add_argument("--carrier-frequency", type=float, default=None)
     p.add_argument("--csv", default=None, help="Optional per-stand residual CSV")
+    p.add_argument("--ssmif", default=None, help="SSMIF or metadata .tgz for the observation date")
     args = p.parse_args()
+    if args.ssmif:
+        lwa_utils.use_ssmif(args.ssmif)
 
-    view = RDCView(args.input, "all", args.pol, args.bad_stands)
+    view = RDCView(args.input, "all", args.pol, args.bad_stands, gap_fill="zero")
     view.select_delay(args.d_min, args.d_max)   # default: +/-1.5 ms around the strongest echo
     frames = view.rdc2_frames(args.integration_time, args.hop_time, fd_min=args.fd_min, fd_max=args.fd_max)
     frame = next(itertools.islice(frames, args.frame_index, None))
@@ -207,8 +235,18 @@ def main():
     delays = lwa_utils.cable_delays_s(array.stands, array.pols, fc)
     results, per_stand = calibration_report(rdc2, array.positions, fc, delays, array.stands, n_cells=args.top_cells)
     print(f"File {args.input}, frame {args.frame_index} ({frame['t0']:.3f}-{frame['t1']:.3f} s), "
-          f"fc {fc / 1e6:.6f} MHz, cube {rdc2.shape}")
+          f"fc {fc / 1e6:.6f} MHz, cube {rdc2.shape}, station {lwa_utils.SSMIF_PATH or 'LSL bundled LWA-SV'}")
     print_report(results, per_stand, rdc2.shape[2])
+    sig = [r["cell"] for r in results[("signal", "lsl")][:5]]
+    noi = [r["cell"] for r in results[("noise", "lsl")][:5]]
+    print("\nPair coherence |gamma| (median over stand pairs; calibration- and mapping-independent):")
+    for label, cells in (("signal", sig), ("noise", noi)):
+        table, edges = pair_coherence(rdc2, array.positions, cells)
+        bins = ", ".join(f"{lo:g}-{hi:g} m: {v:.2f}" for lo, hi, v in zip(edges[:-1], edges[1:], np.nanmedian(table[:, :-1], axis=0)))
+        print(f"  {label:6s} ({int(table[0, -1])} snapshots/cell)  {bins}")
+    print("  High signal |gamma| at all baselines with low eta_ph means the wavefield is coherent but the\n"
+          "  phase model (stand positions/mapping, cable delays, or sign) is wrong. Low |gamma| means the\n"
+          "  cells hold several sources, diffuse scatter or interference rather than one plane wave.")
     if args.csv:
         with open(args.csv, "w", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=list(per_stand[0].keys()))
