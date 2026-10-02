@@ -8,11 +8,16 @@ every array command accepts with ``--calibration``.
 
 Steps
   1. Bring the input to RDC2 frames, apply the SSMIF cable correction.
-  2. Pick the strongest cells in every frame (per-channel noise normalised,
-     non-maximum suppressed, at least --min-snr-db above the median cell).
+  2. Pick the strongest echo cells in every frame (per-channel noise normalised,
+     non-maximum suppressed, at least --min-snr-db above the median cell, and
+     localised in delay so narrowband interference spread over all delays is
+     skipped).
   3. Flag stands whose noise power is more than --max-power-db from the median.
-  4. Fit the per-stand phases; flag stands whose phase does not follow the fit
-     (consistency below half the median); refit without them.
+  4. Fit the per-stand phases. If some cells get *worse* with them, fit those
+     cells separately and flag stands whose phase differs between the two
+     classes of echo (one phase per stand cannot serve both; on 2023-12-09 the
+     classes look like the O and X magnetoionic modes). Flag stands whose phase
+     does not follow the fit (consistency below half the median). Refit.
   5. Validate on held-out cells: fit on half (alternate frames when there are
      several, otherwise alternate cells), measure the plane-wave fit eta on the
      other half before and after, and swap.
@@ -60,26 +65,23 @@ def build_parser():
 
 
 def strong_cells(frames, processor, n_cells, min_snr_db):
-    """Snapshots (K, N), fold labels (K,), cell descriptions and per-channel noise power [dB re median]."""
+    """Echo cells from every frame (delay-localised, see ``calibration_utils.echo_cells``).
+
+    Returns the chosen cells (strongest first, each with its normalised snapshot)
+    and the per-channel noise power [dB re median].
+    """
     candidates, noise = [], []
     for i, fr in enumerate(frames):
         cube = processor.prepare(fr["cube"]).astype(np.complex128)
-        finite = np.all(np.isfinite(cube), axis=-1)
-        p = np.where(finite[..., None], np.abs(cube) ** 2, np.nan)
-        sigma2 = np.nanmedian(p.reshape(-1, p.shape[-1]), axis=0)
+        power, sigma2 = cu.normalized_power(cube)
         noise.append(sigma2)
-        power = np.where(finite, np.nansum(p / np.maximum(sigma2, 1e-30), axis=-1), np.nan)
-        floor = np.nanmedian(power)
-        for r, c in ru.pick_cells(power, n_cells):
-            snr = 10 * np.log10(power[r, c] / floor)
-            if snr >= min_snr_db:
-                candidates.append(dict(frame=i, t0=fr["t0"], t1=fr["t1"], delay_index=r, doppler_index=c,
-                                       doppler_hz=float(fr["doppler_hz"][c]), snr_db=float(snr),
-                                       x=cube[r, c] / np.sqrt(np.maximum(sigma2, 1e-30))))
+        for r, c, snr, contrast in cu.echo_cells(power, n_cells, min_snr_db):
+            candidates.append(dict(frame=i, t0=fr["t0"], t1=fr["t1"], delay_index=r, doppler_index=c,
+                                   doppler_hz=float(fr["doppler_hz"][c]), snr_db=snr, contrast_db=contrast,
+                                   x=cube[r, c] / np.sqrt(np.maximum(sigma2, 1e-30))))
     candidates.sort(key=lambda d: -d["snr_db"])
-    chosen = candidates[:n_cells]
     noise_db = 10 * np.log10(np.nanmedian(np.array(noise), axis=0))
-    return chosen, noise_db - np.nanmedian(noise_db)
+    return candidates[:n_cells], noise_db - np.nanmedian(noise_db)
 
 
 def main(argv=None):
@@ -99,7 +101,7 @@ def main(argv=None):
                                   metadata=view.meta)
     cells, power_db = strong_cells(frames, processor, args.cells, args.min_snr_db)
     if len(cells) < 3:
-        raise ValueError(f"Only {len(cells)} cell(s) are {args.min_snr_db:g} dB above the median; "
+        raise ValueError(f"Only {len(cells)} echo cell(s) are {args.min_snr_db:g} dB above the median; "
                          "lower --min-snr-db or widen the delay/Doppler window")
     X = np.array([c["x"] for c in cells])
     frame_ids = np.array([c["frame"] for c in cells])
@@ -108,15 +110,15 @@ def main(argv=None):
 
     print(f"Input {args.input}: {len(frames)} frame(s), {len(processor.stands)} stands, pol "
           f"{'xy'[int(processor.pols[0])]}, {fc / 1e6:.6f} MHz, station {lwa.SSMIF_PATH or 'LSL bundled LWA-SV'}")
-    print(f"Using {len(cells)} cells, {cells[-1]['snr_db']:.1f}-{cells[0]['snr_db']:.1f} dB above the median cell; "
-          f"validation by {split}")
+    print(f"Using {len(cells)} echo cells, {cells[-1]['snr_db']:.1f}-{cells[0]['snr_db']:.1f} dB above the median "
+          f"cell; validation by {split}")
     res = cu.calibrate(X, processor.positions, fc, power_db, groups, args.max_power_db)
     v = res["validation"]
 
     stands, pols = processor.stands, processor.pols
     digitizers = [int(a.digitizer) for a in lwa.selected_antennas(stands, pols)]
-    for c, (az, el), eta in zip(cells, res["directions"], res["eta"]):
-        c.update(az=float(az), el=float(el), eta_after=float(eta))
+    for c, (az, el), eta, b in zip(cells, res["directions"], res["eta"], res["class_b_cells"]):
+        c.update(az=float(az), el=float(el), eta_after=float(eta), class_b=bool(b))
         c.pop("x")
     meta = dict(kind="array_calibration", created_utc=cu.now_utc(), tool="calibrate_array",
                 input=os.path.abspath(args.input), ssmif=lwa.SSMIF_PATH, frequency_hz=fc,
@@ -133,8 +135,9 @@ def main(argv=None):
     print("\nPlane-wave fit eta (phases only; 1 = perfect plane wave, "
           f"{v['noise_eta']:.4f} = random phases):")
     if v["eta_before_median"] is not None:
-        print(f"  held-out cells ({v['held_out_cells']}):  SSMIF only {v['eta_before_median']:.3f}  ->  "
-              f"with self-cal {v['eta_after_median']:.3f}")
+        print(f"  held-out cells ({v['held_out_cells']}):  SSMIF only {v['eta_power_flags_only_median']:.3f}  ->  "
+              f"without flagged stands {v['eta_before_median']:.3f}  ->  with self-cal {v['eta_after_median']:.3f}"
+              f"   ({v['cells_made_worse']} cell(s) made worse)")
     print(f"  fitted cells (optimistic):  {v['in_sample_eta_before_median']:.3f}  ->  "
           f"{v['in_sample_eta_after_median']:.3f}")
     az, el = np.median(res["directions"], axis=0)
@@ -146,14 +149,18 @@ def main(argv=None):
           f"{int(used.sum())} stands; largest:")
     for n in np.argsort(-np.abs(phase) * used)[:10]:
         print(f"  stand {int(stands[n]):3d}  {phase[n]:+7.1f} deg  consistency {res['consistency'][n]:.2f}")
+    nb = int(res["class_b_cells"].sum())
+    if nb:
+        print(f"\n{nb} of {len(cells)} cells were made worse by the first-pass phases (a second class of echo, "
+              "e.g. the other\nmagnetoionic mode); stands that respond differently to the two classes are flagged below.")
     print(f"\nFlagged {int(res['flagged'].sum())} stand(s) (dropped when the calibration is applied):")
     for n, reason in sorted(res["reasons"].items(), key=lambda kv: int(stands[kv[0]])):
         print(f"  stand {int(stands[n]):3d}  {reason}")
     if args.csv:
         with open(args.csv, "w", newline="") as fh:
             w = csv.writer(fh)
-            w.writerow(["stand", "pol", "digitizer", "phase_deg", "consistency", "power_db_re_median", "flagged",
-                        "reason"])
+            w.writerow(["stand", "pol", "digitizer", "phase_deg", "consistency", "power_db_re_median",
+                        "flagged", "reason"])
             for n in range(len(stands)):
                 w.writerow([int(stands[n]), int(pols[n]), digitizers[n], f"{phase[n]:.2f}",
                             f"{res['consistency'][n]:.3f}", f"{power_db[n]:.2f}", int(res["flagged"][n]),

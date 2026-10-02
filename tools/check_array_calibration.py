@@ -102,7 +102,12 @@ def calibration_report(rdc2, positions_m, frequency_hz, cable_delays_s, stands,
     # Normalize each channel by its median power so a few loud (RFI/faulty) stands cannot
     # decide which cells are "signal".
     power = np.where(finite, np.sum(np.abs(rdc2) ** 2 / np.maximum(chan_power, 1e-30), axis=2), np.nan)
-    cells = pick_cells(power, n_cells)
+    # Echo cells: localised in delay. Narrowband interference is spread over every delay of one
+    # Doppler bin after dechirping and would otherwise fill the list (see calibration_utils.echo_cells).
+    from calibration_utils import echo_cells
+    cells = [(r, c) for r, c, _, _ in echo_cells(power, n_cells, min_snr_db=10.0)]
+    if len(cells) < 3:
+        cells = pick_cells(power, n_cells)
     rng = np.random.default_rng(seed)
     quiet = np.argwhere(finite & (power <= np.nanpercentile(power, 50)))
     noise_cells = [tuple(map(int, quiet[i])) for i in rng.choice(len(quiet), min(n_noise, len(quiet)), replace=False)]

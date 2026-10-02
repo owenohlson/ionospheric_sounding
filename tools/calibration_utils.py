@@ -97,6 +97,48 @@ def unit_phase(x):
 
 
 # ---------------------------------------------------------------------------
+# Cell selection and per-stand timing
+# ---------------------------------------------------------------------------
+
+def normalized_power(cube):
+    """Per-cell power summed over channels, each channel scaled by its median (noise) power.
+
+    cube: (delay, doppler, channels). Returns (power (delay, doppler), channel noise power (channels,)).
+    """
+    p = np.abs(np.asarray(cube)) ** 2
+    p = np.where(np.isfinite(p), p, np.nan)
+    sigma2 = np.nanmedian(p.reshape(-1, p.shape[-1]), axis=0)
+    power = np.nansum(p / np.maximum(sigma2, 1e-30), axis=-1)
+    power[~np.all(np.isfinite(cube), axis=-1)] = np.nan
+    return power, sigma2
+
+
+def echo_cells(power, n, min_snr_db=15.0, min_contrast_db=6.0, delay_guard=3, doppler_guard=5):
+    """Strongest cells that are localised in delay, i.e. echoes rather than delay-spread interference.
+
+    A narrowband (unchirped) interferer is spread over every delay bin of one
+    Doppler bin after dechirping. Cells are therefore ranked by their power over
+    the median of their own Doppler column ("contrast"), and must also be
+    ``min_snr_db`` above the median cell. Returns [(row, col, snr_db, contrast_db)].
+    """
+    floor = np.nanmedian(power)
+    column = np.nanmedian(power, axis=0)
+    contrast = power / np.maximum(column, 1e-30)[None, :]
+    out = []
+    work = np.where(np.isfinite(contrast), contrast, -np.inf)
+    for _ in range(int(n)):
+        flat = int(np.argmax(work))
+        if not np.isfinite(work.flat[flat]):
+            break
+        r, c = np.unravel_index(flat, work.shape)
+        work[max(0, r - delay_guard):r + delay_guard + 1, max(0, c - doppler_guard):c + doppler_guard + 1] = -np.inf
+        snr, con = 10 * np.log10(power[r, c] / floor), 10 * np.log10(contrast[r, c])
+        if snr >= min_snr_db and con >= min_contrast_db:
+            out.append((int(r), int(c), float(snr), float(con)))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Self-calibration
 # ---------------------------------------------------------------------------
 
@@ -177,9 +219,39 @@ def plane_wave_eta(snapshots, search, gain=None, use=None):
     return search.fit(X)[0]
 
 
+def class_dependent_stands(X, positions_m, frequency_hz, use, gain, iterations=30, max_diff_deg=60.0,
+                           min_consistency=0.3):
+    """Stands whose phase differs between two classes of echo cells.
+
+    Class B are the cells the first-pass gains fit poorly: made worse by them, or
+    left below 80 % of the median fit. If there are at least 3 of them (and 3
+    others), gains are fitted separately to each class; stands whose two gains are
+    both well determined (consistency >= ``min_consistency``) yet differ by more
+    than ``max_diff_deg`` respond differently to the two classes. On 2023-12-09 the
+    classes look like the two magnetoionic modes, so these stands probably have a
+    different polarization response, and no single phase can calibrate them for
+    both. Returns (mask of such stands, class-B cell mask).
+    """
+    pos = np.asarray(positions_m, float)
+    search = PlaneWaveSearch(pos[use], frequency_hz)
+    before = plane_wave_eta(X, search, None, use)
+    after = plane_wave_eta(X, search, gain, use)
+    poor = (after < before - 0.05) | (after < 0.8 * np.nanmedian(after))
+    odd = np.zeros(X.shape[1], bool)
+    if poor.sum() < 3 or (~poor).sum() < 3:
+        return odd, poor
+    ra = self_calibrate(X[~poor], pos, frequency_hz, use, iterations)
+    rb = self_calibrate(X[poor], pos, frequency_hz, use, iterations)
+    diff = ra["gain"] * np.conj(rb["gain"])
+    diff = diff * np.conj(np.sum(diff[use])) / max(abs(np.sum(diff[use])), 1e-30)
+    sure = (ra["consistency"] >= min_consistency) & (rb["consistency"] >= min_consistency)
+    odd = use & sure & (np.degrees(np.abs(np.angle(diff))) > max_diff_deg)
+    return odd, poor
+
+
 def calibrate(snapshots, positions_m, frequency_hz, channel_power_db, groups=None, max_power_db=10.0,
               min_relative_consistency=0.5, iterations=30):
-    """Full procedure: power flags, fit, consistency flags, refit, two-fold validation.
+    """Full procedure: power flags, fit, class and consistency flags, refit, two-fold validation.
 
     channel_power_db: per-channel noise power re the median (for power flags).
     groups: (K,) fold label per snapshot (e.g. frame parity); default alternates cells.
@@ -194,8 +266,15 @@ def calibrate(snapshots, positions_m, frequency_hz, channel_power_db, groups=Non
         reasons[int(n)] = f"power {power_db[n]:+.1f} dB re median"
     use = np.ones(N, bool)
     use[list(reasons)] = False
+    power_only = use.copy()
 
     first = self_calibrate(X, positions_m, frequency_hz, use, iterations)
+    odd, class_b = class_dependent_stands(X, positions_m, frequency_hz, use, first["gain"], iterations)
+    for n in np.flatnonzero(odd):
+        reasons[int(n)] = f"phase differs between echo classes ({int(class_b.sum())} of {K} cells in class B)"
+    use[odd] = False
+    if odd.any():
+        first = self_calibrate(X, positions_m, frequency_hz, use, iterations)
     c = first["consistency"]
     threshold = min_relative_consistency * np.median(c[use])
     for n in np.flatnonzero(use & (c < threshold)):
@@ -203,27 +282,32 @@ def calibrate(snapshots, positions_m, frequency_hz, channel_power_db, groups=Non
     use[list(reasons)] = False
     final = self_calibrate(X, positions_m, frequency_hz, use, iterations)
     search = PlaneWaveSearch(np.asarray(positions_m, float)[use], frequency_hz)
+    search_all = PlaneWaveSearch(np.asarray(positions_m, float)[power_only], frequency_hz)
 
     groups = np.arange(K) % 2 if groups is None or len(np.unique(groups)) < 2 else np.asarray(groups)
     labels = np.unique(groups)
-    held_before, held_after = [], []
+    held_unflagged, held_before, held_after = [], [], []
     for lab in labels[:2] if len(labels) == 2 else labels:
         fit_on, test_on = groups != lab, groups == lab
         if fit_on.sum() < 3 or not test_on.any():
             continue
         r = self_calibrate(X[fit_on], positions_m, frequency_hz, use, iterations)
+        held_unflagged.append(plane_wave_eta(X[test_on], search_all, None, power_only))
         held_before.append(plane_wave_eta(X[test_on], search, None, use))
         held_after.append(plane_wave_eta(X[test_on], search, r["gain"], use))
+    cat = (lambda h: np.concatenate(h)) if held_before else None
     validation = dict(
         held_out_cells=int(sum(len(h) for h in held_before)),
-        eta_before_median=float(np.nanmedian(np.concatenate(held_before))) if held_before else None,
-        eta_after_median=float(np.nanmedian(np.concatenate(held_after))) if held_after else None,
+        eta_power_flags_only_median=float(np.nanmedian(cat(held_unflagged))) if held_before else None,
+        eta_before_median=float(np.nanmedian(cat(held_before))) if held_before else None,
+        eta_after_median=float(np.nanmedian(cat(held_after))) if held_before else None,
+        cells_made_worse=int(np.sum(cat(held_after) < cat(held_before) - 0.05)) if held_before else None,
         in_sample_eta_before_median=float(np.nanmedian(plane_wave_eta(X, search, None, use))),
         in_sample_eta_after_median=float(np.nanmedian(final["eta"])),
         noise_eta=1.0 / max(int(use.sum()), 1))
     flagged = np.zeros(N, bool)
     flagged[list(reasons)] = True
-    final.update(flagged=flagged, reasons=reasons, validation=validation, used=use,
+    final.update(flagged=flagged, reasons=reasons, validation=validation, used=use, class_b_cells=class_b,
                  first_pass_consistency=c, consistency_threshold=float(threshold))
     return final
 
@@ -265,6 +349,7 @@ class ArrayCalibration:
                     h5.create_dataset("consistency", data=self.consistency)
                 if self.power_db is not None:
                     h5.create_dataset("power_db", data=self.power_db)
+
                 h5.attrs["metadata_json"] = json.dumps(self.meta, default=_json_default)
         self.path = path
         return path

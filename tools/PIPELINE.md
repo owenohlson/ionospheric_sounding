@@ -103,10 +103,18 @@ Phases across the array come from three places, applied in this order:
 2. **Self-calibration** (`calibrate_array.py`, then `--calibration CAL.h5`): one
    phase per stand measured from the strongest echo cells, for whatever the SSMIF
    does not capture. The fit alternates between finding each cell's plane-wave
-   direction and averaging the per-stand residual phase. Stands whose noise power
-   is far from the median (`--max-power-db`, default 10 dB) or whose phase does not
-   follow the fit (consistency below half the median) are flagged and dropped
-   when the file is applied. Only phases are corrected; equalising amplitudes
+   direction and averaging the per-stand residual phase. Cells are echoes:
+   strong, and localised in delay (narrowband interference, which dechirping
+   spreads over every delay of one Doppler bin, is skipped). Stands are flagged,
+   and dropped when the file is applied, if:
+   * their noise power is far from the median (`--max-power-db`, default 10 dB);
+   * their phase differs between two classes of echo. Some cells fit the
+     first-pass phases poorly; fitted on their own, they need very different
+     phases on certain stands. On 2023-12-09 the two classes look like the O and
+     X magnetoionic modes, and about 30 stands also differ in amplitude between
+     them, which points to a different polarization response on those stands.
+     No single phase per stand can serve both modes;
+   * their phase does not follow the fit (consistency below half the median). Only phases are corrected; equalising amplitudes
    would amplify the noise of weak channels.
 
 What self-calibration cannot do:
@@ -122,8 +130,10 @@ What self-calibration cannot do:
   is corrected exactly only near the direction it was calibrated on.
 
 `calibrate_array.py` reports the plane-wave fit on held-out cells (fitted on
-alternate frames, or alternate cells for one frame) before and after
-calibration. The in-sample number is always optimistic. `check_array_calibration.py
+alternate frames, or alternate cells for one frame) three ways: SSMIF only,
+without the flagged stands, and with self-calibration. It also counts held-out
+cells the calibration made worse. The in-sample number is always optimistic.
+2023-12-09 (fit on 0–5 s, tested on 5–9.5 s): 0.56 → 0.84 → 0.96. `check_array_calibration.py
 --calibration CAL.h5` adds a `selfcal` variant, for testing on another time range.
 
 ## Examples

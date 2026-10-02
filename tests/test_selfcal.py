@@ -59,6 +59,24 @@ class SnapshotTests(unittest.TestCase):
         az, el = np.median(res["directions"], axis=0)
         self.assertLess(abs(az - np.median(self.az)) + abs(el - np.median(self.el)), 3.0)
 
+    def test_stands_that_differ_between_echo_classes_are_flagged(self):
+        """Two echo classes (e.g. O and X modes): 10 stands see +phi on one and -phi on the other."""
+        rng = np.random.default_rng(3)
+        n, k = len(self.pos), 30
+        odd = np.arange(10, 20)
+        extra = np.zeros(n)
+        extra[odd] = np.radians(rng.choice([-1, 1], odd.size) * rng.uniform(60, 110, odd.size))
+        cls = np.arange(k) % 3 == 0                         # one third of the cells are class B
+        az, el = -86 + rng.normal(0, 3, k), 21 + rng.normal(0, 2, k)
+        a = cu.steering(self.pos, self.fc, az, el)
+        x = self.g * a * np.exp(1j * np.where(cls[:, None], -extra, extra)) * np.exp(2j * np.pi * rng.uniform(size=(k, 1)))
+        x += 0.3 * (rng.normal(size=(k, n)) + 1j * rng.normal(size=(k, n)))
+        res = cu.calibrate(x, self.pos, self.fc, np.zeros(n))
+        flagged = sorted(n for n, r in res["reasons"].items() if "classes" in r)
+        self.assertEqual(flagged, odd.tolist())
+        self.assertEqual(res["validation"]["cells_made_worse"], 0)
+        self.assertGreater(res["validation"]["eta_after_median"], 0.85)
+
     def test_a_linear_ramp_is_not_absorbed(self):
         """A pure pointing offset (linear phase across the array) must stay in the directions, not the gains."""
         k = 2 * np.pi * self.fc / helpers.C
