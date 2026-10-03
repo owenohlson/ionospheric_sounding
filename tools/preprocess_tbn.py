@@ -1,18 +1,20 @@
-"""Check, repair and trim a raw TBN recording before export (replaces splitTBNfix.py).
+"""Check a raw TBN recording, and optionally cut it into time ranges (replaces splitTBNfix.py).
 
-The file is scanned by frame header only (fast, no LSL needed):
+The export commands read raw TBN directly (``lwa_utils.TBNReader``): every frame
+is placed by its timetag, so late or shuffled frames land in the right place and
+missing captures become NaN (or zero with --gap-fill zero) at the right time.
+Trimming is therefore optional. Use this command to:
 
-* captures are found as groups of frames sharing a timetag (the order of
-  ant/pol frames inside a capture is not fixed, so stand 1 / pol 0 is not
-  used as a boundary);
-* the sample rate and frames per capture come from the timetags;
-* frames with a bad sync word are dropped, as are incomplete captures at the
-  start and end of the file (and anywhere with --drop-incomplete);
-* the report lists incomplete captures, missing captures (timetag jumps) and
-  bad frames, so corrupted stretches are visible before processing.
+* see the data quality before processing (``--report-only``): complete,
+  partial, overfull (duplicate frames) and missing captures, the number and
+  longest of the gaps, late frame groups and bad sync words;
+* cut a time range or fixed-length chunks. Output is written in timetag order
+  with late frames rejoining their capture, bad-sync frames and partial edge
+  captures dropped (all partial captures with --drop-incomplete). Missing
+  captures stay missing, so LSL's own reader still refuses files with gaps.
 
-Missing samples are not reconstructed; later stages fill timing gaps with NaN/zero.
-Output goes next to the input unless --output is given.
+The scan reads frame headers only (no LSL). Output goes next to the input
+unless --output is given.
 """
 
 import os

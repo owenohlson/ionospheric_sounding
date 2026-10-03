@@ -5,8 +5,10 @@ Station
     positions, cable delays and phase factors, digitizer rows for TBN,
     bad stands (SSMIF status flags), legacy channel labels.
 TBN
-    ``open_tbn``/``tbn_info``/``probe_timestamp``, the gap-aware sample reader
-    ``read_tbn_blocks``, and capture alignment/copying for ``preprocess_tbn.py``.
+    Read directly from the frame headers (no LSL): ``scan_tbn`` (captures by
+    timetag, gaps, late frames), ``TBNReader`` (samples placed by timetag, so
+    out-of-order frames land in the right place and missing frames become NaN),
+    and ``write_tbn_range`` for ``preprocess_tbn.py``.
 
 Channels are always identified by physical (stand, polarization); list order
 in LSL or in a file is never used as an identity.
@@ -209,139 +211,6 @@ TBN_SAMPLES_PER_FRAME = 512
 
 
 # ---------------------------------------------------------------------------
-# Timestamps
-# ---------------------------------------------------------------------------
-
-def to_datetime(timestamp):
-    """LSL timestamps expose ``utc_datetime`` or ``datetime``; plain datetimes pass through."""
-    if timestamp is None:
-        return None
-    for attr in ("utc_datetime", "datetime"):
-        if hasattr(timestamp, attr):
-            return getattr(timestamp, attr)
-    return timestamp if isinstance(timestamp, datetime) else None
-
-
-def fractional_second(timestamp):
-    dt = to_datetime(timestamp)
-    return None if dt is None else dt.microsecond / 1e6
-
-
-# ---------------------------------------------------------------------------
-# LSL access
-# ---------------------------------------------------------------------------
-
-def open_tbn(path):
-    from lsl.reader.ldp import LWADataFile, TBNFile
-    idf = LWADataFile(path)
-    if not isinstance(idf, TBNFile):
-        raise RuntimeError(f"'{path}' does not appear to be a TBN file (LSL type {type(idf).__name__})")
-    return idf
-
-
-def tbn_info(idf):
-    fs = float(idf.get_info("sample_rate"))
-    try:
-        n_antpol = int(idf.get_info("nantenna")) or 520
-    except Exception:
-        n_antpol = 520
-    nframe = float(idf.get_info("nframe"))
-    return dict(
-        sample_rate_hz=fs,
-        tuning_frequency_hz=float(idf.get_info("freq1")),
-        start_time=to_datetime(idf.get_info("start_time")),
-        n_frames=int(nframe),
-        n_antpol=n_antpol,
-        usable_duration_s=np.floor(nframe / n_antpol) * TBN_SAMPLES_PER_FRAME / fs,
-    )
-
-
-def print_tbn_info(info):
-    print("=== TBN metadata ===")
-    print(f"Start time:  {info['start_time']}")
-    print(f"Sample rate: {info['sample_rate_hz']:g} Hz")
-    print(f"Tuning:      {info['tuning_frequency_hz']:.3f} Hz")
-    print(f"Frames:      {info['n_frames']} ({info['n_antpol']} ant/pol streams)")
-    print(f"Duration:    {info['usable_duration_s']:.3f} s")
-    print("====================", flush=True)
-
-
-def probe_timestamp(path, tstart):
-    """UTC timestamp of the first sample at ``tstart`` seconds into the file."""
-    idf = open_tbn(path)
-    try:
-        idf.offset(float(tstart))
-        _, timestamp, _ = idf.read(0.001)
-        return timestamp
-    finally:
-        idf.close()
-
-
-def read_tbn_blocks(idf, tstart, duration, rows, chunk_seconds=0.25):
-    """Yield ``(block, gap_samples)`` for digitizer ``rows`` over [tstart, tstart+duration).
-
-    ``block`` is complex64 (len(rows), n). Timetag jumps and invalid-timetag
-    skips become NaN-filled blocks of the right length (``gap_samples`` > 0), so
-    downstream sweep timing stays correct. The first yielded item is preceded by
-    ``idf`` being positioned at ``tstart``. Also sets ``read_tbn_blocks.first_timestamp``.
-    """
-    from lsl.reader import errors
-    rows = np.asarray(rows, int)
-    fs = float(idf.get_info("sample_rate"))
-    idf.offset(float(tstart))
-    got = timeline = 0.0
-    first = None
-    tolerance = max(2.0 / fs, 0.001)
-    read_tbn_blocks.first_timestamp = None
-
-    def gap(seconds):
-        n = int(round(seconds * fs))
-        return np.full((len(rows), n), np.nan + 1j * np.nan, np.complex64), n
-
-    while got < duration:
-        try:
-            _, stamp, data = idf.read(min(chunk_seconds, duration - got))
-        except errors.EOFError:
-            print("Reached end of TBN file", flush=True)
-            return
-        except RuntimeError as exc:
-            if "Invalid timetag skip" not in str(exc):
-                raise
-            block, n = gap(min(0.002, duration - got))
-            print(f"Invalid timetag skip at {tstart + got:.3f} s; inserting {n} NaN samples", flush=True)
-            idf.offset(n / fs)
-            got += n / fs
-            timeline += n / fs
-            if n:
-                yield block, n
-            continue
-        if first is None:
-            first = to_datetime(stamp)
-            if first is not None and got > 0:
-                first = first - timedelta(seconds=got)
-            read_tbn_blocks.first_timestamp = first
-        else:
-            now = to_datetime(stamp)
-            if now is not None and first is not None:
-                jump = (now - first).total_seconds() - timeline
-                if jump > tolerance:
-                    block, n = gap(min(jump, duration - got))
-                    print(f"Timestamp gap at {tstart + got:.3f} s; inserting {n} NaN samples", flush=True)
-                    got += n / fs
-                    timeline += n / fs
-                    if n:
-                        yield block, n
-        if data.ndim != 2 or rows.max() >= data.shape[0]:
-            raise ValueError(f"TBN block has shape {data.shape}; cannot select rows up to {rows.max()}")
-        keep = min(data.shape[1], int(round((duration - got) * fs)))
-        if keep <= 0:
-            return
-        yield data[rows, :keep].astype(np.complex64), 0
-        got += keep / fs
-        timeline += keep / fs
-
-
-# ---------------------------------------------------------------------------
 # Frame-level scan and trimming (preprocess_tbn.py)
 # ---------------------------------------------------------------------------
 # A TBN file is a sequence of 1048-byte frames: 24-byte header (sync word
@@ -394,35 +263,59 @@ def scan_tbn(path, block_frames=1 << 16):
                 sample_rate_hz=TBN_SAMPLES_PER_FRAME * FPGA_CLOCK_HZ / step)
 
 
+def capture_slots(scan):
+    """Capture index of every frame group: (timetag - first timetag) / timetag step."""
+    step = TBN_SAMPLES_PER_FRAME * FPGA_CLOCK_HZ / scan["sample_rate_hz"]
+    tags = scan["group_timetag"]
+    return np.round((tags - tags.min()) / step).astype(np.int64)
+
+
 def summarize_tbn_scan(scan):
+    """Data-quality numbers for a scanned TBN file (see ``preprocess_tbn.py``)."""
     fs, per = scan["sample_rate_hz"], scan["frames_per_capture"]
-    step = TBN_SAMPLES_PER_FRAME * FPGA_CLOCK_HZ / fs
-    jumps = np.diff(scan["group_timetag"]) / step
-    return dict(captures=int(scan["group_first"].size), sample_rate_hz=fs, frames_per_capture=per,
-                incomplete_captures=int(np.count_nonzero(scan["group_size"] != per)),
-                missing_captures=int(np.sum(np.round(jumps[jumps > 1.5]) - 1)),
-                backwards_timetags=int(np.count_nonzero(jumps <= 0)),
+    slots = capture_slots(scan)
+    n_slots = int(slots.max()) + 1
+    frames = np.zeros(n_slots, np.int64)
+    np.add.at(frames, slots, scan["group_size"])
+    present = frames > 0
+    missing = ~present
+    # runs of missing captures
+    edges = np.diff(np.concatenate([[0], missing.astype(np.int8), [0]]))
+    runs = np.flatnonzero(edges == -1) - np.flatnonzero(edges == 1)
+    capture_s = TBN_SAMPLES_PER_FRAME / fs
+    late = np.diff(scan["group_timetag"]) <= 0
+    return dict(captures=int(present.sum()), sample_rate_hz=fs, frames_per_capture=per,
+                complete_captures=int(np.count_nonzero(frames == per)),
+                partial_captures=int(np.count_nonzero(present & (frames < per))),
+                overfull_captures=int(np.count_nonzero(frames > per)),
+                missing_captures=int(missing.sum()),
+                missing_s=float(missing.sum() * capture_s),
+                gaps=int(runs.size), longest_gap_s=float(runs.max() * capture_s) if runs.size else 0.0,
+                out_of_order_groups=int(late.sum()),
                 bad_sync_frames=int(scan["bad_sync"].size),
-                duration_s=float((scan["group_timetag"][-1] - scan["group_timetag"][0]) / FPGA_CLOCK_HZ
-                                 + TBN_SAMPLES_PER_FRAME / fs))
+                duration_s=float(n_slots * capture_s))
 
 
 def write_tbn_range(path, output, scan, tstart=0.0, tend=None, drop_incomplete=False, block_frames=1 << 16):
-    """Copy whole captures whose time (from the first capture) lies in [tstart, tend).
+    """Copy captures whose time (from the first capture) lies in [tstart, tend), in timetag order.
 
-    Frames with bad sync words are always dropped; with ``drop_incomplete`` so are
-    captures holding the wrong number of frames. Returns (captures, frames) written.
+    Late (out-of-order) frame groups are written next to the rest of their
+    capture. Frames with bad sync words are always dropped; with
+    ``drop_incomplete`` so are captures holding the wrong number of frames.
+    Missing captures stay missing. Returns (captures, frames) written.
     """
-    t = (scan["group_timetag"] - scan["group_timetag"][0]) / FPGA_CLOCK_HZ
-    complete = scan["group_size"] == scan["frames_per_capture"]
+    slots = capture_slots(scan)
+    per_slot = np.zeros(int(slots.max()) + 1, np.int64)
+    np.add.at(per_slot, slots, scan["group_size"])
+    t = slots * TBN_SAMPLES_PER_FRAME / scan["sample_rate_hz"]
+    complete = per_slot[slots] == scan["frames_per_capture"]
     keep = t >= tstart
     if tend is not None:
         keep &= t < tend
     if drop_incomplete:
         keep &= complete
     else:                                   # always drop partial captures at the file edges
-        keep[0] &= complete[0]
-        keep[-1] &= complete[-1]
+        keep &= complete | ((slots > slots.min()) & (slots < slots.max()))
     if not keep.any():
         raise ValueError("No captures in the requested time range")
     mm = np.memmap(path, np.uint8, mode="r")
@@ -430,12 +323,121 @@ def write_tbn_range(path, output, scan, tstart=0.0, tend=None, drop_incomplete=F
     bad = scan["bad_sync"]
     bad_groups = set((np.searchsorted(firsts, bad, side="right") - 1).tolist()) if bad.size else set()
     frames = 0
+    groups = np.flatnonzero(keep)
+    groups = groups[np.argsort(slots[groups], kind="stable")]
     with open(output, "wb") as fo:
-        for g in np.flatnonzero(keep):
+        for g in groups:
             first, size = int(firsts[g]), int(sizes[g])
             blk = _frame_block(mm, first, size)
             if g in bad_groups:
                 blk = blk[~np.isin(np.arange(first, first + size), bad)]
             fo.write(blk.tobytes())
             frames += len(blk)
-    return int(keep.sum()), frames
+    return int(np.unique(slots[groups]).size), frames
+
+
+# ---------------------------------------------------------------------------
+# Sample reader
+# ---------------------------------------------------------------------------
+
+class TBNReader:
+    """Read TBN samples straight from the file, placing every frame by its timetag.
+
+    Frame layout (LSL ``tbn.cpp``): sync word, frame count, tuning word
+    (big-endian u32 at byte 8), TBN id (big-endian u16 at byte 12; digitizer =
+    id & 1023, LSL row = digitizer - 1), gain, timetag (big-endian u64 at byte
+    16, 196 MHz ticks since the Unix epoch), then 512 complex samples as int8
+    I/Q pairs. Unlike LSL's reader this tolerates late frames, duplicate frames
+    and missing captures: samples are placed at
+    (timetag - first timetag) / step, and anything absent is NaN.
+    """
+
+    def __init__(self, path, scan=None):
+        self.path = str(path)
+        self.scan = scan if scan is not None else scan_tbn(self.path)
+        self.sample_rate_hz = float(self.scan["sample_rate_hz"])
+        self.step = int(round(TBN_SAMPLES_PER_FRAME * FPGA_CLOCK_HZ / self.sample_rate_hz))
+        self.tag0 = int(self.scan["group_timetag"].min())
+        self.group_slot = capture_slots(self.scan)
+        self.n_captures = int(self.group_slot.max()) + 1
+        self._order = np.argsort(self.group_slot, kind="stable")
+        self._frames = np.memmap(self.path, np.uint8, mode="r",
+                                 shape=(int(self.scan["n_frames"]), TBN_FRAME_SIZE))
+        first = np.asarray(self._frames[int(self.scan["group_first"][0])])
+        tuning = int(np.frombuffer(first[8:12].tobytes(), ">u4")[0])
+        self.tuning_frequency_hz = tuning * FPGA_CLOCK_HZ / 2 ** 32
+        self.n_rows = int(self.scan["frames_per_capture"])
+
+    @property
+    def duration_s(self):
+        return self.n_captures * TBN_SAMPLES_PER_FRAME / self.sample_rate_hz
+
+    def utc_at(self, t):
+        """UTC datetime of time ``t`` [s] after the first capture (exact to the 196 MHz clock)."""
+        from datetime import timezone
+        ticks = self.tag0 + int(round(t * FPGA_CLOCK_HZ))
+        whole, frac = divmod(ticks, int(FPGA_CLOCK_HZ))
+        return datetime.fromtimestamp(whole, timezone.utc) + timedelta(seconds=frac / FPGA_CLOCK_HZ)
+
+    def fractional_second_at(self, t):
+        ticks = self.tag0 + int(round(t * FPGA_CLOCK_HZ))
+        return (ticks % int(FPGA_CLOCK_HZ)) / FPGA_CLOCK_HZ
+
+    def info(self):
+        return dict(sample_rate_hz=self.sample_rate_hz, tuning_frequency_hz=self.tuning_frequency_hz,
+                    start_time=self.utc_at(0.0), n_frames=int(self.scan["n_frames"]), n_antpol=self.n_rows,
+                    usable_duration_s=self.duration_s)
+
+    def read_blocks(self, rows, tstart=0.0, duration=None, chunk_seconds=0.25):
+        """Yield ``(block, missing)`` covering [tstart, tstart + duration).
+
+        ``block`` is complex64 (len(rows), n) for digitizer ``rows`` (digitizer - 1);
+        samples whose frame is absent are NaN; ``missing`` counts them. tstart is
+        rounded down to a capture boundary (5.12 ms at 100 kHz).
+        """
+        rows = np.asarray(rows, int)
+        where = np.full(1024, -1, np.int64)
+        where[rows] = np.arange(rows.size)
+        per = TBN_SAMPLES_PER_FRAME
+        first = int(np.floor(tstart * self.sample_rate_hz / per + 1e-9))
+        stop = self.n_captures if duration is None else min(
+            self.n_captures, first + int(np.ceil(duration * self.sample_rate_hz / per - 1e-9)))
+        chunk = max(1, int(round(chunk_seconds * self.sample_rate_hz / per)))
+        sorted_slots = self.group_slot[self._order]
+        bad = self.scan["bad_sync"]
+        for a in range(first, stop, chunk):
+            b = min(a + chunk, stop)
+            lo, hi = np.searchsorted(sorted_slots, [a, b])
+            groups = self._order[lo:hi]
+            out = np.full((rows.size, b - a, per), np.nan + 1j * np.nan, np.complex64)
+            if groups.size:
+                idx = np.concatenate([np.arange(f, f + n) for f, n in
+                                      zip(self.scan["group_first"][groups], self.scan["group_size"][groups])])
+                if bad.size:
+                    idx = idx[~np.isin(idx, bad)]
+                raw = np.asarray(self._frames[idx])
+                ident = np.ascontiguousarray(raw[:, 12:14]).view(">u2").ravel().astype(np.int64)
+                tbn = (ident >> 15) & 1 == 0                       # TBW frames have this bit set
+                digit = ident & 1023
+                tag = np.ascontiguousarray(raw[:, 16:24]).view(">u8").ravel().astype(np.int64)
+                slot = np.round((tag - self.tag0) / self.step).astype(np.int64) - a
+                ch = np.where((digit >= 1) & (digit <= 1024), where[np.clip(digit - 1, 0, 1023)], -1)
+                use = tbn & (ch >= 0) & (slot >= 0) & (slot < b - a)
+                iq = raw[use, 24:].view(np.int8).astype(np.float32).reshape(-1, per, 2)
+                out[ch[use], slot[use], :] = iq[..., 0] + 1j * iq[..., 1]
+            block = out.reshape(rows.size, -1)
+            yield block, int(np.count_nonzero(np.isnan(block.real)))
+
+
+def print_tbn_info(info, quality=None):
+    print("=== TBN metadata ===")
+    print(f"Start time:  {info['start_time']}")
+    print(f"Sample rate: {info['sample_rate_hz']:g} Hz")
+    print(f"Tuning:      {info['tuning_frequency_hz']:.3f} Hz")
+    print(f"Frames:      {info['n_frames']} ({info['n_antpol']} ant/pol streams)")
+    print(f"Duration:    {info['usable_duration_s']:.3f} s")
+    if quality:
+        print(f"Missing:     {quality['missing_captures']} captures ({quality['missing_s']:.2f} s in "
+              f"{quality['gaps']} gaps, longest {quality['longest_gap_s'] * 1e3:.1f} ms); "
+              f"{quality['partial_captures']} partial; {quality['out_of_order_groups']} late frame groups placed by timetag")
+    print("====================", flush=True)

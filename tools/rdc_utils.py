@@ -127,29 +127,28 @@ def open_raw_source(path, sweep_frequency, tstart=None, tend=None, offset=0.0, t
         return RawSource(wav_utils.read_wav_blocks(path, start, stop - start), fs, skip,
                          np.array([1]), np.array([-1]), stop - start,
                          dict(meta, source_tstart_s=tstart, first_sweep_utc=first_utc))
-    idf = lwa.open_tbn(path)
-    info = lwa.tbn_info(idf)
-    lwa.print_tbn_info(info)
+    reader = lwa.TBNReader(path)
+    info = reader.info()
+    lwa.print_tbn_info(info, lwa.summarize_tbn_scan(reader.scan))
     fs = info["sample_rate_hz"]
-    tstart = 0.0 if tstart is None else tstart
-    tend = info["usable_duration_s"] if tend is None else tend
+    capture = lwa.TBN_SAMPLES_PER_FRAME / fs
+    tstart = 0.0 if tstart is None else np.floor(tstart / capture + 1e-9) * capture   # capture boundary
+    tend = info["usable_duration_s"] if tend is None else min(tend, info["usable_duration_s"])
     if not 0 <= tstart < tend:
-        raise ValueError("--tend must be greater than --tstart")
+        raise ValueError("--tend must be greater than --tstart (and --tstart inside the file)")
     stand_list = lwa.parse_stands(stands, available=lwa.station_stands())
     rows, ch_stands, ch_pols = lwa.tbn_stream_indices(stand_list, pol)
     if bad_stands != "none":
         keep = ~lwa.bad_stand_mask(ch_stands, ch_pols, bad_stands)
         rows, ch_stands, ch_pols = rows[keep], ch_stands[keep], ch_pols[keep]
-    stamp = lwa.probe_timestamp(path, tstart)
-    frac = lwa.fractional_second(stamp) if timestamp_align else None
+    frac = reader.fractional_second_at(tstart) if timestamp_align else None
     skip = lfm.sweep_alignment_samples(frac, sweep_frequency, fs, offset)
-    start_dt = lwa.to_datetime(stamp)
-    first_utc = start_dt + timedelta(seconds=skip / fs) if start_dt is not None else None
+    first_utc = reader.utc_at(tstart + skip / fs)
     meta = dict(source_format="tbn", station="lwasv", channel_id_kind="physical_stand",
                 channel_digitizers=(rows + 1).tolist(), tuning_frequency_hz=info["tuning_frequency_hz"],
-                sample_rate_hz=fs, source_tstart_s=tstart, first_sweep_utc=first_utc)
-    blocks = lwa.read_tbn_blocks(idf, tstart, tend - tstart, rows)
-    return RawSource(blocks, fs, skip, ch_stands, ch_pols, int(round((tend - tstart) * fs)), meta, idf.close)
+                sample_rate_hz=fs, source_tstart_s=float(tstart), first_sweep_utc=first_utc, tbn_reader="native")
+    blocks = reader.read_blocks(rows, tstart, tend - tstart)
+    return RawSource(blocks, fs, skip, ch_stands, ch_pols, int(round((tend - tstart) * fs)), meta)
 
 
 # ===========================================================================
