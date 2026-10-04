@@ -103,6 +103,12 @@ class StageWriter:
 
     def write(self, selection, values):
         values = np.asarray(values)
+        if self.real.dtype == np.float16:
+            peak = float(np.nanmax(np.abs(np.concatenate([values.real.ravel(), values.imag.ravel()]))) or 0.0) \
+                if values.size else 0.0
+            if peak > 65504:
+                raise ValueError(f"{self.stage.upper()} values reach {peak:.3g}, beyond float16 (65504); use "
+                                 "--dtype float32. float16 is exact for raw 8-bit samples (RDC0) only.")
         self.real[selection] = values.real.astype(self.real.dtype, copy=False)
         self.imag[selection] = values.imag.astype(self.imag.dtype, copy=False)
 

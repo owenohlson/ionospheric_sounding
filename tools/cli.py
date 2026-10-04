@@ -226,7 +226,9 @@ def export_main(stage, argv=None):
     if stage == "rdc2p":
         p.add_argument("--estimator-sweeps", type=int, default=1, help="Sweep pairs summed per estimate")
     g = p.add_argument_group("storage")
-    g.add_argument("--dtype", choices=["float32", "float16"], default="float32", help="float16 is lossy")
+    g.add_argument("--dtype", choices=["float32", "float16"], default="float32",
+                   help="float16 halves the size and is exact for RDC0 (8-bit samples); dechirped stages "
+                        "usually exceed its range")
     g.add_argument("--compression", choices=["gzip", "lzf", "none"], default="gzip")
     g.add_argument("--dry-run", action="store_true", help="Only report the output size")
     args = p.parse_args(argv)
