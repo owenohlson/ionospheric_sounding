@@ -30,24 +30,10 @@ sweep is cut, dechirped and reduced to the delay window before the next is read,
 so no RDC0 is ever stored (RDC2/RDC2P go through a temporary RDC1 next to the
 output).
 
-**Large recordings.** RDC0 holds every raw sample as complex float32, so it is
-about 4 times the size of the TBN file (which stores 8-bit I/Q). A 15-minute LWA-SV file with all 520 inputs is
-about 375 GB as RDC0, against about 2 GB as RDC1 with a 3 ms delay window.
-Use RDC0 only for short cuts (`--tstart/--tend`) when choosing parameters, then
-export RDC1 or RDC2 straight from the raw file:
-
-```bash
-# 1. quality report (seconds), tuning and start time
-python tools/preprocess_tbn.py raw.dat --report-only
-# 2. a 30 s, one-stand RDC0 to check the sweep and find the echoes
-python tools/export_rdc0.py raw.dat --sweep-frequency 2 --bandwidth=-99.259377e3 --stands 10 \
-    --tend 30 --output test_rdc0.h5
-python tools/plot_power_delay.py test_rdc0.h5 --full-delay --output pdp.png
-# 3. the whole file, all stands, both pols, straight to RDC2 (keeps RDC1)
-LWA_SSMIF=data/LD021_0001.tgz python tools/export_rdc2.py raw.dat --sweep-frequency 2 \
-    --bandwidth=-99.259377e3 --pol both --bad-stands status --gap-fill zero --d-min 13 --d-max 19 \
-    --integration-time 120 --hop-time 30 --output session_rdc2.h5
-```
+**Large recordings.** RDC0 holds every raw sample as complex float32, about 4
+times the TBN file (375 GB for 15 minutes of all 520 inputs), so use it only for
+short test cuts. Export RDC1/RDC2 straight from the raw file instead; see
+"Workflow for an LWA session" below for sizes and commands.
 An RDC2 keeps the RDC1 it came from by default, so integration and hop can be
 changed later without re-dechirping.
 
@@ -157,6 +143,147 @@ without the flagged stands, and with self-calibration. It also counts held-out
 cells the calibration made worse. The in-sample number is always optimistic.
 2023-12-09 (fit on 0–5 s, tested on 5–9.5 s): 0.56 → 0.84 → 0.96. `check_array_calibration.py
 --calibration CAL.h5` adds a `selfcal` variant, for testing on another time range.
+
+## Workflow for an LWA session
+
+The commands below use the 2023-12-09 13.5 MHz file. Each TBN file holds one
+tuning (13.5, 16.15, 24.55 MHz, ...), so repeat steps 2–6 per file with that
+transmitter's sweep settings.
+
+### 0. Station description (every command)
+
+```bash
+export LWA_SSMIF=/path/to/LD021_0001.tgz   # once per shell or job script (bash)
+LWA_SSMIF=/path/to/LD021_0001.tgz python tools/...   # or for one command
+python tools/... --ssmif /path/to/LD021_0001.tgz     # or as a flag
+```
+
+The value is an SSMIF text file or an observation metadata `.tgz`. Exports need it
+to map digitizers to stands and to apply `--bad-stands status`. Array commands
+need it for positions and cable delays. Files store each channel's digitizer, so
+setting it later still re-labels the stands correctly.
+
+### 1. Check the file
+
+```bash
+python tools/preprocess_tbn.py raw.dat --report-only
+```
+
+Read `tuning_mhz`, `start_utc`, the missing captures and the gaps. No trimming is
+needed: exports place every frame by its timetag and ignore leftover frames from
+the previous tuning.
+
+### 2. Sweep settings and delay window (per frequency)
+
+```bash
+python tools/export_rdc0.py raw.dat --sweep-frequency 2 --bandwidth=-99.259377e3 \
+    --stands 10 --tend 30 --output test_rdc0.h5
+python tools/plot_spectrogram.py test_rdc0.h5 --overlay-lfm --output spec.png
+python tools/plot_power_delay.py test_rdc0.h5 --full-delay --output pdp.png
+```
+
+The spectrogram estimate confirms the sweep rate and bandwidth. The full-delay
+profile shows where the echoes are. Then choose `--d-min/--d-max`, and
+`--offset` if the echoes sit far into the sweep (see "Sweep offset").
+
+### 3. Export the session
+
+```bash
+python tools/export_rdc2.py raw.dat --sweep-frequency 2 --bandwidth=-99.259377e3 \
+    --pol both --bad-stands status --gap-fill zero --d-min 12 --d-max 20 \
+    --integration-time 120 --hop-time 30 --output s13p5_rdc2.h5 --dry-run   # size check
+```
+
+Run it again without `--dry-run`. The RDC2 file keeps the per-sweep RDC1, so
+every later plot can change integration/hop without re-reading the raw file.
+
+**Size (float32, uncompressed; gzip saves little on noisy data):**
+
+    RDC1 = delay bins x sweeps x channels x 8 bytes
+    RDC2 = frames x delay bins x nfft x channels x 8 bytes      (in addition, when RDC1 is kept)
+
+* Delay bins: one per 10.07 us at 100 kHz, about 99 per ms of window.
+* Sweeps: 1792 per 15 minutes at 2 Hz.
+* Channels: up to 520 inputs.
+* Frames: (900 - integration) / hop + 1, i.e. 27 for 120 s / 30 s.
+* nfft: the next power of two of the sweeps per frame, i.e. 256 for 120 s at 2 Hz.
+
+For one 15-minute file with all 520 inputs:
+
+| Window | RDC1 only (`export_rdc1.py`) | RDC2 120 s/30 s + RDC1 |
+| --- | --- | --- |
+| 3 ms | 2.2 GB | 11 GB |
+| 10 ms | 7.4 GB | 36 GB |
+| 22 ms | 16 GB | 80 GB |
+| 108 ms | 80 GB | — |
+
+To shrink it:
+* narrow the delay window (the biggest lever);
+* use `--no-keep-rdc1`, which fixes integration/hop for good;
+* use non-overlapping frames (`--hop-time` = `--integration-time`);
+* export RDC1 only, since plots and calibration recompute Doppler from it;
+* crop Doppler with `--fd-min/--fd-max`.
+
+`--dtype float16` is exact for RDC0 only: dechirped values exceed its range, and
+the export stops with an error if they do.
+
+### 4. Single-receiver and incoherent plots
+
+`--stands all` sums the power of every selected input. Without it, the plot uses
+the first stand. `--pol x|y|both` selects polarizations.
+
+```bash
+python tools/plot_dechirp.py s13p5_rdc2.h5 --stands all --navg 4 --output dechirp.png        # delay vs time
+python tools/plot_power_delay.py s13p5_rdc2.h5 --stands all --output pdp.png
+python tools/plot_doppler_time.py s13p5_rdc2.h5 --stands all --integration-time 60 --hop-time 10 --output dt.png
+python tools/plot_delay_doppler.py s13p5_rdc2.h5 --stands all --output dd.png                # first frame
+python tools/sliding_delay_doppler.py s13p5_rdc2.h5 --stands all --output dd_video           # every frame
+python tools/plot_phase_doppler.py s13p5_rdc2.h5 --stands all --kind doppler-time --output pd.png
+python tools/sliding_phase_doppler.py s13p5_rdc2.h5 --stands all --output pd_video
+```
+
+Delay-Doppler plots use the stored 120 s / 30 s frames. Passing
+`--integration-time/--hop-time` recomputes the frames from the retained RDC1.
+
+### 5. Calibrate the array (once per file and polarization)
+
+```bash
+python tools/calibrate_array.py s13p5_rdc2.h5 --pol x --integration-time 10 --hop-time 10 \
+    --output cal_s13p5_x.h5 --csv cal_s13p5_x.csv
+python tools/calibrate_array.py s13p5_rdc2.h5 --pol y --integration-time 10 --hop-time 10 \
+    --output cal_s13p5_y.h5
+```
+
+* Use non-overlapping frames, so the held-out validation really is held out.
+* Check the report: the held-out fit should rise (2023-12-09: 0.56 → 0.84 → 0.96)
+  and few cells should get worse.
+* Recalibrate when the tuning, the session or the SSMIF changes. A file is
+  refused at another frequency.
+* Each polarization needs its own file.
+* For an independent check, calibrate on one time range (`--tend 300`) and test
+  another:
+  `check_array_calibration.py s13p5_rdc2.h5 --tstart 300 --calibration cal.h5`.
+
+### 6. Array plots (one polarization, calibrated)
+
+```bash
+# sliding array delay-Doppler: beam re-aimed each frame at the strongest echo
+python tools/sliding_delay_doppler.py s13p5_rdc2.h5 --pol x --beamformer conventional \
+    --calibration cal_s13p5_x.h5 --output dd_beam_video
+# ... plus sliding sky (angle) maps: whole window, or the N strongest cells per frame
+python tools/sliding_delay_doppler.py s13p5_rdc2.h5 --pol x --beamformer conventional \
+    --calibration cal_s13p5_x.h5 --angle-output sky_video --angle-cells 4 --output dd_beam_video
+# fixed beam instead of auto-aim; MVDR; beam pattern
+python tools/plot_delay_doppler.py s13p5_rdc2.h5 --pol x --beamformer mvdr --look-az -86 --look-el 22 \
+    --calibration cal_s13p5_x.h5 --beam-pattern-output bp.png --output dd_mvdr.png
+# stored beams for later (RDC3)
+python tools/export_rdc3.py s13p5_rdc2.h5 --pol x --calibration cal_s13p5_x.h5 --look -86,22 \
+    --output s13p5_rdc3.h5
+```
+
+Auto-aimed videos write `look_directions.csv` (az/el per frame) into the
+`--output` directory. Sky maps are in dB relative to their own peak
+(`--angle-range-db`).
 
 ## Examples
 
