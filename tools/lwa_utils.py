@@ -230,61 +230,87 @@ def _frame_block(mm, first, count):
 def scan_tbn(path, block_frames=1 << 16):
     """Read only frame headers. Returns a dict describing captures (timetag groups).
 
-    Keys: n_frames, bad_sync (indices), group_first (first frame of each capture),
-    group_size, group_timetag, sample_rate_hz, frames_per_capture.
+    Frames are grouped by consecutive (timetag, tuning word). The recording's own
+    captures are the groups with the dominant tuning word whose timetags sit on the
+    dominant timetag grid; anything else (for example a few frames left over from
+    a previous TBN setup at another frequency, ahead of a gap) is marked invalid
+    and ignored by the reader, the summary and trimming.
+
+    Keys: n_frames, bad_sync (indices), group_first, group_size, group_timetag,
+    group_tuning, valid (per group), tuning_word, timetag_step, sample_rate_hz,
+    frames_per_capture.
     """
     mm = np.memmap(path, np.uint8, mode="r")
     n = mm.size // TBN_FRAME_SIZE
-    firsts, tags, bad = [], [], []
+    firsts, tags, tunes, bad = [], [], [], []
     prev = None
     for f0 in range(0, n, block_frames):
         blk = _frame_block(mm, f0, min(block_frames, n - f0))
         ok = (blk[:, 0] == 0xDE) & (blk[:, 1] == 0xC0) & (blk[:, 2] == 0xDE) & (blk[:, 3] == 0x5C)
         bad.extend((f0 + np.flatnonzero(~ok)).tolist())
-        tag = np.ascontiguousarray(blk[:, 16:24]).view(">u8").ravel().astype(np.int64)
         idx = np.flatnonzero(ok)
         if not idx.size:
             continue
-        t = tag[idx]
+        t = np.ascontiguousarray(blk[idx, 16:24]).view(">u8").ravel().astype(np.int64)
+        w = np.ascontiguousarray(blk[idx, 8:12]).view(">u4").ravel().astype(np.int64)
         change = np.ones(t.size, bool)
-        change[1:] = t[1:] != t[:-1]
-        if prev is not None and t[0] == prev:
+        change[1:] = (t[1:] != t[:-1]) | (w[1:] != w[:-1])
+        if prev is not None and (t[0], w[0]) == prev:
             change[0] = False
         firsts.extend((f0 + idx[change]).tolist())
         tags.extend(t[change].tolist())
-        prev = t[-1]
-    firsts, tags = np.asarray(firsts, np.int64), np.asarray(tags, np.int64)
+        tunes.extend(w[change].tolist())
+        prev = (t[-1], w[-1])
+    firsts, tags, tunes = (np.asarray(x, np.int64) for x in (firsts, tags, tunes))
     if firsts.size < 3:
         raise RuntimeError("Fewer than three captures with valid sync words")
     sizes = np.diff(np.append(firsts, n))
-    step = np.median(np.diff(tags))
+    words = np.unique(tunes)
+    weight = {w_: int(sizes[tunes == w_].sum()) for w_ in words}
+    main = max(weight, key=weight.get)                      # tuning word holding most frames
+    m = tunes == main
+    diffs = np.diff(np.sort(np.unique(tags[m])))
+    step = int(np.median(diffs)) if diffs.size else 0
+    if step <= 0:
+        raise RuntimeError("Could not determine the timetag step")
+    phases, pc = np.unique(tags[m] % step, return_counts=True)
+    phase = int(phases[np.argmax(pc)])                      # grid the recording's captures sit on
+    valid = m & (tags % step == phase)
     return dict(n_frames=n, bad_sync=np.asarray(bad, np.int64), group_first=firsts, group_size=sizes,
-                group_timetag=tags, frames_per_capture=int(np.median(sizes)),
+                group_timetag=tags, group_tuning=tunes, valid=valid, tuning_word=int(main), timetag_step=step,
+                frames_per_capture=int(np.median(sizes[valid])),
                 sample_rate_hz=TBN_SAMPLES_PER_FRAME * FPGA_CLOCK_HZ / step)
 
 
 def capture_slots(scan):
-    """Capture index of every frame group: (timetag - first timetag) / timetag step."""
-    step = TBN_SAMPLES_PER_FRAME * FPGA_CLOCK_HZ / scan["sample_rate_hz"]
-    tags = scan["group_timetag"]
-    return np.round((tags - tags.min()) / step).astype(np.int64)
+    """Capture index of every frame group, (timetag - first valid timetag) / step; -1 for invalid groups."""
+    tags, valid = scan["group_timetag"], scan["valid"]
+    slots = np.full(tags.size, -1, np.int64)
+    slots[valid] = (tags[valid] - tags[valid].min()) // scan["timetag_step"]
+    return slots
 
 
 def summarize_tbn_scan(scan):
     """Data-quality numbers for a scanned TBN file (see ``preprocess_tbn.py``)."""
     fs, per = scan["sample_rate_hz"], scan["frames_per_capture"]
-    slots = capture_slots(scan)
+    valid = scan["valid"]
+    slots = capture_slots(scan)[valid]
     n_slots = int(slots.max()) + 1
     frames = np.zeros(n_slots, np.int64)
-    np.add.at(frames, slots, scan["group_size"])
+    np.add.at(frames, slots, scan["group_size"][valid])
     present = frames > 0
     missing = ~present
     # runs of missing captures
     edges = np.diff(np.concatenate([[0], missing.astype(np.int8), [0]]))
     runs = np.flatnonzero(edges == -1) - np.flatnonzero(edges == 1)
     capture_s = TBN_SAMPLES_PER_FRAME / fs
-    late = np.diff(scan["group_timetag"]) <= 0
-    return dict(captures=int(present.sum()), sample_rate_hz=fs, frames_per_capture=per,
+    late = np.diff(scan["group_timetag"][valid]) <= 0
+    other = ~valid
+    other_tunings = sorted({round(w * FPGA_CLOCK_HZ / 2 ** 32 / 1e6, 4) for w in scan["group_tuning"][other]})
+    return dict(captures=int(present.sum()), sample_rate_hz=fs,
+                tuning_mhz=round(scan["tuning_word"] * FPGA_CLOCK_HZ / 2 ** 32 / 1e6, 6),
+                start_utc=_utc_from_ticks(int(scan["group_timetag"][valid].min())).isoformat(),
+                frames_per_capture=per,
                 complete_captures=int(np.count_nonzero(frames == per)),
                 partial_captures=int(np.count_nonzero(present & (frames < per))),
                 overfull_captures=int(np.count_nonzero(frames > per)),
@@ -293,7 +319,15 @@ def summarize_tbn_scan(scan):
                 gaps=int(runs.size), longest_gap_s=float(runs.max() * capture_s) if runs.size else 0.0,
                 out_of_order_groups=int(late.sum()),
                 bad_sync_frames=int(scan["bad_sync"].size),
+                ignored_frames=int(scan["group_size"][other].sum()),
+                ignored_tunings_mhz=", ".join(f"{f:g}" for f in other_tunings) or "-",
                 duration_s=float(n_slots * capture_s))
+
+
+def _utc_from_ticks(ticks):
+    from datetime import timezone
+    whole, frac = divmod(int(ticks), int(FPGA_CLOCK_HZ))
+    return datetime.fromtimestamp(whole, timezone.utc) + timedelta(seconds=frac / FPGA_CLOCK_HZ)
 
 
 def write_tbn_range(path, output, scan, tstart=0.0, tend=None, drop_incomplete=False, block_frames=1 << 16):
@@ -305,17 +339,18 @@ def write_tbn_range(path, output, scan, tstart=0.0, tend=None, drop_incomplete=F
     Missing captures stay missing. Returns (captures, frames) written.
     """
     slots = capture_slots(scan)
+    valid = scan["valid"]
     per_slot = np.zeros(int(slots.max()) + 1, np.int64)
-    np.add.at(per_slot, slots, scan["group_size"])
+    np.add.at(per_slot, slots[valid], scan["group_size"][valid])
     t = slots * TBN_SAMPLES_PER_FRAME / scan["sample_rate_hz"]
-    complete = per_slot[slots] == scan["frames_per_capture"]
-    keep = t >= tstart
+    complete = valid & (per_slot[np.maximum(slots, 0)] == scan["frames_per_capture"])
+    keep = valid & (t >= tstart)
     if tend is not None:
         keep &= t < tend
     if drop_incomplete:
         keep &= complete
     else:                                   # always drop partial captures at the file edges
-        keep &= complete | ((slots > slots.min()) & (slots < slots.max()))
+        keep &= complete | ((slots > 0) & (slots < slots.max()))
     if not keep.any():
         raise ValueError("No captures in the requested time range")
     mm = np.memmap(path, np.uint8, mode="r")
@@ -356,16 +391,17 @@ class TBNReader:
         self.path = str(path)
         self.scan = scan if scan is not None else scan_tbn(self.path)
         self.sample_rate_hz = float(self.scan["sample_rate_hz"])
-        self.step = int(round(TBN_SAMPLES_PER_FRAME * FPGA_CLOCK_HZ / self.sample_rate_hz))
-        self.tag0 = int(self.scan["group_timetag"].min())
+        self.step = int(self.scan["timetag_step"])
+        valid = self.scan["valid"]
+        self.tag0 = int(self.scan["group_timetag"][valid].min())
         self.group_slot = capture_slots(self.scan)
         self.n_captures = int(self.group_slot.max()) + 1
-        self._order = np.argsort(self.group_slot, kind="stable")
+        order = np.argsort(self.group_slot, kind="stable")
+        self._order = order[valid[order]]                        # invalid groups (slot -1) never read
         self._frames = np.memmap(self.path, np.uint8, mode="r",
                                  shape=(int(self.scan["n_frames"]), TBN_FRAME_SIZE))
-        first = np.asarray(self._frames[int(self.scan["group_first"][0])])
-        tuning = int(np.frombuffer(first[8:12].tobytes(), ">u4")[0])
-        self.tuning_frequency_hz = tuning * FPGA_CLOCK_HZ / 2 ** 32
+        self.tuning_word = int(self.scan["tuning_word"])
+        self.tuning_frequency_hz = self.tuning_word * FPGA_CLOCK_HZ / 2 ** 32
         self.n_rows = int(self.scan["frames_per_capture"])
 
     @property
@@ -374,10 +410,7 @@ class TBNReader:
 
     def utc_at(self, t):
         """UTC datetime of time ``t`` [s] after the first capture (exact to the 196 MHz clock)."""
-        from datetime import timezone
-        ticks = self.tag0 + int(round(t * FPGA_CLOCK_HZ))
-        whole, frac = divmod(ticks, int(FPGA_CLOCK_HZ))
-        return datetime.fromtimestamp(whole, timezone.utc) + timedelta(seconds=frac / FPGA_CLOCK_HZ)
+        return _utc_from_ticks(self.tag0 + int(round(t * FPGA_CLOCK_HZ)))
 
     def fractional_second_at(self, t):
         ticks = self.tag0 + int(round(t * FPGA_CLOCK_HZ))
@@ -404,6 +437,7 @@ class TBNReader:
             self.n_captures, first + int(np.ceil(duration * self.sample_rate_hz / per - 1e-9)))
         chunk = max(1, int(round(chunk_seconds * self.sample_rate_hz / per)))
         sorted_slots = self.group_slot[self._order]
+        step = self.step
         bad = self.scan["bad_sync"]
         for a in range(first, stop, chunk):
             b = min(a + chunk, stop)
@@ -417,12 +451,14 @@ class TBNReader:
                     idx = idx[~np.isin(idx, bad)]
                 raw = np.asarray(self._frames[idx])
                 ident = np.ascontiguousarray(raw[:, 12:14]).view(">u2").ravel().astype(np.int64)
-                tbn = (ident >> 15) & 1 == 0                       # TBW frames have this bit set
+                tune = np.ascontiguousarray(raw[:, 8:12]).view(">u4").ravel().astype(np.int64)
+                tbn = ((ident >> 15) & 1 == 0) & (tune == self.tuning_word)   # TBW bit set / other tuning
                 digit = ident & 1023
                 tag = np.ascontiguousarray(raw[:, 16:24]).view(">u8").ravel().astype(np.int64)
-                slot = np.round((tag - self.tag0) / self.step).astype(np.int64) - a
+                on_grid = (tag - self.tag0) % step == 0
+                slot = (tag - self.tag0) // step - a
                 ch = np.where((digit >= 1) & (digit <= 1024), where[np.clip(digit - 1, 0, 1023)], -1)
-                use = tbn & (ch >= 0) & (slot >= 0) & (slot < b - a)
+                use = tbn & on_grid & (ch >= 0) & (slot >= 0) & (slot < b - a)
                 iq = raw[use, 24:].view(np.int8).astype(np.float32).reshape(-1, per, 2)
                 out[ch[use], slot[use], :] = iq[..., 0] + 1j * iq[..., 1]
             block = out.reshape(rows.size, -1)
@@ -436,6 +472,9 @@ def print_tbn_info(info, quality=None):
     print(f"Tuning:      {info['tuning_frequency_hz']:.3f} Hz")
     print(f"Frames:      {info['n_frames']} ({info['n_antpol']} ant/pol streams)")
     print(f"Duration:    {info['usable_duration_s']:.3f} s")
+    if quality and quality.get("ignored_frames"):
+        print(f"Ignored:     {quality['ignored_frames']} frames at other tunings ({quality['ignored_tunings_mhz']} MHz) "
+              f"or off the timetag grid")
     if quality:
         print(f"Missing:     {quality['missing_captures']} captures ({quality['missing_s']:.2f} s in "
               f"{quality['gaps']} gaps, longest {quality['longest_gap_s'] * 1e3:.1f} ms); "

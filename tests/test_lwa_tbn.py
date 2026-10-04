@@ -15,11 +15,11 @@ STEP = int(512 * 196e6 / 100e3)
 TUNING_WORD = int(round(38.1e6 / 196e6 * 2 ** 32))
 
 
-def frame(tag, row, fill):
+def frame(tag, row, fill, tuning_word=TUNING_WORD):
     """One TBN frame; ``fill`` is a scalar byte or 512 complex samples (int8 I/Q)."""
     f = np.zeros(lwa_utils.TBN_FRAME_SIZE, np.uint8)
     f[0:4] = [0xDE, 0xC0, 0xDE, 0x5C]
-    f[8:12] = np.frombuffer(np.array([TUNING_WORD], ">u4").tobytes(), np.uint8)
+    f[8:12] = np.frombuffer(np.array([tuning_word], ">u4").tobytes(), np.uint8)
     f[12:14] = np.frombuffer(np.array([row + 1], ">u2").tobytes(), np.uint8)
     f[16:24] = np.frombuffer(np.array([tag], ">u8").tobytes(), np.uint8)
     if np.ndim(fill):
@@ -29,7 +29,7 @@ def frame(tag, row, fill):
     return f
 
 
-def messy_tbn(path, per=16, captures=60, seed=0, missing_capture=25, partial=(40, 3)):
+def messy_tbn(path, per=16, captures=60, seed=0, missing_capture=25, partial=(40, 3), stray=False):
     """Synthetic TBN with shuffled frames, a late group, a duplicate, a missing and a partial capture.
 
     Returns the true samples (per rows, captures * 512) with NaN where frames are absent.
@@ -49,6 +49,9 @@ def messy_tbn(path, per=16, captures=60, seed=0, missing_capture=25, partial=(40
     groups[11] = groups[11] + late
     groups[12] = groups[12] + [groups[12][0]]           # duplicated frame
     frames = [frame(t0 + g * STEP, r, truth[r, g * 512:(g + 1) * 512]) for grp in groups for g, r in grp]
+    if stray:   # leftovers of a previous setup: other tuning, off the timetag grid, 5.8 s earlier
+        other = int(round(13.5e6 / 196e6 * 2 ** 32))
+        frames = [frame(t0 - int(5.8 * 196e6) - STEP // 2, r, 7, other) for r in range(5)] + frames
     np.concatenate(frames).tofile(path)
     truth[:, missing_capture * 512:(missing_capture + 1) * 512] = np.nan
     truth[partial[1], partial[0] * 512:(partial[0] + 1) * 512] = np.nan
@@ -105,6 +108,19 @@ class TBNScanTests(unittest.TestCase):
             again = np.concatenate([b for b, _ in lwa_utils.TBNReader(out).read_blocks(rows)], axis=1)
             np.testing.assert_array_equal(again, truth[rows])
 
+
+    def test_leftover_frames_from_another_setup_are_ignored(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "stray.dat"
+            truth, t0 = messy_tbn(src, stray=True)
+            q = lwa_utils.summarize_tbn_scan(lwa_utils.scan_tbn(src))
+            self.assertEqual((q["ignored_frames"], q["ignored_tunings_mhz"], q["missing_captures"], q["gaps"]),
+                             (5, "13.5", 1, 1))
+            self.assertAlmostEqual(q["tuning_mhz"], 38.1, places=3)
+            r = lwa_utils.TBNReader(src)
+            self.assertEqual(r.utc_at(0).isoformat(), "2023-12-09T15:59:54.189440+00:00")
+            got = np.concatenate([b for b, _ in r.read_blocks(np.arange(16))], axis=1)
+            np.testing.assert_array_equal(got, truth)
 
     def test_export_rdc0_from_messy_tbn(self):
         import rdc_io
