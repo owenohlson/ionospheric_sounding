@@ -101,7 +101,8 @@ class RawSource:
 
 
 def open_raw_source(path, sweep_frequency, tstart=None, tend=None, offset=0.0, timestamp_align=True,
-                    stands="all", pol="both", bad_stands="none", start_utc=None, carrier_frequency=None):
+                    stands="all", pol="both", bad_stands="none", start_utc=None, carrier_frequency=None,
+                    verbose=True):
     """Open a TBN or WAV recording as a ``RawSource`` aligned to the sweep grid."""
     path = os.path.expanduser(path)
     if path.lower().endswith(".wav"):
@@ -129,7 +130,8 @@ def open_raw_source(path, sweep_frequency, tstart=None, tend=None, offset=0.0, t
                          dict(meta, source_tstart_s=tstart, first_sweep_utc=first_utc))
     reader = lwa.TBNReader(path)
     info = reader.info()
-    lwa.print_tbn_info(info, lwa.summarize_tbn_scan(reader.scan))
+    if verbose:
+        lwa.print_tbn_info(info, lwa.summarize_tbn_scan(reader.scan))
     fs = info["sample_rate_hz"]
     capture = lwa.TBN_SAMPLES_PER_FRAME / fs
     tstart = 0.0 if tstart is None else np.floor(tstart / capture + 1e-9) * capture   # capture boundary
@@ -572,11 +574,17 @@ def export(input_path, target, output, s, tool=None):
     if not input_path.lower().endswith((".h5", ".hdf5")):
         if target == "rdc0":
             return export_rdc0(input_path, output, s, tool)
-        with tempfile.TemporaryDirectory(prefix="rdc0_") as tmp:
-            temp = os.path.join(tmp, "rdc0.h5")
-            quick = dataclasses.replace(s, compression="lzf", dtype="float32", dry_run=False)
-            export_rdc0(input_path, temp, quick, tool, temporary=True)
-            chained = dataclasses.replace(s, tstart=None, tend=None, stands="all", pol="both", bad_stands="none")
+        if target == "rdc1":
+            return export_rdc1_from_raw(input_path, output, s, tool)
+        if s.dry_run:
+            export_rdc1_from_raw(input_path, output, s, tool)
+            return None
+        # RDC2/RDC2P: stream to a temporary RDC1 (delay window only), then continue from it
+        with tempfile.TemporaryDirectory(prefix="rdc1_", dir=os.path.dirname(os.path.abspath(output))) as tmp:
+            temp = os.path.join(tmp, "rdc1.h5")
+            export_rdc1_from_raw(input_path, temp, dataclasses.replace(s, compression="lzf"), tool, temporary=True)
+            chained = dataclasses.replace(s, tstart=None, tend=None, stands="all", pol="both", bad_stands="none",
+                                          d_min=None, d_max=None)
             return export(temp, target, output, chained, tool)
     if target == "rdc0":
         raise ValueError("RDC0 is made from a raw TBN/WAV recording")
@@ -652,6 +660,137 @@ def export_rdc0(raw_path, output, s, tool="export_rdc0", temporary=False):
     if not temporary:
         print(f"Wrote {output}", flush=True)
     return output
+
+
+RDC1_BUFFER_BYTES = 512e6     # sweeps of dechirped data held before one HDF5 write
+
+
+def export_rdc1_from_raw(raw_path, output, s, tool="export_rdc1", temporary=False):
+    """Stream a raw TBN/WAV recording straight to RDC1, one sweep at a time.
+
+    Nothing the size of the raw data is ever stored: each sweep is cut, dechirped
+    and reduced to the delay window before the next is read. Without --d-min/
+    --d-max the window is +/-1.5 ms around the strongest delay in the first 32
+    sweeps of the first 16 channels.
+    """
+    if not s.sweep_frequency or s.sweep_frequency <= 0:
+        raise ValueError("--sweep-frequency is required for raw input")
+    if not s.bandwidth:
+        raise ValueError("--bandwidth is required to dechirp a raw recording")
+    open_args = (raw_path, s.sweep_frequency, s.tstart, s.tend, s.offset, s.timestamp_align,
+                 s.stands, s.pol, s.bad_stands, s.start_utc, s.carrier_frequency)
+    src = open_raw_source(*open_args, verbose=not temporary)
+    try:
+        fs, prf = src.sample_rate, float(s.sweep_frequency)
+        sweep = int(round(fs / prf))
+        adc_count = sweep - s.adc_start if s.adc_count is None else s.adc_count
+        n_pulses = (src.n_samples - src.skip_samples) // sweep
+        if n_pulses < 1:
+            raise ValueError("The selection does not contain one complete sweep after alignment")
+        gate = lfm.parse_reference_gate(s.reference_gate) if s.reference_gate else None
+        g = gate or (None, 0.5, 0.0)
+        wave = lfm.LFMWaveform(s.bandwidth, prf, fs, g[0], g[1], g[2])
+        window = s.dechirp_window or "hann"
+        gap_fill = s.gap_fill or "nan"
+        n_ch = len(src.channel_stands)
+        d_min, d_max = s.d_min, s.d_max
+        if d_min is None and d_max is None:
+            if s.dry_run:
+                d_min, d_max = 0.0, 3.0                      # size estimate only
+            else:
+                d_min, d_max = _raw_preview_window(open_args, sweep, adc_count, wave, window, s, gap_fill)
+        bins, delay_ms = lfm.delay_band(wave, adc_count, d_min, d_max)
+        n_delay = delay_ms.size
+        item = np.dtype(s.dtype).itemsize * 2
+        print(f"RDC1 from raw: {n_delay} delay bins ({delay_ms[0]:.3f}-{delay_ms[-1]:.3f} ms), {n_pulses} sweeps, "
+              f"{n_ch} channels; {n_delay * n_pulses * n_ch * item / 1e9:.2f} GB uncompressed", flush=True)
+        if s.dry_run:
+            return None
+        buf_n = int(max(1, min(n_pulses, 256, RDC1_BUFFER_BYTES // max(n_delay * n_ch * 8, 1))))
+        chunks = (min(32, n_delay), buf_n, min(8, n_ch))
+        with rdc_io.atomic_output(output) as tmp:
+            with rdc_io._h5py().File(tmp, "w") as h5:
+                w = rdc_io.StageWriter(h5, "rdc1", (n_delay, n_pulses, n_ch), s.dtype, s.compression,
+                                       chunks=chunks, maxshape=(n_delay, None, n_ch))
+                inv = w.dataset("invalid_counts", shape=(n_pulses, n_ch), dtype="int64", maxshape=(None, n_ch))
+                buf = np.empty((n_delay, buf_n, n_ch), np.complex64)
+                bad = np.empty((buf_n, n_ch), np.int64)
+                filled = start = 0
+                for p, sweep_block, invalid in pack_sweeps(src.blocks, sweep, src.skip_samples, s.adc_start,
+                                                           adc_count, n_pulses, gap_fill):
+                    buf[:, filled] = lfm.dechirp_range_fft(sweep_block[:, None, :], wave, window, s.adc_start,
+                                                           bins)[:, 0, :]
+                    bad[filled] = invalid
+                    filled += 1
+                    if filled == buf_n:
+                        w.write((slice(None), slice(start, start + filled), slice(None)), buf)
+                        inv[start:start + filled] = bad
+                        start, filled = start + filled, 0
+                        if not temporary:
+                            print(f"  RDC1 sweep {start}/{n_pulses}", flush=True)
+                if filled:
+                    w.write((slice(None), slice(start, start + filled), slice(None)), buf[:, :filled])
+                    inv[start:start + filled] = bad[:filled]
+                    start += filled
+                if start < n_pulses:
+                    print(f"Input ended early: {start} of {n_pulses} sweeps written", flush=True)
+                    w.resize((n_delay, start, n_ch))
+                    inv.resize((start, n_ch))
+                w.group.attrs["tstart_s"] = 0.0
+                w.group.attrs["sweep_frequency_hz"] = prf
+                w.channels(src.channel_stands, src.channel_pols, src.metadata.get("channel_digitizers"))
+                w.dataset("delay_ms", delay_ms)
+                meta = dict(src.metadata)
+                first = meta.pop("first_sweep_utc", None)
+                common = dict(stands=s.stands, pol=s.pol, bad_stands=s.bad_stands, gap_fill=gap_fill)
+                meta.update(
+                    format_version=rdc_io.FORMAT_VERSION, rdc_stage=1, sweep_frequency_hz=prf,
+                    bandwidth_hz=s.bandwidth, sweep_length_samples=sweep, adc_start=s.adc_start, adc_count=adc_count,
+                    start_offset_samples=int(src.skip_samples), sweep_offset_s=float(s.offset or 0.0),
+                    timestamp_aligned=bool(s.timestamp_align), gap_fill=gap_fill, tstart=0.0, tend=start / prf,
+                    time_zero_utc=first.isoformat() if first else None, pulse0_utc=first.isoformat() if first else None,
+                    source_file=os.path.basename(raw_path), n_channels=n_ch, dtype=s.dtype, dechirp_window=window,
+                    d_min_ms=float(delay_ms[0]), d_max_ms=float(delay_ms[-1]),
+                    selected_stands=np.asarray(src.channel_stands).tolist(),
+                    **polarization_summary(src.channel_pols),
+                    history=[rdc_io.history_entry(tool, stage="rdc0", source=os.path.basename(raw_path),
+                                                  tstart=s.tstart, tend=s.tend, offset=s.offset,
+                                                  timestamp_align=s.timestamp_align, adc_start=s.adc_start,
+                                                  adc_count=adc_count, streamed=True, **common),
+                             rdc_io.history_entry(tool, stage="rdc1", source="raw (streamed)", source_stage="raw",
+                                                  d_min_ms=float(delay_ms[0]), d_max_ms=float(delay_ms[-1]),
+                                                  dechirp_window=window, reference_gate=gate, **common)])
+                if gate:
+                    meta.update(reference_gate_frequency=gate[0], reference_gate_duty=gate[1],
+                                reference_gate_phase=gate[2])
+                rdc_io.write_metadata(h5, meta)
+    finally:
+        if src.close:
+            src.close()
+    if not temporary:
+        print(f"Wrote {output}", flush=True)
+    return output
+
+
+def _raw_preview_window(open_args, sweep, adc_count, wave, window, s, gap_fill, n_sweeps=32, n_channels=16,
+                        half_width_ms=1.5):
+    """+/-half_width around the strongest delay in the first sweeps of the first channels of a raw file."""
+    src = open_raw_source(*open_args, verbose=False)
+    try:
+        delay, order = lfm.delay_axis_ms(wave, adc_count)
+        power = np.zeros(delay.size)
+        for _, block, _ in pack_sweeps(src.blocks, sweep, src.skip_samples, s.adc_start, adc_count, n_sweeps, "zero"):
+            spec = lfm.dechirp_range_fft(block[:, None, :n_channels], wave, window, s.adc_start, order)
+            power += np.sum(np.abs(spec[:, 0, :]) ** 2, axis=1)
+    finally:
+        if src.close:
+            src.close()
+    if not np.any(power > 0):
+        raise ValueError("No signal in the preview; give --d-min/--d-max")
+    peak = float(delay[int(np.argmax(power))])
+    print(f"Auto delay window: {peak - half_width_ms:.3f} to {peak + half_width_ms:.3f} ms "
+          f"(strongest bin {peak:.3f} ms in the first {n_sweeps} sweeps)", flush=True)
+    return peak - half_width_ms, peak + half_width_ms
 
 
 def _export_processed(view, target, output, s, tool):

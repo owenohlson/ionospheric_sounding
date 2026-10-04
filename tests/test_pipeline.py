@@ -62,6 +62,22 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual([h["step"] for h in f.meta["history"]], ["export_rdc0", "export_rdc1", "export_rdc2"])
         np.testing.assert_allclose(f.axis("rdc2", "frame_tstart_s"), np.arange(0, 13, 4))
 
+    def test_raw_streams_straight_to_rdc1(self):
+        """Raw -> RDC1 without an RDC0 gives the same cube, time axis and UTC as going through RDC0."""
+        quiet(ru.export, self.r0, "rdc1", self.d / "via0.h5", ru.ExportSettings(d_min=5, d_max=30))
+        streamed = ru.ExportSettings(**{**self.raw_settings.__dict__, "d_min": 5, "d_max": 30})
+        quiet(ru.export, self.wav, "rdc1", self.d / "direct.h5", streamed)
+        np.testing.assert_allclose(self.cube(self.d / "direct.h5", "rdc1"), self.cube(self.d / "via0.h5", "rdc1"),
+                                   atol=1e-5)
+        a, b = rdc_io.RDCFile(self.d / "direct.h5"), rdc_io.RDCFile(self.d / "via0.h5")
+        np.testing.assert_allclose(a.axis("rdc1", "delay_ms"), b.axis("rdc1", "delay_ms"))
+        self.assertEqual(a.time_zero_utc, b.time_zero_utc)
+        np.testing.assert_array_equal(a.invalid_counts("rdc1", [0], slice(None)),
+                                      b.invalid_counts("rdc1", [0], slice(None)))
+        v = ru.RDCView(self.d / "direct.h5")
+        quiet(v.select_delay)
+        self.assertEqual(next(v.rdc2_frames(8, 4))["cube"].shape[0], v.delay_ms.size)
+
     def test_rdc2_matches_manual_math(self):
         quiet(ru.export, self.r0, "rdc2", self.d / "r2.h5", ru.ExportSettings(d_min=10, d_max=20, integration_time=10))
         f = rdc_io.RDCFile(self.d / "r2.h5")

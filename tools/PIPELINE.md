@@ -25,7 +25,29 @@ export step. Later stages inherit these settings. A request that contradicts an
 already-applied setting is an error, never a silent relabel.
 
 Each export command also accepts any earlier input and chains through the missing
-stages. For example, `export_rdc2.py raw.dat ...` makes a temporary RDC0 first.
+stages. From a raw recording, `export_rdc1/2/2p.py` stream sweep by sweep: each
+sweep is cut, dechirped and reduced to the delay window before the next is read,
+so no RDC0 is ever stored (RDC2/RDC2P go through a temporary RDC1 next to the
+output).
+
+**Large recordings.** RDC0 holds every raw sample as complex float32, so it is
+about 4 times the size of the TBN file (which stores 8-bit I/Q). A 15-minute LWA-SV file with all 520 inputs is
+about 375 GB as RDC0, against about 2 GB as RDC1 with a 3 ms delay window.
+Use RDC0 only for short cuts (`--tstart/--tend`) when choosing parameters, then
+export RDC1 or RDC2 straight from the raw file:
+
+```bash
+# 1. quality report (seconds), tuning and start time
+python tools/preprocess_tbn.py raw.dat --report-only
+# 2. a 30 s, one-stand RDC0 to check the sweep and find the echoes
+python tools/export_rdc0.py raw.dat --sweep-frequency 2 --bandwidth=-99.259377e3 --stands 10 \
+    --tend 30 --output test_rdc0.h5
+python tools/plot_power_delay.py test_rdc0.h5 --full-delay --output pdp.png
+# 3. the whole file, all stands, both pols, straight to RDC2 (keeps RDC1)
+LWA_SSMIF=data/LD021_0001.tgz python tools/export_rdc2.py raw.dat --sweep-frequency 2 \
+    --bandwidth=-99.259377e3 --pol both --bad-stands status --gap-fill zero --d-min 13 --d-max 19 \
+    --integration-time 120 --hop-time 30 --output session_rdc2.h5
+```
 An RDC2 keeps the RDC1 it came from by default, so integration and hop can be
 changed later without re-dechirping.
 

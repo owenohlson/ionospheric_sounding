@@ -4,6 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from dataclasses import replace as dataclasses_replace
+
 import numpy as np
 
 import helpers  # noqa: F401
@@ -147,6 +149,15 @@ class TBNScanTests(unittest.TestCase):
                 expect = truth[dig - 1, skip:skip + n].reshape(data.shape[1], data.shape[0]).T
                 np.testing.assert_array_equal(data[..., k], expect)
             self.assertTrue(np.isnan(data).any())                  # the gap stays a gap, in the right place
+            # streaming raw -> RDC1 matches RDC0 -> RDC1
+            s1 = rdc_utils.ExportSettings(bandwidth=-99.259377e3, d_min=10, d_max=20, compression="none")
+            raw1 = dataclasses_replace(s, bandwidth=-99.259377e3, d_min=10, d_max=20)
+            with contextlib.redirect_stdout(io.StringIO()):
+                rdc_utils.export(str(out), "rdc1", str(Path(d) / "via0.h5"), s1)
+                rdc_utils.export(str(src), "rdc1", str(Path(d) / "direct.h5"), raw1)
+            a = rdc_io.RDCFile(Path(d) / "direct.h5").read("rdc1")
+            b = rdc_io.RDCFile(Path(d) / "via0.h5").read("rdc1")
+            np.testing.assert_allclose(a, b, atol=1e-3, equal_nan=True)
             frac = ((t0 + skip * 1960) % 196_000_000) / 196e6       # first sweep on a half-second boundary
             self.assertAlmostEqual(frac % 0.5, 0.0, places=6)
 

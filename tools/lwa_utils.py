@@ -227,7 +227,20 @@ def _frame_block(mm, first, count):
     return np.asarray(mm[first * TBN_FRAME_SIZE:(first + count) * TBN_FRAME_SIZE]).reshape(count, TBN_FRAME_SIZE)
 
 
+_SCAN_CACHE = {}
+
+
 def scan_tbn(path, block_frames=1 << 16):
+    """Cached ``_scan_tbn`` (keyed by path, size and modification time)."""
+    st = os.stat(path)
+    key = (os.path.realpath(path), st.st_size, st.st_mtime_ns, block_frames)
+    if key not in _SCAN_CACHE:
+        _SCAN_CACHE.clear()
+        _SCAN_CACHE[key] = _scan_tbn(path, block_frames)
+    return _SCAN_CACHE[key]
+
+
+def _scan_tbn(path, block_frames=1 << 16):
     """Read only frame headers. Returns a dict describing captures (timetag groups).
 
     Frames are grouped by consecutive (timetag, tuning word). The recording's own
