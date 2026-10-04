@@ -148,7 +148,8 @@ def open_raw_source(path, sweep_frequency, tstart=None, tend=None, offset=0.0, t
     first_utc = reader.utc_at(tstart + skip / fs)
     meta = dict(source_format="tbn", station="lwasv", channel_id_kind="physical_stand",
                 channel_digitizers=(rows + 1).tolist(), tuning_frequency_hz=info["tuning_frequency_hz"],
-                sample_rate_hz=fs, source_tstart_s=float(tstart), first_sweep_utc=first_utc, tbn_reader="native")
+                sample_rate_hz=fs, source_tstart_s=float(tstart), first_sweep_utc=first_utc, tbn_reader="native",
+                ssmif=lwa.SSMIF_PATH or "LSL bundled LWA-SV")
     blocks = reader.read_blocks(rows, tstart, tend - tstart)
     return RawSource(blocks, fs, skip, ch_stands, ch_pols, int(round((tend - tstart) * fs)), meta)
 

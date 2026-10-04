@@ -61,7 +61,7 @@ def pol_indices(pol):
     raise ValueError("--pol must be both, x/y, or 0/1")
 
 
-SSMIF_PATH = os.environ.get("LWA_SSMIF") or None
+SSMIF_PATH = os.path.expanduser(os.environ["LWA_SSMIF"]) if os.environ.get("LWA_SSMIF") else None
 
 
 def use_ssmif(path):
@@ -84,6 +84,8 @@ def _station():
         raise ImportError("LWA-SV station metadata requires LSL; run in your LSL environment") from exc
     if SSMIF_PATH is None:
         return stations.lwasv
+    if not os.path.isfile(SSMIF_PATH):
+        raise FileNotFoundError(f"Station description not found: {SSMIF_PATH} (from --ssmif or $LWA_SSMIF)")
     if SSMIF_PATH.endswith((".tgz", ".tar.gz", ".tar")):
         from lsl.common import metabundle
         return metabundle.get_station(SSMIF_PATH)
