@@ -261,6 +261,11 @@ class RDCView:
             mask &= delay <= d_max
         if not mask.any():
             raise ValueError(f"No delay bins in the requested band; available {delay.min():.3f}-{delay.max():.3f} ms")
+        if d_min is not None or d_max is not None:
+            clipped = (d_min is not None and d_min < delay.min() - 1e-9) or (d_max is not None and d_max > delay.max() + 1e-9)
+            print(f"Delay window: {delay[mask][0]:.3f}-{delay[mask][-1]:.3f} ms ({int(mask.sum())} bins; "
+                  f"{stage.upper()} holds {delay.min():.3f}-{delay.max():.3f} ms"
+                  f"{', request clipped to it' if clipped else ''})", flush=True)
         self.delay_ms = delay[mask]
         self._band = order[mask]
         self._band_stage = stage
@@ -1101,6 +1106,8 @@ class ArrayProcessor:
             self.cable_note = f"{os.path.basename(lwa.SSMIF_PATH) if lwa.SSMIF_PATH else 'LSL LWA-SV'} " \
                               f"at {self.fc / 1e6:.6f} MHz"
         self.calibration = calibration
+        self.station_note = self.cable_note
+        self.calibration_note = None
         if calibration is not None:
             calibration.check_station(lwa.SSMIF_PATH)
             factors, ok = calibration.factors(self.stands, self.pols, self.fc)
@@ -1111,7 +1118,8 @@ class ArrayProcessor:
             self.keep[kept[~ok]] = False
             self.stands, self.pols, self.positions = self.stands[ok], self.pols[ok], self.positions[ok]
             self.cable = self.cable[ok] * factors[ok]
-            self.cable_note += f" + {calibration.describe()}"
+            self.calibration_note = calibration.describe()
+            self.cable_note += f" + self-cal {self.calibration_note}"
         if not len(self.stands):
             raise ValueError("No stands left for array processing")
 

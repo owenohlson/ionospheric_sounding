@@ -61,7 +61,7 @@ def angle_maps(args, processor, cube, power_db, grid, delay_ms, doppler_hz):
         markers.append((paz, pel))
         if isinstance(label, tuple):
             r, c = label
-            label = f"cell {len(maps)}: {delay_ms[r]:.3f} ms, {doppler_hz[c]:.3f} Hz ({len(snaps)} snapshots)"
+            label = f"cell {len(maps)}: {delay_ms[r]:.3f} ms, {doppler_hz[c]:.3f} Hz\n({len(snaps)} snapshots)"
         labels.append(label)
         notes.append(f"Peak {len(maps)}: az {paz:.1f} deg, el {pel:.1f} deg")
     if args.angle_method == "mvdr" and min(len(s) for s, _ in blocks) < 2 * len(processor.positions):
@@ -106,7 +106,9 @@ def run(args, video=False):
                 (az, el), how = processor.look_direction(cube, args.angle_step), "auto"
             looks.append((frame["t0"], frame["t1"], az, el))
             rows += [("Array", f"{len(processor.stands)} stands, pol {'xy'[int(processor.pols[0])]}"),
-                     ("Cable phase", processor.cable_note)]
+                     ("Cable phase", processor.station_note)]
+            if processor.calibration_note:
+                rows.append(("Self-cal", processor.calibration_note))
             if args.beamformer == "incoherent":
                 power = ru.incoherent_power(cube, args.combine)
                 rows.append(("Beamformer", f"incoherent {args.combine}"))

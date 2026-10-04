@@ -43,15 +43,16 @@ def add_info_panel(fig, info_rows=None, notes=None, footer=None):
     if rows:
         cells = [[str(k), ""] if v == "" else ["\n".join(textwrap.wrap(str(k), 13) or [""]),
                                                 "\n".join(textwrap.wrap(str(v), 32) or [""])] for k, v in rows]
-        n = len(cells) + 1
+        lines = [1] + [max(k.count("\n"), v.count("\n")) + 1 for k, v in cells]   # header + wrapped rows
+        n = sum(lines)
         size = 6.4 if n > 24 else (6.9 if n > 18 else 7.5)
         table = ax.table(cellText=cells, colLabels=["Parameter", "Value"], cellLoc="left", colLoc="left",
                          loc="upper left", colWidths=[0.34, 0.66])
         table.auto_set_font_size(False)
         table.set_fontsize(size)
-        height = min(0.045, 0.9 / n)
+        unit = min(0.045, 0.95 / n)
         for (r, c), cell in table.get_celld().items():
-            cell.set_height(height)
+            cell.set_height(unit * (lines[r] if lines[r] == 1 else lines[r] * 0.85 + 0.3))
             cell.set_linewidth(0.35)
             cell.set_edgecolor("#c9c9c9")
             header = r == 0 or (c == 0 and cells[r - 1][1] == "" and cells[r - 1][0])
@@ -224,12 +225,12 @@ def plot_angle_maps(maps, az_deg, el_deg, labels, title, output, range_db=30.0,
     rows_n = int(np.ceil(n / cols))
     fig = plt.figure(figsize=(14, max(5.2, 4.3 * rows_n)))
     left, bottom, width, height = PLOT_RECT
-    w = (width - 0.035 * (cols - 1)) / cols
+    w = (width - 0.08 * (cols - 1)) / cols
     h = (height - 0.09 * (rows_n - 1)) / rows_n
     pcm = None
     for i, m in enumerate(maps):
         r, c = divmod(i, cols)
-        ax = fig.add_axes([left + c * (w + 0.035), bottom + (rows_n - 1 - r) * (h + 0.09), w, h], projection="polar")
+        ax = fig.add_axes([left + c * (w + 0.08), bottom + (rows_n - 1 - r) * (h + 0.09), w, h], projection="polar")
         peak = np.nanmax(m)
         db = 10 * np.log10(np.maximum(m / peak, 1e-30)) if np.isfinite(peak) and peak > 0 else np.full(m.shape, np.nan)
         pcm = ax.pcolormesh(theta, radius, db[::-1], shading="auto", cmap="inferno", vmin=-abs(range_db), vmax=0)
@@ -242,6 +243,7 @@ def plot_angle_maps(maps, az_deg, el_deg, labels, title, output, range_db=30.0,
         ax.set_yticklabels(["90", "60", "30", "0"])
         ax.set_rlabel_position(135)
         ax.grid(color="white", alpha=0.28, lw=0.6)
+        ax.tick_params(labelsize=8.5, pad=1)
         ax.set_title(labels[i] if labels else "", fontsize=9)
     if pcm is not None:
         cb = fig.colorbar(pcm, ax=fig.axes, pad=0.08)

@@ -379,7 +379,7 @@ class ArrayCalibration:
 
     def describe(self):
         name = os.path.basename(str(self.path)) if self.path else "in memory"
-        return f"self-cal {name} ({int(np.sum(~self.flagged))} stands, {int(np.sum(self.flagged))} flagged)"
+        return f"{name} ({int(np.sum(~self.flagged))} stands, {int(np.sum(self.flagged))} flagged)"
 
     def check_station(self, ssmif_path):
         """Warn when the file was made with a different station description."""
