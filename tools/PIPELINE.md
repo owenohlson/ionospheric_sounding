@@ -186,16 +186,26 @@ The spectrogram estimate confirms the sweep rate and bandwidth. The full-delay
 profile shows where the echoes are. Then choose `--d-min/--d-max`, and
 `--offset` if the echoes sit far into the sweep (see "Sweep offset").
 
-### 3. Export the session
+### 3. Export the session (RDC1)
 
 ```bash
-python tools/export_rdc2.py raw.dat --sweep-frequency 2 --bandwidth=-99.259377e3 \
+python tools/export_rdc1.py raw.dat --sweep-frequency 2 --bandwidth=-99.259377e3 \
     --pol both --bad-stands status --gap-fill zero --d-min 12 --d-max 20 \
-    --integration-time 120 --hop-time 30 --output s13p5_rdc2.h5 --dry-run   # size check
+    --output s13p5_rdc1.h5 --dry-run        # prints the size; run again without --dry-run
 ```
 
-Run it again without `--dry-run`. The RDC2 file keeps the per-sweep RDC1, so
-every later plot can change integration/hop without re-reading the raw file.
+RDC1 is the product to keep. Every later step computes its Doppler frames from
+it with whatever `--integration-time/--hop-time` it is given: delay-Doppler plots
+and videos, Doppler-time, calibration and RDC3. Each frame reads only its own
+sweeps, so memory stays at about one frame. In the commands below,
+`s13p5_rdc1.h5` can be replaced by an RDC2 file; the commands are the same.
+
+`export_rdc2.py` is optional. It also stores one set of Doppler frames (its
+`--integration-time/--hop-time`) as a cache. That saves the FFTs when the same
+frames are plotted many times, at the cost of size: overlapping frames are
+stored several times over, zero-padded to `nfft`. Plots use the cache only when
+their settings match it, and otherwise recompute from the RDC1 the file keeps.
+With `--no-keep-rdc1` the cache is all there is, and integration/hop are fixed.
 
 **Size (float32, uncompressed; gzip saves little on noisy data):**
 
@@ -210,19 +220,12 @@ every later plot can change integration/hop without re-reading the raw file.
 
 For one 15-minute file with all 520 inputs:
 
-| Window | RDC1 only (`export_rdc1.py`) | RDC2 120 s/30 s + RDC1 |
+| Window | RDC1 (`export_rdc1.py`) | RDC1 + RDC2 cache at 120 s/30 s |
 | --- | --- | --- |
 | 3 ms | 2.2 GB | 11 GB |
 | 10 ms | 7.4 GB | 36 GB |
 | 22 ms | 16 GB | 80 GB |
 | 108 ms | 80 GB | — |
-
-To shrink it:
-* narrow the delay window (the biggest lever);
-* use `--no-keep-rdc1`, which fixes integration/hop for good;
-* use non-overlapping frames (`--hop-time` = `--integration-time`);
-* export RDC1 only, since plots and calibration recompute Doppler from it;
-* crop Doppler with `--fd-min/--fd-max`.
 
 `--dtype float16` is exact for RDC0 only: dechirped values exceed its range, and
 the export stops with an error if they do.
@@ -233,24 +236,26 @@ the export stops with an error if they do.
 the first stand. `--pol x|y|both` selects polarizations.
 
 ```bash
-python tools/plot_dechirp.py s13p5_rdc2.h5 --stands all --navg 4 --output dechirp.png        # delay vs time
-python tools/plot_power_delay.py s13p5_rdc2.h5 --stands all --output pdp.png
-python tools/plot_doppler_time.py s13p5_rdc2.h5 --stands all --integration-time 60 --hop-time 10 --output dt.png
-python tools/plot_delay_doppler.py s13p5_rdc2.h5 --stands all --output dd.png                # first frame
-python tools/sliding_delay_doppler.py s13p5_rdc2.h5 --stands all --output dd_video           # every frame
-python tools/plot_phase_doppler.py s13p5_rdc2.h5 --stands all --kind doppler-time --output pd.png
-python tools/sliding_phase_doppler.py s13p5_rdc2.h5 --stands all --output pd_video
+python tools/plot_dechirp.py s13p5_rdc1.h5 --stands all --navg 4 --output dechirp.png        # delay vs time
+python tools/plot_power_delay.py s13p5_rdc1.h5 --stands all --output pdp.png
+python tools/plot_doppler_time.py s13p5_rdc1.h5 --stands all --integration-time 60 --hop-time 10 --output dt.png
+python tools/plot_delay_doppler.py s13p5_rdc1.h5 --stands all --tstart 0 --tend 120 --output dd.png
+python tools/sliding_delay_doppler.py s13p5_rdc1.h5 --stands all --integration-time 120 --hop-time 30 \
+    --output dd_video
+python tools/plot_phase_doppler.py s13p5_rdc1.h5 --stands all --kind doppler-time --output pd.png
+python tools/sliding_phase_doppler.py s13p5_rdc1.h5 --stands all --output pd_video
 ```
 
-Delay-Doppler plots use the stored 120 s / 30 s frames. Passing
-`--integration-time/--hop-time` recomputes the frames from the retained RDC1.
+Delay-Doppler plots and videos default to one frame over the whole selection;
+give `--integration-time/--hop-time` (e.g. 120 / 30) for sliding frames, and
+`--tstart/--tend` to restrict the time range.
 
 ### 5. Calibrate the array (once per file and polarization)
 
 ```bash
-python tools/calibrate_array.py s13p5_rdc2.h5 --pol x --integration-time 10 --hop-time 10 \
+python tools/calibrate_array.py s13p5_rdc1.h5 --pol x --integration-time 10 --hop-time 10 \
     --output cal_s13p5_x.h5 --csv cal_s13p5_x.csv
-python tools/calibrate_array.py s13p5_rdc2.h5 --pol y --integration-time 10 --hop-time 10 \
+python tools/calibrate_array.py s13p5_rdc1.h5 --pol y --integration-time 10 --hop-time 10 \
     --output cal_s13p5_y.h5
 ```
 
@@ -262,23 +267,24 @@ python tools/calibrate_array.py s13p5_rdc2.h5 --pol y --integration-time 10 --ho
 * Each polarization needs its own file.
 * For an independent check, calibrate on one time range (`--tend 300`) and test
   another:
-  `check_array_calibration.py s13p5_rdc2.h5 --tstart 300 --calibration cal.h5`.
+  `check_array_calibration.py s13p5_rdc1.h5 --tstart 300 --calibration cal.h5`.
 
 ### 6. Array plots (one polarization, calibrated)
 
 ```bash
 # sliding array delay-Doppler: beam re-aimed each frame at the strongest echo
-python tools/sliding_delay_doppler.py s13p5_rdc2.h5 --pol x --beamformer conventional \
-    --calibration cal_s13p5_x.h5 --output dd_beam_video
+python tools/sliding_delay_doppler.py s13p5_rdc1.h5 --pol x --beamformer conventional \
+    --calibration cal_s13p5_x.h5 --integration-time 120 --hop-time 30 --output dd_beam_video
 # ... plus sliding sky (angle) maps: whole window, or the N strongest cells per frame
-python tools/sliding_delay_doppler.py s13p5_rdc2.h5 --pol x --beamformer conventional \
-    --calibration cal_s13p5_x.h5 --angle-output sky_video --angle-cells 4 --output dd_beam_video
+python tools/sliding_delay_doppler.py s13p5_rdc1.h5 --pol x --beamformer conventional \
+    --calibration cal_s13p5_x.h5 --integration-time 120 --hop-time 30 \
+    --angle-output sky_video --angle-cells 4 --output dd_beam_video
 # fixed beam instead of auto-aim; MVDR; beam pattern
-python tools/plot_delay_doppler.py s13p5_rdc2.h5 --pol x --beamformer mvdr --look-az -86 --look-el 22 \
+python tools/plot_delay_doppler.py s13p5_rdc1.h5 --pol x --beamformer mvdr --look-az -86 --look-el 22 --tend 120 \
     --calibration cal_s13p5_x.h5 --beam-pattern-output bp.png --output dd_mvdr.png
 # stored beams for later (RDC3)
-python tools/export_rdc3.py s13p5_rdc2.h5 --pol x --calibration cal_s13p5_x.h5 --look -86,22 \
-    --output s13p5_rdc3.h5
+python tools/export_rdc3.py s13p5_rdc1.h5 --pol x --calibration cal_s13p5_x.h5 --look -86,22 \
+    --integration-time 120 --hop-time 30 --output s13p5_rdc3.h5
 ```
 
 Auto-aimed videos write `look_directions.csv` (az/el per frame) into the

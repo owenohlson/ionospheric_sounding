@@ -192,6 +192,8 @@ EXPORT_HELP = {
     "rdc0": "Cut a raw TBN/WAV recording into sweeps: RDC0 (adc, pulses, channels).",
     "rdc1": "Dechirp + range FFT: RDC1 (delay, pulses, channels). Input: raw recording or RDC0.",
     "rdc2": "Doppler FFT: RDC2 (frames, delay, doppler, channels), keeping the RDC1 it came from. "
+            "Optional: plots and calibration compute frames from RDC1 with any integration/hop, so the "
+            "stored frames are only a cache of one setting (overlapping frames multiply the size). "
             "Input: raw recording, RDC0, RDC1, or an RDC2 that retained RDC1.",
     "rdc2p": "Phase-derived Doppler: RDC2P (delay, estimates, channels) of sweep-to-sweep lag products. "
              "Input: raw recording, RDC0 or RDC1.",

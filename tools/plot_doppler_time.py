@@ -23,11 +23,10 @@ def main():
     cli.validate(p, args)
     view = cli.view_from_args(args)
     delay = view.select_delay(args.d_min, args.d_max, args.full_delay)
-    rdc1, gaps, times = view.rdc1()
     integration = args.integration_time or view.meta.get("integration_time_s") or 60.0
     hop = args.hop_time or view.meta.get("hop_time_s") or 10.0
     window = args.slow_window or view.meta.get("slow_window") or "hann"
-    t, fd, power = ru.doppler_time(rdc1, view.prf, integration, hop, window, args.nfft_doppler, args.combine)
+    t, fd, power, gaps, times = view.doppler_time(integration, hop, window, args.nfft_doppler, args.combine)
     keep = ru.range_mask(fd, args.fd_min, args.fd_max, "Doppler")
     rows = view.info_rows(times[0], times[-1] + 1 / view.prf) + [
         ("Delay band", f"{delay[0]:.3f}-{delay[-1]:.3f} ms"), ("Integration", f"{integration:g} s"),

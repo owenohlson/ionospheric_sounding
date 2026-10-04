@@ -78,6 +78,25 @@ class PipelineTests(unittest.TestCase):
         quiet(v.select_delay)
         self.assertEqual(next(v.rdc2_frames(8, 4))["cube"].shape[0], v.delay_ms.size)
 
+    def test_streamed_plot_products_match_in_memory_math(self):
+        """Frames, Doppler-time and summed power are streamed by channel chunk / frame; same numbers."""
+        quiet(ru.export, self.r0, "rdc1", self.d / "s1.h5", ru.ExportSettings(d_min=5, d_max=30))
+        v = ru.RDCView(self.d / "s1.h5")
+        quiet(v.select_delay, 5, 30)
+        rdc1, _, times = v.rdc1()
+        for combine in ("incoherent", "coherent", "peak"):
+            t1, _, p1 = ru.doppler_time(rdc1, v.prf, 4, 2, "hann", None, combine)
+            t2, _, p2, _, _ = v.doppler_time(4, 2, "hann", None, combine)
+            np.testing.assert_allclose(p2, p1, rtol=1e-4)
+            np.testing.assert_allclose(t2, t1)
+        np.testing.assert_allclose(v.rdc1_power()[0], ru.incoherent_power(rdc1), rtol=1e-5)
+        count = int(4 * v.prf)
+        for i, frame in enumerate(v.rdc2_frames(4, 2)):
+            s = 2 * i * int(v.prf)
+            expect, _ = lfm.doppler_fft(rdc1[:, s:s + count], v.prf, "hann", None)
+            np.testing.assert_allclose(frame["cube"], expect, rtol=1e-4, atol=1e-3)
+            self.assertAlmostEqual(frame["t0"], times[s])
+
     def test_rdc2_matches_manual_math(self):
         quiet(ru.export, self.r0, "rdc2", self.d / "r2.h5", ru.ExportSettings(d_min=10, d_max=20, integration_time=10))
         f = rdc_io.RDCFile(self.d / "r2.h5")

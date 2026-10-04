@@ -22,8 +22,8 @@ def main():
     cli.validate(p, args)
     view = cli.view_from_args(args)
     delay = view.select_delay(args.d_min, args.d_max, args.full_delay)
-    rdc1, gaps, times = view.rdc1()
-    power = ru.incoherent_power(rdc1).T                     # (pulses, delay)
+    power, gaps, times = view.rdc1_power()
+    power = power.T                                          # (pulses, delay)
     n = (power.shape[0] // args.navg) * args.navg
     if n == 0:
         p.error("--navg exceeds the number of sweeps")

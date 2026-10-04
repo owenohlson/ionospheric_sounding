@@ -345,7 +345,11 @@ class RDCView:
         yield from self._iter_pulse_stage(stage, channels, first, last, self._stage_band(stage))
 
     def rdc1(self):
-        """(delay, pulses, channels) for the whole selection, plus per-sweep gap flags and time axis."""
+        """(delay, pulses, channels) for the whole selection, plus per-sweep gap flags and time axis.
+
+        Loads everything into memory; plots use the streaming ``rdc1_power`` /
+        ``doppler_time`` / ``rdc2_frames`` instead.
+        """
         blocks, invalid = [], []
         for _, _, block, inv in self.iter_rdc1():
             blocks.append(block)
@@ -353,6 +357,64 @@ class RDCView:
         first, last, origin = self.pulse_range()
         times = origin + np.arange(first, last) / self.prf
         return np.concatenate(blocks, axis=2), np.any(np.concatenate(invalid, axis=1) > 0, axis=1), times
+
+    def rdc1_power(self, skip_nan=True):
+        """Channel-summed power (delay, pulses), per-sweep gap flags and times, streamed by channel chunk.
+
+        ``skip_nan``: NaN samples (gap fill "nan") are left out of the sum; otherwise they propagate.
+        """
+        total, gaps = None, None
+        for _, _, block, inv in self.iter_rdc1():
+            p = np.abs(block) ** 2
+            p = np.nansum(p, axis=2) if skip_nan else np.sum(p, axis=2)
+            total = p if total is None else total + p
+            g = np.any(inv > 0, axis=1)
+            gaps = g if gaps is None else gaps | g
+        first, last, origin = self.pulse_range()
+        return total, gaps, origin + np.arange(first, last) / self.prf
+
+    def doppler_time(self, integration, hop, window="hann", nfft=None, combine="incoherent"):
+        """Doppler spectra of the delay band vs time, streamed by channel chunk (see ``doppler_time``)."""
+        first, last, origin = self.pulse_range()
+        n = last - first
+        count, stride = int(round(integration * self.prf)), int(round(hop * self.prf))
+        if count < 1 or stride < 1 or count > n:
+            raise ValueError(f"Integration must cover 1..{n} sweeps and hop at least one sweep")
+        starts = np.arange(0, n - count + 1, stride)
+        nfft = lfm.default_nfft(count) if nfft is None else int(nfft)
+        acc = coh = tot = gaps = None
+        n_ch = 0
+        for _, _, block, inv in self.iter_rdc1():
+            n_ch += block.shape[2]
+            g = np.any(inv > 0, axis=1)
+            gaps = g if gaps is None else gaps | g
+            if combine == "coherent":
+                c = np.sum(block, axis=2)
+                coh = c if coh is None else coh + c
+                continue
+            if acc is None:
+                acc = np.zeros((len(starts), block.shape[0], nfft))
+                tot = np.zeros(block.shape[:2])
+            tot += np.sum(np.abs(block) ** 2, axis=2)
+            for i, s0 in enumerate(starts):
+                X, fd = lfm.doppler_fft(block[:, s0:s0 + count], self.prf, window, nfft)
+                acc[i] += np.sum(np.abs(X) ** 2, axis=2)
+        fd = lfm.doppler_axis_hz(nfft, self.prf)
+        if combine == "coherent":
+            power = []
+            for s0 in starts:
+                X, _ = lfm.doppler_fft(coh[:, s0:s0 + count, None], self.prf, window, nfft)
+                power.append(np.sum(np.abs(X[..., 0]) ** 2, axis=0) / n_ch)
+            power = np.array(power)
+        elif combine == "incoherent":
+            power = acc.mean(axis=1)
+        elif combine == "peak":
+            power = np.array([acc[i][int(np.argmax(tot[:, s0:s0 + count].sum(axis=1)))]
+                              for i, s0 in enumerate(starts)])
+        else:
+            raise ValueError("combine must be incoherent, coherent or peak")
+        times = origin + np.arange(first, last) / self.prf
+        return (starts + count / 2.0) / self.prf, fd, power, gaps, times
 
     # -- Doppler frames ---------------------------------------------------------
     def stored_rdc2_matches(self, integration=None, hop=None, window=None, nfft=None):
@@ -387,8 +449,9 @@ class RDCView:
         window = window or self.meta.get("slow_window") or "hann"
         if window in ("synthetic_rdc2_direct", "unknown"):
             window = "hann"
-        rdc1, gaps, times = self.rdc1()
-        n = rdc1.shape[1]
+        stage = self.pulse_source()
+        first, last, origin = self.pulse_range(stage)
+        n = last - first
         count = n if integration is None else int(round(integration * self.prf))
         stride = count if hop is None else int(round(hop * self.prf))
         if count < 1 or stride < 1 or count > n:
@@ -396,10 +459,17 @@ class RDCView:
         nfft = lfm.default_nfft(count) if nfft is None else int(nfft)
         fd = lfm.doppler_axis_hz(nfft, self.prf)
         keep = range_mask(fd, fd_min, fd_max, "Doppler")
+        band = self._stage_band(stage)
         for i, s in enumerate(range(0, n - count + 1, stride)):
-            cube, _ = lfm.doppler_fft(rdc1[:, s:s + count], self.prf, window, nfft)
-            yield dict(index=i, t0=float(times[s]), t1=float(times[s] + count / self.prf),
-                       cube=cube[:, keep], doppler_hz=fd[keep], gaps=bool(gaps[s:s + count].any()),
+            parts, bad = [], False                       # read only this frame's sweeps (bounded memory)
+            for _, _, block, inv in self._iter_pulse_stage(stage, self.channels[stage], first + s,
+                                                           first + s + count, band):
+                parts.append(block)
+                bad = bad or bool(np.any(inv > 0))
+            cube, _ = lfm.doppler_fft(np.concatenate(parts, axis=2), self.prf, window, nfft)
+            yield dict(index=i, t0=float(origin + (first + s) / self.prf),
+                       t1=float(origin + (first + s + count) / self.prf),
+                       cube=cube[:, keep], doppler_hz=fd[keep], gaps=bad,
                        integration=count / self.prf, hop=stride / self.prf, window=window, nfft=nfft)
 
     def _stored_frames(self, stage, fd_min=None, fd_max=None):

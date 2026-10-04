@@ -21,8 +21,7 @@ def main():
     cli.validate(p, args)
     view = cli.view_from_args(args)
     delay = view.select_delay(args.d_min, args.d_max, args.full_delay)
-    rdc1, gaps, times = view.rdc1()
-    power = np.sum(np.abs(rdc1) ** 2, axis=2)                # (delay, pulses)
+    power, gaps, times = view.rdc1_power(skip_nan=False)    # (delay, pulses); sweeps with NaN are left out below
     power_db = ru.to_db(np.nanmean(np.where(np.isfinite(power), power, np.nan), axis=1))
     rows = view.info_rows(times[0], times[-1] + 1 / view.prf) + [("Sweeps", str(len(times)))]
     plots.plot_power_delay(delay, power_db, args.title or "Power-delay profile", args.output, args.vmin, args.vmax,
