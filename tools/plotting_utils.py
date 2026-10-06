@@ -208,11 +208,14 @@ def plot_phase_doppler_frame(fd_hz, delay_ms, power_db, fd_lim, title, output=No
 
 
 def plot_angle_maps(maps, az_deg, el_deg, labels, title, output, range_db=30.0,
-                    info_rows=None, notes=None, footer=None, markers=None):
+                    info_rows=None, notes=None, footer=None, markers=None, annotations=None, side_lines=None):
     """Polar sky maps (north up, east right, zenith at centre), each normalised to its own peak.
 
     ``maps`` is a list of (el, az) linear power arrays. ``markers`` optionally gives
-    one (az, el) refined peak per map, drawn as a cross.
+    one (az, el) refined peak per map, drawn as a cross. ``annotations`` optionally
+    gives per map ``None`` or ``dict(label=str, points=[(az, el), ...])``: the label
+    is written at the cross and the points (e.g. station bearings) are drawn as
+    small triangles. ``side_lines`` adds a text panel on the right.
     """
     az_deg = np.asarray(az_deg, float)
     el_deg = np.asarray(el_deg, float)
@@ -223,8 +226,8 @@ def plot_angle_maps(maps, az_deg, el_deg, labels, title, output, range_db=30.0,
     n = len(maps)
     cols = min(3, n)
     rows_n = int(np.ceil(n / cols))
-    fig = plt.figure(figsize=(14, max(5.2, 4.3 * rows_n)))
-    left, bottom, width, height = PLOT_RECT
+    fig = plt.figure(figsize=(18 if side_lines else 14, max(5.2, 4.3 * rows_n)))
+    left, bottom, width, height = [0.255, PLOT_RECT[1], 0.46, PLOT_RECT[3]] if side_lines else PLOT_RECT
     w = (width - 0.08 * (cols - 1)) / cols
     h = (height - 0.09 * (rows_n - 1)) / rows_n
     pcm = None
@@ -236,6 +239,14 @@ def plot_angle_maps(maps, az_deg, el_deg, labels, title, output, range_db=30.0,
         pcm = ax.pcolormesh(theta, radius, db[::-1], shading="auto", cmap="inferno", vmin=-abs(range_db), vmax=0)
         if markers is not None and markers[i] is not None:
             ax.plot(np.deg2rad(markers[i][0]), 90 - markers[i][1], "c+", ms=10, mew=1.5)
+        note = annotations[i] if annotations is not None and i < len(annotations) else None
+        if note:
+            for paz, pel in note.get("points", []):
+                ax.plot(np.deg2rad(paz), 90 - pel, marker="^", ms=4, color="white", mec="black", mew=0.4, ls="none")
+            if markers is not None and markers[i] is not None and note.get("label"):
+                ax.annotate("\n".join(textwrap.wrap(note["label"], 22)), (np.deg2rad(markers[i][0]), 90 - markers[i][1]),
+                            xytext=(8, 8), textcoords="offset points", fontsize=7, color="white",
+                            bbox={"facecolor": "black", "alpha": 0.6, "edgecolor": "none", "pad": 1.5})
         ax.set_theta_zero_location("N")
         ax.set_theta_direction(-1)
         ax.set_rlim(0, 90)
@@ -246,8 +257,14 @@ def plot_angle_maps(maps, az_deg, el_deg, labels, title, output, range_db=30.0,
         ax.tick_params(labelsize=8.5, pad=1)
         ax.set_title(labels[i] if labels else "", fontsize=9)
     if pcm is not None:
-        cb = fig.colorbar(pcm, ax=fig.axes, pad=0.08)
+        if side_lines:
+            cb = fig.colorbar(pcm, cax=fig.add_axes([left + width + 0.02, bottom, 0.01, height]))
+        else:
+            cb = fig.colorbar(pcm, ax=fig.axes, pad=0.08)
         cb.set_label("Power relative to map peak [dB]")
+    if side_lines:
+        fig.text(left + width + 0.075, bottom + height, "\n".join(side_lines), ha="left", va="top",
+                 fontsize=6.6, family="monospace")
     fig.suptitle(title)
     add_info_panel(fig, info_rows, notes, footer)
     return save(fig, output)

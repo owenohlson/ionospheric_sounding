@@ -51,6 +51,7 @@ path.
 | `rdc_io.py` | HDF5 layout: `RDCFile` reader (all stages, legacy formats), `StageWriter`, metadata/history, atomic output |
 | `rdc_utils.py` | Stage-to-stage processing: channel selection, sweep packing, `RDCView` (brings any stored stage to the product a plot needs), exports, array processing (`ArrayProcessor`, covariance, steering, angle spectra, beam pattern), plot reductions |
 | `calibration_utils.py` | Array self-calibration: plane-wave fit, phase-gain estimation (alternating fit, ramp kept out), held-out validation, the calibration file (`ArrayCalibration`) |
+| `codar_stations.py` | HF radar source identification: HFRnet station tables, bearings and sky-wave geometry from the station, waveform/band/date filters, the labelling rule |
 | `plotting_utils.py` | Figures only (arrays → PNG) and video assembly |
 | `cli.py` | Shared command-line flag groups and the export command line |
 
@@ -286,6 +287,47 @@ python tools/plot_delay_doppler.py s13p5_rdc1.h5 --pol x --beamformer mvdr --loo
 python tools/export_rdc3.py s13p5_rdc1.h5 --pol x --calibration cal_s13p5_x.h5 --look -86,22 \
     --integration-time 120 --hop-time 30 --output s13p5_rdc3.h5
 ```
+
+**Naming the HF radar behind a peak.** Add `--codar-stations TABLE.csv [TABLE2.csv ...]`
+(HFRnet station-list exports) to any sky-map command. The sky map then makes
+room for a panel on the right that lists, for each peak, the candidate stations
+with their bearing, azimuth error and distance, and the sky-wave path that fits
+the elevation. Peaks that can be named get a label and small triangles at the
+stations' bearings:
+
+```bash
+python tools/sliding_delay_doppler.py s13p5_rdc1.h5 --pol x --beamformer conventional \
+    --calibration cal_s13p5_x.h5 --integration-time 120 --hop-time 30 --angle-output sky_video \
+    --angle-cells 4 --codar-stations data/HFRnet-station-list-*.csv --output dd_beam_video
+```
+
+How a station is chosen:
+
+1. **Active:** it was added before the observation date and still produced
+   radials then.
+2. **Waveform:** it uses the same sweep rate and signed bandwidth as the dechirp.
+   Other sweeps do not compress into echoes.
+3. **Band:** at least half of its sweep band falls inside the receive band.
+4. **Direction:** its bearing is within `--station-az-tol` (default 4°) of the
+   peak's azimuth, and the peak's elevation fits a 1–3 hop path reflecting at
+   90–450 km.
+
+A label is given only when every other candidate fits at least 3° worse in
+azimuth. The label is one station, or one network when several of its
+GPS-synchronised stations fit equally well. Anything else is listed as
+ambiguous and not drawn.
+
+Several table snapshots can be given, because the configuration on the
+observation date is not recorded. Each distinct configuration is a candidate.
+Delay cannot help: our delays are relative to our own sweep timing, and the
+tables list no sweep offsets.
+
+On 2023-12-09 at 13.5 MHz:
+
+* the echoes near az −84°, el 19° are the SLO network (ARG1, DCSR, ESTR, FBK1,
+  LUIS, PTC1, about 1,260 km away; 1 hop at a virtual height of about 260 km);
+* those near az −92° are USC (SCCI, SCDH, about 1,070 km away);
+* the interferer at az −65° matches no station.
 
 Auto-aimed videos write `look_directions.csv` (az/el per frame) into the
 `--output` directory. Sky maps are in dB relative to their own peak

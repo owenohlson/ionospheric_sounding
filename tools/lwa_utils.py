@@ -103,6 +103,17 @@ def lwasv_antennas():
     return result
 
 
+LWASV_LOCATION = (34.348358, -106.885783, 1477.8)   # GEO_N, GEO_E, GEO_EL of the bundled SSMIF
+
+
+def station_location():
+    """(latitude [deg N], longitude [deg E], elevation [m]) of the station from the SSMIF in use."""
+    st = _station()
+    if all(hasattr(st, k) for k in ("lat", "long", "elev")):
+        return float(np.degrees(st.lat)), float(np.degrees(st.long)), float(st.elev)
+    return LWASV_LOCATION
+
+
 def station_stands():
     return sorted({stand for stand, _ in lwasv_antennas()})
 

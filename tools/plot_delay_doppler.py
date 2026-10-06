@@ -13,6 +13,7 @@ processing uses all stands.
 
 import csv
 import os
+from datetime import timedelta
 
 import numpy as np
 
@@ -41,6 +42,40 @@ def frame_rows(frame):
         rows.append(("Hop", f"{float(frame['hop']):.3f} s"))
     rows += [("Slow window", str(frame.get("window"))), ("Doppler FFT", str(frame.get("nfft")))]
     return rows
+
+
+def station_context(args, view):
+    """Station tables and receiver description for --codar-stations, or None."""
+    if not getattr(args, "codar_stations", None):
+        return None
+    import codar_stations as cs
+    import lwa_utils
+    if not view.bandwidth or not view.fs or not view.fc:
+        raise ValueError("--codar-stations needs the sweep bandwidth, sample rate and tuning of the input")
+    lat, lon, _ = lwa_utils.station_location()
+    stations = cs.load_tables(args.codar_stations)
+    return dict(cs=cs, stations=stations, lat=lat, lon=lon, view=view)
+
+
+def identify_sources(ctx, frame_t0, markers, args):
+    """Per sky-map peak: annotation dict (or None) and side-panel lines."""
+    cs, view = ctx["cs"], ctx["view"]
+    zero = view.file.time_zero_utc
+    when = (zero + timedelta(seconds=float(frame_t0))).date() if zero else None
+    rx = cs.Receiver(ctx["lat"], ctx["lon"], float(view.fc), float(view.fs), float(view.prf),
+                     float(view.bandwidth), when)
+    cands = cs.candidates(ctx["stations"], rx)
+    lines = cs.panel_header(rx, cands, len(ctx["stations"]), args.codar_stations)
+    annotations = []
+    for i, (az, el) in enumerate(markers):
+        ident = cs.identify(az, el, cands, rx, az_tol=args.station_az_tol)
+        lines += ["", f"Map {i + 1}: az {az:.1f}, el {el:.1f} deg"] + cs.describe(ident)
+        if ident.confident:
+            pts = [(m.bearing_deg, el) for m in ident.matches if m.passed]
+            annotations.append(dict(label=ident.label, points=pts))
+        else:
+            annotations.append(None)
+    return annotations, lines
 
 
 def angle_maps(args, processor, cube, power_db, grid, delay_ms, doppler_hz):
@@ -87,6 +122,7 @@ def run(args, video=False):
                                       "conventional" if args.beamformer == "incoherent" else args.beamformer,
                                       args.cable_correction, view.meta, args.diagonal_loading,
                                       calibration=cli.load_calibration(args))
+    stations = station_context(args, view) if processor is not None and args.angle_output else None
     grid = (np.arange(-180, 180, args.angle_step), np.arange(0, 90 + 0.5 * args.angle_step, args.angle_step))
     title = args.title or ("Delay-Doppler" + (f" ({args.beamformer} beam)" if array and args.beamformer != "incoherent" else ""))
     dd_video = plots.FrameVideo(args.output, "delay_doppler", args.framerate, args.keep_frames) if video else None
@@ -135,8 +171,9 @@ def run(args, video=False):
         if processor is not None and args.angle_output:
             maps, labels, markers, anotes = angle_maps(args, processor, cube, power_db, grid, delay, fd)
             path = angle_video.next_path() if video else args.angle_output
+            annotations, side = identify_sources(stations, frame["t0"], markers, args) if stations else (None, None)
             plots.plot_angle_maps(maps, grid[0], grid[1], labels, f"Sky map ({args.angle_method})", path,
-                                  args.angle_range_db, rows, anotes, footer, markers)
+                                  args.angle_range_db, rows, anotes, footer, markers, annotations, side)
         if processor is not None and args.beam_pattern_output and len(looks) == 1:
             az, el = looks[0][2:]
             pattern = ru.beam_pattern(processor.positions, processor.fc, az, el, *grid)
