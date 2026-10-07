@@ -46,14 +46,14 @@ def frame_rows(frame):
 
 def station_context(args, view):
     """Station tables and receiver description for --codar-stations, or None."""
-    if not getattr(args, "codar_stations", None):
+    if getattr(args, "codar_stations", None) is None:
         return None
     import codar_stations as cs
     import lwa_utils
     if not view.bandwidth or not view.fs or not view.fc:
         raise ValueError("--codar-stations needs the sweep bandwidth, sample rate and tuning of the input")
     lat, lon, _ = lwa_utils.station_location()
-    stations = cs.load_tables(args.codar_stations)
+    stations = cs.load_tables(args.codar_stations or None)      # bare flag: built-in table
     return dict(cs=cs, stations=stations, lat=lat, lon=lon, view=view)
 
 
@@ -65,7 +65,7 @@ def identify_sources(ctx, frame_t0, markers, args):
     rx = cs.Receiver(ctx["lat"], ctx["lon"], float(view.fc), float(view.fs), float(view.prf),
                      float(view.bandwidth), when)
     cands = cs.candidates(ctx["stations"], rx)
-    lines = cs.panel_header(rx, cands, len(ctx["stations"]), args.codar_stations)
+    lines = cs.panel_header(rx, cands, len(ctx["stations"]), args.codar_stations or None)
     annotations = []
     for i, (az, el) in enumerate(markers):
         ident = cs.identify(az, el, cands, rx, az_tol=args.station_az_tol)

@@ -70,6 +70,25 @@ class StationTests(unittest.TestCase):
         self.assertEqual(cs.identify(-85.0, 75.0, cands, self.rx).status, "none")   # no sky-wave path fits
 
 
+    def test_builtin_table_and_merging(self):
+        builtin = cs.load_tables()                              # no paths: the table shipped with the code
+        self.assertGreater(len(builtin), 200)
+        rx = cs.Receiver(*LWASV, 13.5e6, 100e3, 2.0, -99.259377e3, date(2023, 12, 9))
+        cands = cs.candidates(builtin, rx)
+        self.assertEqual(cs.identify(-84.0, 19.0, cands, rx).label, "SLO: ARG1/DCSR/ESTR/FBK1/LUIS/PTC1")
+        self.assertEqual(cs.identify(-92.0, 23.0, cands, rx).label, "USC: SCCI/SCDH")
+        table = Path(self.tmp.name) / "merged.csv"
+        before, after = cs.merge_into_builtin([str(Path(self.tmp.name) / "a.csv")], str(table))
+        self.assertEqual((before, after), (0, 8))
+        before, after = cs.merge_into_builtin([str(Path(self.tmp.name) / "b.csv")], str(table))
+        self.assertEqual((before, after), (8, 9))               # ARG1's newer configuration is added
+        again = cs.merge_into_builtin([str(Path(self.tmp.name) / "b.csv")], str(table))
+        self.assertEqual(again, (9, 9))                         # merging is idempotent
+        arg1 = [c for c in cs.load_tables([str(table)]) if c.code == "ARG1"]
+        self.assertEqual(sorted(c.sources for c in arg1), [("a",), ("b",)])
+        both = [c for c in cs.load_tables([str(table)]) if c.code == "PTC1"][0]
+        self.assertEqual(both.sources, ("a", "b"))
+
     def test_sky_map_with_station_labels(self):
         import contextlib
         import io
@@ -93,6 +112,9 @@ class StationTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 plot_delay_doppler.run(args)
         self.assertTrue(out.exists())
+        bare = plot_delay_doppler.build_parser().parse_args([str(Path(self.tmp.name) / "a.h5"), "--output", "x.png",
+                                                             "--codar-stations"])
+        self.assertEqual(bare.codar_stations, [])               # bare flag -> built-in table
         # the synthetic file has no UTC, so no date filter: NEW1 (added later) stays a candidate
         self.assertEqual(annotations[0]["label"], "SLO: ARG1/NEW1/PTC1")
         self.assertTrue(any("unknown date" in line for line in lines))

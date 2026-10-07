@@ -51,7 +51,7 @@ path.
 | `rdc_io.py` | HDF5 layout: `RDCFile` reader (all stages, legacy formats), `StageWriter`, metadata/history, atomic output |
 | `rdc_utils.py` | Stage-to-stage processing: channel selection, sweep packing, `RDCView` (brings any stored stage to the product a plot needs), exports, array processing (`ArrayProcessor`, covariance, steering, angle spectra, beam pattern), plot reductions |
 | `calibration_utils.py` | Array self-calibration: plane-wave fit, phase-gain estimation (alternating fit, ramp kept out), held-out validation, the calibration file (`ArrayCalibration`) |
-| `codar_stations.py` | HF radar source identification: HFRnet station tables, bearings and sky-wave geometry from the station, waveform/band/date filters, the labelling rule |
+| `codar_stations.py` | HF radar source identification: the built-in HFRnet station table (`hfrnet_stations.csv`, updated with `--add`), bearings and sky-wave geometry from the station, waveform/band/date filters, the labelling rule |
 | `plotting_utils.py` | Figures only (arrays → PNG) and video assembly |
 | `cli.py` | Shared command-line flag groups and the export command line |
 
@@ -288,17 +288,28 @@ python tools/export_rdc3.py s13p5_rdc1.h5 --pol x --calibration cal_s13p5_x.h5 -
     --integration-time 120 --hop-time 30 --output s13p5_rdc3.h5
 ```
 
-**Naming the HF radar behind a peak.** Add `--codar-stations TABLE.csv [TABLE2.csv ...]`
-(HFRnet station-list exports) to any sky-map command. The sky map then makes
-room for a panel on the right that lists, for each peak, the candidate stations
-with their bearing, azimuth error and distance, and the sky-wave path that fits
-the elevation. Peaks that can be named get a label and small triangles at the
-stations' bearings:
+**Naming the HF radar behind a peak.** Add `--codar-stations` to any sky-map
+command. It uses the HFRnet station table that ships with the code
+(`tools/hfrnet_stations.csv`); give CSV paths after the flag to use other tables
+instead. The sky map then makes room for a panel on the right that lists, for
+each peak, the candidate stations with their bearing, azimuth error and
+distance, and the sky-wave path that fits the elevation. Peaks that can be named
+get a label and small triangles at the stations' bearings:
 
 ```bash
 python tools/sliding_delay_doppler.py s13p5_rdc1.h5 --pol x --beamformer conventional \
     --calibration cal_s13p5_x.h5 --integration-time 120 --hop-time 30 --angle-output sky_video \
-    --angle-cells 4 --codar-stations data/HFRnet-station-list-*.csv --output dd_beam_video
+    --angle-cells 4 --codar-stations --output dd_beam_video
+```
+
+The built-in table is the union of every HFRnet export added to it. Each
+distinct station configuration is kept, along with the exports it appeared in
+(the `Snapshots` column). Stations with no published waveform (-9999) are left
+out. To add a newer export (download the CSV from the HFRnet station list):
+
+```bash
+python tools/codar_stations.py --add HFRnet-station-list-<date>.csv   # then commit the table
+python tools/codar_stations.py                                        # summary of the table
 ```
 
 How a station is chosen:
@@ -317,8 +328,9 @@ azimuth. The label is one station, or one network when several of its
 GPS-synchronised stations fit equally well. Anything else is listed as
 ambiguous and not drawn.
 
-Several table snapshots can be given, because the configuration on the
-observation date is not recorded. Each distinct configuration is a candidate.
+Every configuration in the table is a candidate, because the one in force on the
+observation date is not recorded. Exports from close to your observation dates
+make the results sharper.
 Delay cannot help: our delays are relative to our own sweep timing, and the
 tables list no sweep offsets.
 

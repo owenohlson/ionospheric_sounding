@@ -111,9 +111,9 @@ def add_array(p):
     g.add_argument("--angle-step", type=float, default=2.0, help="Sky-map grid step [deg]")
     g.add_argument("--angle-range-db", type=float, default=30.0, help="Sky-map colour range below its peak")
     g.add_argument("--beam-pattern-output", default=None, help="PNG of the array beam pattern for the look direction")
-    g.add_argument("--codar-stations", nargs="+", default=None, metavar="CSV",
-                   help="HFRnet station table(s): name the HF radar behind each sky-map peak when unambiguous "
-                        "(see codar_stations.py)")
+    g.add_argument("--codar-stations", nargs="*", default=None, metavar="CSV",
+                   help="Name the HF radar behind each sky-map peak when unambiguous, using the built-in HFRnet "
+                        "station table (or the CSV tables given; see codar_stations.py)")
     g.add_argument("--station-az-tol", type=float, default=4.0,
                    help="Largest azimuth error [deg] for a station to explain a sky-map peak")
 

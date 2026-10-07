@@ -3,9 +3,14 @@
 Station tables are HFRnet station lists (CSV export: Station, "Station Name",
 Network, Frequency [MHz], Bandwidth [kHz, signed: the sign is the sweep
 direction], SweepRate [Hz], "Date Added", "Last Radial File", Latitude,
-Longitude, Manufacturer). Several tables (snapshots taken at different times)
-can be given; every distinct configuration a station has had is a candidate,
-because the configuration in force on the observation date is not recorded.
+Longitude, Manufacturer). A merged table ships with the code
+(``hfrnet_stations.csv`` next to this file) and is used by default. It keeps
+every distinct configuration seen in any HFRnet export ("Snapshots" column),
+because the configuration in force on an observation date is not recorded, so
+every configuration a station has had is a candidate. To fold in a newer
+export:
+
+    python tools/codar_stations.py --add HFRnet-station-list-<date>.csv
 
 A detection is a measured direction of arrival (azimuth, elevation) in an
 array product made with a known receive band (tuning, sample rate) and a known
@@ -39,11 +44,15 @@ the tables do not list the stations' sweep timing offsets.
 
 import csv
 import math
+import os
 from dataclasses import dataclass, field
 from datetime import date, datetime
 
 import numpy as np
 
+BUILTIN_TABLE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hfrnet_stations.csv")
+COLUMNS = ["Station", "Station Name", "Network", "Frequency", "Bandwidth", "SweepRate", "Date Added",
+           "Last Radial File", "Latitude", "Longitude", "Manufacturer", "Snapshots"]
 EARTH_RADIUS_KM = 6371.0
 C_KM_S = 299_792.458
 
@@ -108,15 +117,19 @@ def _float(text):
     return None if v <= -9998 else v
 
 
-def load_tables(paths):
-    """All distinct station configurations in one or more HFRnet CSV tables.
+def _snapshot_name(path):
+    return os.path.splitext(os.path.basename(str(path)))[0]
+
+
+def load_tables(paths=None):
+    """All distinct station configurations in one or more HFRnet CSV tables (default: the built-in one).
 
     Rows with an unknown waveform (-9999) are kept out: they cannot be matched.
     The latest "Last Radial File" date seen for a station applies to all its rows.
     """
-    rows = {}
-    last = {}
-    for path in ([paths] if isinstance(paths, str) else paths):
+    paths = [BUILTIN_TABLE] if not paths else ([paths] if isinstance(paths, str) else list(paths))
+    rows, last = {}, {}
+    for path in paths:
         with open(path, newline="", encoding="utf-8-sig") as fh:
             for r in csv.DictReader(fh):
                 code = r["Station"].strip()
@@ -127,18 +140,38 @@ def load_tables(paths):
                     last[code] = lr
                 if None in (f, bw, rate, lat, lon):
                     continue
-                cfg = StationConfig(code, r["Station Name"].strip(), r["Network"].strip(), f * 1e6, bw * 1e3,
-                                    rate, lat, lon, _date(r.get("Date Added")), lr,
-                                    r.get("Manufacturer", "").strip())
-                key = (code, round(cfg.frequency_hz), round(cfg.bandwidth_hz, 1), round(rate, 6))
+                snaps = [x for x in (r.get("Snapshots") or "").split(";") if x] or [_snapshot_name(path)]
+                key = (code, round(f * 1e6), round(bw * 1e3, 1), round(rate, 6))
                 prev = rows.get(key)
-                rows[key] = cfg if prev is None else prev
-                rows[key] = StationConfig(**{**rows[key].__dict__,
-                                             "sources": tuple(sorted(set(rows[key].sources) | {str(path)}))})
-    out = []
-    for cfg in rows.values():
-        out.append(StationConfig(**{**cfg.__dict__, "last_radial": last.get(cfg.code, cfg.last_radial)}))
-    return sorted(out, key=lambda c: (c.network, c.code, c.frequency_hz))
+                added = _date(r.get("Date Added"))
+                if prev is not None:
+                    added = min(d for d in (prev.added, added) if d) if (prev.added or added) else None
+                    snaps = sorted(set(prev.sources) | set(snaps))
+                rows[key] = StationConfig(code, r["Station Name"].strip(), r["Network"].strip(), f * 1e6, bw * 1e3,
+                                          rate, lat, lon, added, lr, (r.get("Manufacturer") or "").strip(),
+                                          tuple(sorted(snaps)))
+    out = [StationConfig(**{**c.__dict__, "last_radial": last.get(c.code, c.last_radial)}) for c in rows.values()]
+    return sorted(out, key=lambda c: (c.network, c.code, c.frequency_hz, c.bandwidth_hz))
+
+
+def write_table(stations, path):
+    """Write configurations in HFRnet column order, plus the snapshots each was seen in."""
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(COLUMNS)
+        for c in stations:
+            w.writerow([c.code, c.name, c.network, f"{c.frequency_hz / 1e6:.5f}", f"{c.bandwidth_hz / 1e3:.8f}",
+                        f"{c.sweep_rate_hz:.8f}", c.added.isoformat() if c.added else "",
+                        c.last_radial.isoformat() if c.last_radial else "", f"{c.lat_deg:.6f}", f"{c.lon_deg:.6f}",
+                        c.manufacturer, ";".join(c.sources)])
+
+
+def merge_into_builtin(paths, table=BUILTIN_TABLE):
+    """Add HFRnet exports to the built-in table (union of configurations). Returns (before, after) counts."""
+    before = load_tables([table]) if os.path.exists(table) else []
+    merged = load_tables(([table] if os.path.exists(table) else []) + list(paths))
+    write_table(merged, table)
+    return len(before), len(merged)
 
 
 # ---------------------------------------------------------------------------
@@ -279,11 +312,11 @@ def describe(ident, max_rows=4):
     return lines
 
 
-def panel_header(rx, cands, n_configs, tables):
-    import os
+def panel_header(rx, cands, n_configs, tables=None):
+    source = "built-in table" if not tables else ", ".join(os.path.basename(t) for t in tables)
     when = rx.obs_date.isoformat() if rx.obs_date else "unknown date"
-    lines = ["HF radar sources (HFRnet tables:", *[f"  {os.path.basename(t)}" for t in tables],
-             f" {n_configs} station configurations)",
+    lines = [f"HF radar sources: HFRnet {source}",
+             f" ({n_configs} station configurations)",
              f"Waveform {rx.sweep_rate_hz:g} Hz, {rx.bandwidth_hz / 1e3:+.3f} kHz,",
              f"band {(rx.tuning_hz - rx.sample_rate_hz / 2) / 1e6:.4f}-{(rx.tuning_hz + rx.sample_rate_hz / 2) / 1e6:.4f}"
              f" MHz, {when}:",
@@ -295,3 +328,22 @@ def panel_header(rx, cands, n_configs, tables):
         for net, codes in sorted(nets.items()):
             lines.append(f"  {net}: {', '.join(sorted(codes))}")
     return lines
+
+
+def main(argv=None):
+    import argparse
+    p = argparse.ArgumentParser(description="Show or update the built-in HFRnet station table.")
+    p.add_argument("--add", nargs="+", metavar="CSV", help="HFRnet station-list exports to merge into the table")
+    p.add_argument("--table", default=BUILTIN_TABLE, help="Table to update (default: the built-in one)")
+    args = p.parse_args(argv)
+    if args.add:
+        before, after = merge_into_builtin(args.add, args.table)
+        print(f"{args.table}: {before} -> {after} station configurations")
+    stations = load_tables([args.table])
+    snaps = sorted({s for c in stations for s in c.sources})
+    print(f"{len(stations)} configurations of {len({c.code for c in stations})} stations, "
+          f"{len({c.network for c in stations})} networks; snapshots: {', '.join(snaps)}")
+
+
+if __name__ == "__main__":
+    main()
