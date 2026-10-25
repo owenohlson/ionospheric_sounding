@@ -51,6 +51,7 @@ path.
 | `rdc_io.py` | HDF5 layout: `RDCFile` reader (all stages, legacy formats), `StageWriter`, metadata/history, atomic output |
 | `rdc_utils.py` | Stage-to-stage processing: channel selection, sweep packing, `RDCView` (brings any stored stage to the product a plot needs), exports, array processing (`ArrayProcessor`, covariance, steering, angle spectra, beam pattern), plot reductions |
 | `calibration_utils.py` | Array self-calibration: plane-wave fit, phase-gain estimation (alternating fit, ramp kept out), held-out validation, the calibration file (`ArrayCalibration`) |
+| `wavefront.py` | Wavefront tracking: reference plane, per-stand unwrapping in time, plane fits per frame, static/dynamic residuals, `EchoTracker` (follows one echo through the frames) |
 | `codar_stations.py` | HF radar source identification: the built-in HFRnet station table (`hfrnet_stations.csv`, updated with `--add`), bearings and sky-wave geometry from the station, waveform/band/date filters, the labelling rule |
 | `plotting_utils.py` | Figures only (arrays → PNG) and video assembly |
 | `cli.py` | Shared command-line flag groups and the export command line |
@@ -67,6 +68,7 @@ path.
 | `plot_phase_doppler.py` (`--kind delay-time` or `doppler-time`) / `sliding_phase_doppler.py` | ✓ | ✓ | ✓ * | ✓ | |
 | `calibrate_array.py` | ✓ | ✓ | ✓ | | |
 | `check_array_calibration.py` | ✓ | ✓ | ✓ | | |
+| `plot_wavefront.py` | ✓ | ✓ | ✓ | | |
 
 \* uses the RDC1 retained inside the RDC2 file.
 
@@ -344,6 +346,63 @@ On 2023-12-09 at 13.5 MHz:
 Auto-aimed videos write `look_directions.csv` (az/el per frame) into the
 `--output` directory. Sky maps are in dB relative to their own peak
 (`--angle-range-db`).
+
+### 7. Wavefront tracking (TIDs)
+
+A TID is hundreds of km long, so across the 100 m array it does not make
+fringes. It tilts the wavefront, and the arrival direction wanders slowly.
+`plot_wavefront.py` follows one echo through the Doppler frames and measures
+that tilt from the per-stand phases:
+
+```bash
+python tools/plot_wavefront.py s13p5_rdc1.h5 --pol x --calibration cal_s13p5_x.h5 \
+    --d-min 3.5 --d-max 6 --echo-delay 4.37 --echo-doppler -0.4 \
+    --integration-time 2 --hop-time 0.5 --output wf.png \
+    --maps-output wf_maps.png --surface-output wf_3d/ --csv wf.csv --npz wf.npz
+```
+
+How it works (details in `wavefront.py`):
+
+1. **Reference plane.** Every channel is divided by a fixed plane wave from the
+   session's median direction (or `--reference-az/--reference-el`). It is also
+   divided by the phase of the beam toward that direction, which removes the
+   common Doppler rotation and frame timing.
+2. **Unwrap in time, per stand, never across stands.** Neighbouring stands can
+   differ by more than π at 13–25 MHz and low elevation, and spatial unwrapping
+   is path dependent: one bad stand spreads its error to the stands reached
+   through it. Between frames 0.5 s apart, a stand's referenced phase barely
+   moves. Each increment is taken on the 2π branch nearest a plane fitted to
+   all increments, so fast-moving edge stands are followed too.
+3. **Remove each stand's time mean.** This removes every fixed per-stand error,
+   so the *changes* do not depend on the calibration. The mean minus its best
+   plane is the **static residual**: the error the calibration left, shown as
+   the first map.
+4. **Fit a plane every frame.** Its tilt gives az(t) and el(t). What is left is
+   the **residual**: non-planar structure, multipath and noise.
+
+Outputs:
+
+* `--output`: az/el from the phase planes, with the coarse grid fit of each
+  frame as grey dots; echo Doppler, delay and SNR; residual rms; and the
+  arrival-direction track in direction cosines.
+* `--maps-output`: the phase change (or `--map-quantity residual`) on the
+  ground at `--maps` times.
+* `--surface-output`: a 3D view (east, north, phase change) with the fitted
+  plane. It is coloured by `--surface-color residual|change|amplitude`. Give a
+  PNG for one frame (default: the largest tilt) or a directory for a video.
+* `--csv` and `--npz`: every per-frame number and array.
+
+Without `--echo-delay/--echo-doppler`, the track starts at the strongest
+delay-localised echo. After that it follows the strongest cell within
+`--track-delay-bins/--track-doppler-bins` of the last one. Frames with an echo
+weaker than `--min-snr-db` are skipped. Stands whose residual does not stay put
+are dropped (`--min-consistency`).
+
+The frame scatter in the table shows the noise floor of the measurement. A TID
+should appear as a slow swing well above it, with a period of minutes. To get
+its horizontal wavelength and velocity, compare echoes that reflect at
+different points: different CODAR stations (`--codar-stations` names them),
+or LWA-1 together with LWA-SV.
 
 ## Examples
 

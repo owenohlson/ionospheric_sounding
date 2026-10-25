@@ -270,6 +270,151 @@ def plot_angle_maps(maps, az_deg, el_deg, labels, title, output, range_db=30.0,
     return save(fig, output)
 
 
+# ---------------------------------------------------------------------------
+# Wavefront tracking (plot_wavefront.py)
+# ---------------------------------------------------------------------------
+
+def plot_wavefront_summary(t_s, series, uv, title, output, info_rows=None, notes=None, footer=None):
+    """Stacked time series sharing one time axis, plus the arrival-direction track.
+
+    ``series``: list of (label, y, extra) where extra is an optional
+    (label, y) drawn as grey dots on the same axis (e.g. the coarse grid fit).
+    ``uv``: (u, v, u_ref, v_ref) direction cosines (east, north) for the track panel.
+    """
+    t_s = np.asarray(t_s, float)
+    fig = plt.figure(figsize=(18, max(8.0, 1.55 * len(series) + 1.5)))
+    left, bottom, width, height = 0.30, PLOT_RECT[1], 0.40, PLOT_RECT[3]
+    gap = 0.012
+    h = (height - gap * (len(series) - 1)) / len(series)
+    axes = []
+    for i, (label, y, extra) in enumerate(series):
+        ax = fig.add_axes([left, bottom + (len(series) - 1 - i) * (h + gap), width, h],
+                          sharex=axes[0] if axes else None)
+        if extra is not None:
+            ax.plot(t_s, extra[1], ".", ms=3, color="#9a9a9a", label=extra[0])
+        ax.plot(t_s, y, "-", lw=1.4, color="#1f5fa8", label=label if extra is not None else None)
+        ax.set_ylabel(label, fontsize=8.5)
+        ax.grid(alpha=0.25, lw=0.6)
+        ax.tick_params(labelsize=8)
+        if extra is not None:
+            ax.legend(fontsize=7, loc="upper right", frameon=False)
+        if i < len(series) - 1:
+            ax.tick_params(labelbottom=False)
+        axes.append(ax)
+    axes[-1].set_xlabel("Time [s]")
+    axes[0].set_title(title)
+    u, v, u_ref, v_ref = uv
+    ax = fig.add_axes([0.76, bottom + 0.22, 0.19, 0.45])
+    ok = np.isfinite(u) & np.isfinite(v)
+    sc = ax.scatter(np.asarray(u)[ok] - u_ref, np.asarray(v)[ok] - v_ref, c=t_s[ok], s=9, cmap="viridis")
+    ax.plot(np.asarray(u)[ok] - u_ref, np.asarray(v)[ok] - v_ref, "-", lw=0.6, color="#777777", alpha=0.6)
+    ax.plot(0, 0, "+", color="black", ms=10, mew=1.2)
+    ax.set_aspect("equal", adjustable="datalim")
+    ax.set(xlabel="East direction cosine change", ylabel="North direction cosine change")
+    ax.set_title("Arrival-direction track\n(+ = session mean)", fontsize=9)
+    ax.ticklabel_format(style="sci", scilimits=(-2, 2))
+    ax.tick_params(labelsize=7.5)
+    ax.grid(alpha=0.25, lw=0.6)
+    cb = fig.colorbar(sc, ax=ax, pad=0.04, fraction=0.06)
+    cb.set_label("Time [s]", fontsize=8)
+    add_info_panel(fig, info_rows, notes, footer)
+    return save(fig, output)
+
+
+def _stand_map(ax, xy, values, vmax, cmap="RdBu_r", size=22):
+    ok = np.isfinite(values)
+    ax.scatter(xy[~ok, 0], xy[~ok, 1], s=size * 0.6, facecolors="none", edgecolors="#b5b5b5", lw=0.6)
+    sc = ax.scatter(xy[ok, 0], xy[ok, 1], c=values[ok], s=size, cmap=cmap, vmin=-vmax, vmax=vmax,
+                    edgecolors="#555555", linewidths=0.3)
+    ax.set_aspect("equal")
+    ax.tick_params(labelsize=7)
+    ax.grid(alpha=0.2, lw=0.5)
+    return sc
+
+
+def plot_phase_maps(xy, maps, labels, title, output, static=None, unit="rad", vmax=None,
+                    info_rows=None, notes=None, footer=None):
+    """Small multiples of per-stand phase on the ground (x east, y north [m]).
+
+    ``maps``: list of (N,) arrays sharing one diverging colour scale (symmetric,
+    ``vmax`` or the 99th percentile). ``static``: optional (N,) map drawn first
+    with its own scale (the per-stand error left after calibration). Hollow
+    circles are stands without a value."""
+    xy = np.asarray(xy, float)
+    panels = ([("static", static)] if static is not None else []) + list(zip(labels, maps))
+    cols = min(4, len(panels))
+    rows_n = int(np.ceil(len(panels) / cols))
+    fig = plt.figure(figsize=(18, max(5.5, 3.9 * rows_n + 1.0)))
+    left, bottom, width, height = 0.29, PLOT_RECT[1], 0.62, PLOT_RECT[3]
+    w = (width - 0.035 * (cols - 1)) / cols
+    h = (height - 0.07 * (rows_n - 1)) / rows_n
+    allv = np.concatenate([np.ravel(m) for m in maps]) if maps else np.array([np.nan])
+    scale = vmax or (np.nanpercentile(np.abs(allv), 99) if np.isfinite(allv).any() else 1.0) or 1.0
+    shared = None
+    for i, (label, values) in enumerate(panels):
+        r, c = divmod(i, cols)
+        ax = fig.add_axes([left + c * (w + 0.035), bottom + (rows_n - 1 - r) * (h + 0.07), w, h])
+        values = np.asarray(values, float)
+        if label == "static" and static is not None:
+            s_scale = np.nanpercentile(np.abs(values), 99) if np.isfinite(values).any() else 1.0
+            sc = _stand_map(ax, xy, values, s_scale or 1.0)
+            ax.set_title("Static residual (time mean minus its plane):\nper-stand error left after calibration",
+                         fontsize=8)
+            cb = fig.colorbar(sc, ax=ax, orientation="horizontal", fraction=0.05, pad=0.16 if r == rows_n - 1 else 0.06)
+            cb.set_label(f"Static residual [{unit}]", fontsize=7.5)
+            cb.ax.tick_params(labelsize=7)
+        else:
+            shared = _stand_map(ax, xy, values, scale)
+            ax.set_title(label, fontsize=8.5)
+        if r == rows_n - 1:
+            ax.set_xlabel("East [m]", fontsize=8)
+        if c == 0:
+            ax.set_ylabel("North [m]", fontsize=8)
+    if shared is not None:
+        cb = fig.colorbar(shared, cax=fig.add_axes([left + width + 0.012, bottom, 0.009, height]))
+        cb.set_label(f"Phase [{unit}]")
+    fig.suptitle(title)
+    add_info_panel(fig, info_rows, notes, footer)
+    return save(fig, output)
+
+
+def plot_phase_surface(xy, z, color, plane, title, output, zlim, clim, color_label, info_rows=None,
+                       notes=None, footer=None, cmap="RdBu_r"):
+    """3D view: stands at (east, north) [m], height ``z`` [rad], coloured by ``color``.
+
+    ``plane``: (du_term_e, du_term_n, offset) so the fitted plane is
+    offset + a*x + b*y [rad], drawn as a translucent sheet."""
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers the projection)
+    xy = np.asarray(xy, float)
+    fig = plt.figure(figsize=(16, 8))
+    ax = fig.add_axes([0.28, 0.06, 0.62, 0.86], projection="3d")
+    ok = np.isfinite(z)
+    if plane is not None and all(np.isfinite(plane)):
+        gx = np.linspace(xy[:, 0].min(), xy[:, 0].max(), 12)
+        gy = np.linspace(xy[:, 1].min(), xy[:, 1].max(), 12)
+        GX, GY = np.meshgrid(gx, gy)
+        GZ = plane[2] + plane[0] * GX + plane[1] * GY
+        GZ = np.where((GZ >= zlim[0]) & (GZ <= zlim[1]), GZ, np.nan)      # keep the sheet inside the box
+        ax.plot_surface(GX, GY, GZ, color="#7d7d7d", alpha=0.18,
+                        linewidth=0, antialiased=True)
+    if ok.any():
+        for x, y, h in zip(xy[ok, 0], xy[ok, 1], np.asarray(z)[ok]):
+            ax.plot([x, x], [y, y], [zlim[0], h], color="#c4c4c4", lw=0.4)
+        cvals = np.asarray(color)[ok]
+        sc = ax.scatter(xy[ok, 0], xy[ok, 1], np.asarray(z)[ok], c=cvals, cmap=cmap, vmin=clim[0], vmax=clim[1],
+                        s=26, edgecolors="#444444", linewidths=0.3, depthshade=False)
+        cb = fig.colorbar(sc, ax=ax, shrink=0.6, pad=0.08)
+        cb.set_label(color_label)
+    ax.set_zlim(*zlim)
+    ax.set_xlabel("East [m]")
+    ax.set_ylabel("North [m]")
+    ax.set_zlabel("Phase change [rad]")
+    ax.view_init(elev=24, azim=-58)
+    ax.set_title(title)
+    add_info_panel(fig, info_rows, notes, footer)
+    return save(fig, output, dpi=160)
+
+
 def _edges(centers):
     c = np.asarray(centers, float)
     if c.size == 1:
