@@ -1,4 +1,4 @@
-"""Spectrogram (frequency vs time) or averaged spectrum of raw samples. Input: RDC0 with complete sweeps.
+"""Spectrogram (frequency vs time) or averaged spectrum of raw samples. Input: raw TBN/WAV, or RDC0 with complete sweeps.
 
 --average plots one spectrum averaged over time and the selected channels.
 --estimate-lfm fits the sweep rate, bandwidth, start offset and gating to the
@@ -27,7 +27,7 @@ def main():
     p.add_argument("--overlay-lfm", action="store_true", help="Draw the estimated sweep (implies --estimate-lfm)")
     args = p.parse_args()
     cli.validate(p, args)
-    view = cli.view_from_args(args)
+    view = cli.view_from_args(args, raw_stage="rdc0")
     iq, t0, gaps = view.raw_samples()
     fc = float(view.fc or 0.0)
     rows = view.info_rows(t0, t0 + iq.shape[1] / view.fs) + [("Window", f"{args.window}, {args.window_size}")]

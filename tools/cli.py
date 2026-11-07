@@ -11,12 +11,48 @@ from lfm_utils import WINDOW_CHOICES
 
 
 def parser(description):
-    return argparse.ArgumentParser(description=description,
+    # "resolve": --carrier-frequency is both a raw-WAV and an array flag (same meaning, one dest)
+    return argparse.ArgumentParser(description=description, conflict_handler="resolve",
                                    formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
 
-def add_input(p, raw_ok=False):
+def is_raw(path):
+    """Anything that is not HDF5 is treated as a raw TBN/WAV recording."""
+    return not str(path).lower().endswith((".h5", ".hdf5"))
+
+
+def add_input(p, raw_ok=True):
     p.add_argument("input", help="RDC HDF5 file" + (" or raw TBN (.dat/.tbn) / WAV recording" if raw_ok else ""))
+    if raw_ok:
+        add_raw_input(p, plot=True)
+
+
+def add_raw_input(p, plot=False):
+    title = "raw input (TBN/WAV only)"
+    if plot:
+        title += ("; a raw file is first cut into a temporary RDC in $SLURM_TMPDIR (or the system temp dir), "
+                  "so cache it with export_rdc1.py when plotting the same data repeatedly")
+    g = p.add_argument_group(title)
+    g.add_argument("--sweep-frequency", type=float, default=None,
+                   help="Sweeps per second [Hz]" + (" (spectrogram: optional)" if plot else ""))
+    g.add_argument("--offset", type=float, default=0.0,
+                   help="Sweep start offset [s] after each UTC second (use the observed echo delay minus a few ms)")
+    g.add_argument("--no-timestamp-align", action="store_true", help="Start sweeps at the first sample instead")
+    g.add_argument("--adc-start", type=int, default=0, help="First sample kept in each sweep")
+    g.add_argument("--adc-count", type=int, default=None, help="Samples kept per sweep (default: rest of sweep)")
+    g.add_argument("--start-utc", default=None, help="WAV only: UTC of sample zero (ISO 8601)")
+    g.add_argument("--carrier-frequency", type=float, default=None, help="WAV only: RF centre frequency [Hz]")
+
+
+def check_raw_flags(p, args):
+    """Reject raw-only flags on an HDF5 input."""
+    if not hasattr(args, "sweep_frequency") or is_raw(args.input):
+        return
+    for flag in ("sweep_frequency", "start_utc"):
+        if getattr(args, flag) is not None:
+            p.error(f"--{flag.replace('_', '-')} applies only to raw input; cached files store it")
+    if args.offset or args.no_timestamp_align or args.adc_start or args.adc_count:
+        p.error("--offset/--no-timestamp-align/--adc-* apply only when cutting a raw recording into sweeps")
 
 
 def add_plot_output(p, video=False):
@@ -157,6 +193,7 @@ def validate(p, args):
         p.error("Give both --look-az and --look-el, or neither")
     if getattr(args, "d_min", None) is not None and getattr(args, "d_max", None) is not None and args.d_min >= args.d_max:
         p.error("--d-min must be below --d-max")
+    check_raw_flags(p, args)
 
 
 def apply_ssmif(args):
@@ -165,13 +202,57 @@ def apply_ssmif(args):
         lwa_utils.use_ssmif(args.ssmif)
 
 
-def view_from_args(args):
+def view_from_args(args, raw_stage="rdc1"):
+    """Open ``args.input`` as an RDCView. A raw recording is first cut into a temporary
+    ``raw_stage`` file (RDC1 for delay/Doppler plots, RDC0 for spectra)."""
     from rdc_utils import RDCView
     apply_ssmif(args)
+    if is_raw(args.input):
+        return _view_from_raw(args, raw_stage)
     return RDCView(args.input, stands=args.stands, pol=args.pol, bad_stands=args.bad_stands,
                    tstart=args.tstart, tend=args.tend, gap_fill=args.gap_fill,
                    bandwidth=getattr(args, "bandwidth", None), dechirp_window=getattr(args, "dechirp_window", None),
                    reference_gate=getattr(args, "reference_gate", None))
+
+
+def _view_from_raw(args, stage):
+    import math
+    import os
+    import tempfile
+    from rdc_utils import ExportSettings, RDCView, export_rdc0, export_rdc1_from_raw
+    path = os.path.expanduser(args.input)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Raw recording not found: {path}")
+    wav = path.lower().endswith(".wav")
+    sweep_frequency, align = args.sweep_frequency, not args.no_timestamp_align
+    if stage == "rdc0" and sweep_frequency is None:
+        # Spectra only need contiguous samples: cut 1 s blocks from the first sample
+        if args.offset or args.adc_start or args.adc_count:
+            raise ValueError("--offset/--adc-* need --sweep-frequency")
+        sweep_frequency, align = 1.0, False
+    full = getattr(args, "full_delay", False)
+    s = ExportSettings(
+        sweep_frequency=sweep_frequency, offset=args.offset, timestamp_align=align, start_utc=args.start_utc,
+        carrier_frequency=args.carrier_frequency, adc_start=args.adc_start, adc_count=args.adc_count,
+        tstart=args.tstart, tend=args.tend,
+        stands="all" if wav else (args.stands or "all"), pol="both" if wav else (args.pol or "both"),
+        bad_stands="none" if wav else (args.bad_stands or "none"), gap_fill=args.gap_fill,
+        bandwidth=getattr(args, "bandwidth", None), dechirp_window=getattr(args, "dechirp_window", None),
+        reference_gate=getattr(args, "reference_gate", None),
+        d_min=-math.inf if full else getattr(args, "d_min", None),
+        d_max=math.inf if full else getattr(args, "d_max", None),
+        dtype="float16" if stage == "rdc0" and not wav else "float32",       # exact for 8-bit TBN samples
+        compression="lzf")
+    tmp = tempfile.TemporaryDirectory(prefix="rdc_plot_", dir=os.environ.get("SLURM_TMPDIR") or None)
+    out = os.path.join(tmp.name, f"{os.path.splitext(os.path.basename(path))[0]}_{stage}.h5")
+    print(f"Raw input: cutting a temporary {stage.upper()} in {tmp.name}", flush=True)
+    (export_rdc0 if stage == "rdc0" else export_rdc1_from_raw)(path, out, s, tool="plot (raw input)", temporary=True)
+    # Selection and time range were applied while cutting; the temporary file's t = 0 is its first sweep
+    view = RDCView(out, stands="all", pol="both", bad_stands="none", gap_fill=args.gap_fill,
+                   bandwidth=s.bandwidth, dechirp_window=s.dechirp_window, reference_gate=s.reference_gate)
+    view.path = path
+    view._tmpdir = tmp          # deleted when the view is
+    return view
 
 
 def gap_footer(had_gaps, gap_fill):
@@ -208,18 +289,10 @@ EXPORT_HELP = {
 def export_main(stage, argv=None):
     from rdc_utils import ExportSettings, export
     p = parser(EXPORT_HELP[stage])
-    add_input(p, raw_ok=True)
+    p.add_argument("input", help="RDC HDF5 file or raw TBN (.dat/.tbn) / WAV recording")
     p.add_argument("--output", required=True, help=f"Output {stage.upper()} HDF5 file")
     add_selection(p)
-    g = p.add_argument_group("raw input (TBN/WAV only)")
-    g.add_argument("--sweep-frequency", type=float, default=None, help="Sweeps per second [Hz]")
-    g.add_argument("--offset", type=float, default=0.0,
-                   help="Sweep start offset [s] after each UTC second (use the observed echo delay minus a few ms)")
-    g.add_argument("--no-timestamp-align", action="store_true", help="Start sweeps at the first sample instead")
-    g.add_argument("--adc-start", type=int, default=0, help="First sample kept in each sweep")
-    g.add_argument("--adc-count", type=int, default=None, help="Samples kept per sweep (default: rest of sweep)")
-    g.add_argument("--start-utc", default=None, help="WAV only: UTC of sample zero (ISO 8601)")
-    g.add_argument("--carrier-frequency", type=float, default=None, help="WAV only: RF centre frequency [Hz]")
+    add_raw_input(p)
     if stage != "rdc0":
         add_range_processing(p)
         add_delay(p)
@@ -254,11 +327,6 @@ def export_main(stage, argv=None):
         keep_rdc1=not getattr(args, "no_keep_rdc1", False), estimator_sweeps=getattr(args, "estimator_sweeps", 1),
         dtype=args.dtype, compression=args.compression, dry_run=args.dry_run)
     apply_ssmif(args)
-    raw = not args.input.lower().endswith((".h5", ".hdf5"))
-    if not raw:
-        for flag in ("sweep_frequency", "start_utc", "carrier_frequency"):
-            if getattr(args, flag) is not None:
-                p.error(f"--{flag.replace('_', '-')} applies only to raw input; cached files store it")
-        if args.offset or args.no_timestamp_align or args.adc_start or args.adc_count:
-            p.error("--offset/--no-timestamp-align/--adc-* apply only when cutting a raw recording into sweeps")
+    if not is_raw(args.input) and args.carrier_frequency is not None:
+        p.error("--carrier-frequency applies only to raw input; cached files store it")
     export(args.input, stage, args.output, s, tool=f"export_{stage}")

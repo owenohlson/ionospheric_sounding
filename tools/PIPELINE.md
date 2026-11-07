@@ -75,8 +75,17 @@ path.
 Each command uses the most-processed stored stage that still fits the request.
 For example, a delay-Doppler plot of an RDC2 uses the stored frames. It recomputes
 from the retained RDC1 only if you change `--integration-time`, `--hop-time`,
-`--slow-window` or `--nfft-doppler`. Plots read HDF5 only; export raw
-recordings first.
+`--slow-window` or `--nfft-doppler`.
+
+**Raw input.** Every plot (and `calibrate_array.py`, `export_rdc3.py`) also takes a
+raw TBN/WAV file. It is first cut into a temporary file in `$SLURM_TMPDIR` (else
+the system temp directory), deleted when the plot finishes: RDC0 for
+`plot_spectrogram.py`, RDC1 for the rest. Give the same raw-input flags as the
+exports (`--sweep-frequency`, `--offset`, ...; plus `--bandwidth` to dechirp).
+`plot_spectrogram.py` needs no `--sweep-frequency`: it then reads 1 s blocks from
+the first sample (the info table shows "Sweep freq 1 Hz", and up to 1 s at the
+end is dropped). Each run re-reads the recording, so for repeated plots of the
+same data export an RDC1 once.
 
 ## Times, channels and delay windows
 
