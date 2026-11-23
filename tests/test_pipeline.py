@@ -40,6 +40,19 @@ class PipelineTests(unittest.TestCase):
     def cube(self, path, stage):
         return rdc_io.RDCFile(path).read(stage)
 
+    def test_raw_spectrogram_has_no_made_up_sweep_rate(self):
+        import argparse
+        import cli
+        args = argparse.Namespace(input=str(self.wav), sweep_frequency=None, no_timestamp_align=False, offset=0.0,
+                                  adc_start=0, adc_count=None, start_utc=None, carrier_frequency=None, tstart=0.0,
+                                  tend=None, stands=None, pol=None, bad_stands=None, gap_fill="zero")
+        view = quiet(cli.view_from_args, args, raw_stage="rdc0")
+        self.assertFalse(view.prf_known)                       # cut in 1 s blocks: no sweep rate known
+        self.assertNotIn("Sweep freq", [k for k, _ in view.info_rows(0, 0.5)])
+        args.sweep_frequency = SF
+        view = quiet(cli.view_from_args, args, raw_stage="rdc0")
+        self.assertIn(("Sweep freq", f"{SF:g} Hz"), view.info_rows(0, 0.5))
+
     def test_rdc0_holds_the_samples(self):
         f = rdc_io.RDCFile(self.r0)
         x = f.read("rdc0")[:, :, 0].T.ravel()
@@ -103,13 +116,22 @@ class PipelineTests(unittest.TestCase):
         raw = rdc_io.RDCFile(self.r0).read("rdc0")
         cfg = lfm.LFMWaveform(BW, SF, FS)
         bins, delay = lfm.delay_band(cfg, raw.shape[0], 10, 20)
-        rdc1 = lfm.dechirp_range_fft(raw, cfg, "hann", 0, bins)
+        rdc1 = lfm.range_compress(raw, cfg, "hann", 0, bins)
         rdc2, fd = lfm.doppler_fft(rdc1[:, :20], SF, "hann")
         np.testing.assert_allclose(f.read("rdc2", frames=0), rdc2, atol=1e-3)
         np.testing.assert_allclose(f.axis("rdc2", "delay_ms"), delay)
         peak = np.unravel_index(np.argmax(np.abs(rdc2[..., 0])), rdc2.shape[:2])
         self.assertAlmostEqual(delay[peak[0]], 13.7, delta=0.6)
         self.assertAlmostEqual(fd[peak[1]], 0.3, delta=0.1)
+
+    def test_range_method_is_recorded_and_fixed(self):
+        quiet(ru.export, self.r0, "rdc1", self.d / "m.h5", ru.ExportSettings(d_min=10, d_max=20))
+        self.assertEqual(rdc_io.RDCFile(self.d / "m.h5").meta["range_method"], "matched")
+        self.assertEqual(ru.RDCView(self.d / "m.h5").range_method, "matched")
+        with self.assertRaises(ValueError):
+            ru.RDCView(self.d / "m.h5", range_method="dechirp")
+        quiet(ru.export, self.r0, "rdc1", self.d / "d.h5", ru.ExportSettings(d_min=10, d_max=20, range_method="dechirp"))
+        self.assertEqual(rdc_io.RDCFile(self.d / "d.h5").meta["range_method"], "dechirp")
 
     def test_view_recomputes_from_retained_rdc1_and_uses_stored_frames(self):
         quiet(ru.export, self.r0, "rdc2", self.d / "r2.h5", ru.ExportSettings(integration_time=8, hop_time=4))
@@ -227,9 +249,8 @@ class ScriptTests(unittest.TestCase):
         cases = [
             ("plot_spectrogram.py", d / "r0.h5", "--estimate-lfm", "--overlay-lfm"),
             ("plot_spectrogram.py", d / "r0.h5", "--average"),
-            ("plot_dechirp.py", d / "r0.h5", "--navg", 2),
-            ("plot_dechirp.py", d / "r2.h5"),
-            ("plot_power_delay.py", d / "r2.h5", "--full-delay"),
+            ("plot_power_delay_profile.py", d / "r0.h5", "--navg", 2),
+            ("plot_power_delay_profile.py", d / "r2.h5", "--full-delay"),
             ("plot_delay_doppler.py", d / "r0.h5", "--integration-time", 10),
             ("plot_delay_doppler.py", d / "r2.h5"),
             ("plot_delay_doppler.py", d / "r2.h5", "--integration-time", 6, "--fd-min", -0.5, "--fd-max", 0.5),
@@ -241,6 +262,37 @@ class ScriptTests(unittest.TestCase):
             out = d / f"plot{i}.png"
             self.run_tool(script, *args, "--output", out)
             self.assertTrue(out.exists(), script)
+
+    def test_rdc_info_describes_and_finds_reusable_files(self):
+        import rdc_info
+        out = self.run_tool("rdc_info.py", self.d / "r0.h5", self.d / "r2.h5", self.d / "p.h5")
+        lines = out.strip().splitlines()
+        self.assertEqual(len(lines), 3)
+        self.assertIn("rdc1+rdc2 (keeps RDC1)", lines[1])
+        self.assertIn(f"bw {BW / 1e3:+.6f} kHz", lines[1])
+        self.assertIn("delay 5.0-", lines[1])
+        i = rdc_info.read_info(str(self.d / "r2.h5"))
+        # a WAV-derived cache has no LWA recording id; check the rules on the file itself
+        base = dict(bandwidth=BW, rate=SF, d_min=10, d_max=20, pol=-1, min_seconds=10)   # a WAV: one receiver, 20 s
+        why = lambda **k: rdc_info.reusable(i, None, **dict(base, **k))  # noqa: E731
+        self.assertEqual(why(), "")
+        self.assertEqual(why(bandwidth=BW + 50), "other bandwidth")
+        self.assertEqual(why(rate=SF * 2), "other sweep rate")
+        self.assertTrue(why(d_max=40).startswith("delays"))
+        self.assertEqual(why(pol=0), "no x-pol channels")
+        self.assertEqual(why(min_seconds=120), "a short time cut")
+        self.assertEqual(why(echoes=[10.0, 25.0]), "")                     # echoes inside the 5-30.0 ms window
+        self.assertIn("miss the echo(es) at 29.80", why(echoes=[10.0, 29.8]))
+        self.assertIn("range-compressed with matched", why(range_method="dechirp"))
+        self.assertEqual(why(sidebands=False), "")                          # made without --suppress-sidebands
+        self.assertEqual(why(sidebands=True), "exported without --suppress-sidebands")
+        i["meta"]["sideband_suppression"] = {"method": "clean", "detected": True}
+        self.assertEqual(why(sidebands=False), "exported with --suppress-sidebands")
+        self.assertEqual(why(sidebands=True), "")
+        del i["meta"]["sideband_suppression"]
+        self.assertEqual(rdc_info.reusable(rdc_info.read_info(str(self.d / "p.h5")), None, BW, SF), "no per-sweep RDC1")
+        full = self.run_tool("rdc_info.py", self.d / "r2.h5", "--full")
+        self.assertIn("history:", full)
 
     def test_videos(self):
         import shutil

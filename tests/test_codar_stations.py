@@ -51,9 +51,14 @@ class StationTests(unittest.TestCase):
 
     def test_filters(self):
         codes = sorted(c.code for c in cs.candidates(self.stations, self.rx))
-        # COP1 sweeps the other way, BML1 has another bandwidth, ARG1's later setup is 47.8 kHz,
-        # SNI1 is mostly outside the band and stopped before the date, NEW1 was added later, SMOA stopped earlier
-        self.assertEqual(codes, ["ARG1", "PTC1", "SCCI"])
+        # COP1 is listed sweeping the other way: kept, after the others and flagged; BML1 has another
+        # bandwidth, ARG1's later setup is 47.8 kHz, SNI1 is mostly outside the band and stopped before
+        # the date, NEW1 was added later, SMOA stopped earlier
+        self.assertEqual(codes, ["ARG1", "COP1", "PTC1", "SCCI"])
+        cands = cs.candidates(self.stations, self.rx)
+        self.assertEqual([c.code for c in cands if cs.sign_flipped(c)], ["COP1"])
+        self.assertEqual(cands[-1].code, "COP1")
+        self.assertAlmostEqual(next(c for c in cands if c.code == "COP1").bandwidth_hz, -99259.377, places=3)
         self.assertEqual(len(cs.candidates(self.stations, cs.Receiver(*LWASV, 13.5e6, 100e3, 1.0,
                                                                       -99.259377e3, date(2023, 12, 9)))), 0)
 
@@ -68,22 +73,68 @@ class StationTests(unittest.TestCase):
         self.assertFalse(mid.confident)
         self.assertEqual(cs.identify(-60.0, 20.0, cands, self.rx).status, "none")
         self.assertEqual(cs.identify(-85.0, 75.0, cands, self.rx).status, "none")   # no sky-wave path fits
+        # COP1 (listed +99 kHz) only names a direction when no station listed with the sign fits there
+        brg, _ = cs.bearing_distance(*LWASV, 34.407467, -119.878783)
+        brg = (brg + 180) % 360 - 180
+        near = cs.identify(brg, 21.0, cands, self.rx)
+        self.assertNotIn("COP1", near.label)
+        only = cs.identify(brg, 21.0, [c for c in cands if c.code == "COP1"], self.rx)
+        self.assertEqual((only.status, only.label), ("station", "COP1 (UCSB)"))
+        self.assertTrue(any("COP1~" in line for line in cs.describe(only)))
 
+
+    def test_hop_count_prefers_a_plausible_virtual_height(self):
+        # FOCF-like: 3,325 km at 10.3 deg needs 560 km for one hop (unphysical), 212 km for two
+        best, alts = cs.choose_hops(cs.hop_options(3325, 10.3))
+        self.assertEqual((best.hops, best.layer), (2, "F"))
+        self.assertAlmostEqual(best.height_km, 212, delta=2)
+        self.assertEqual([(a.hops, a.layer) for a in alts], [(3, "E")])
+        # PCYC-like: one F hop at ~256 km, with two E hops at ~110 km as the alternative
+        best, alts = cs.choose_hops(cs.hop_options(1777, 11.78))
+        self.assertEqual((best.hops, best.layer, [a.hops for a in alts]), (1, "F", [2]))
+        self.assertAlmostEqual(best.height_km, 256, delta=2)
+        # nothing fits exactly: the tolerance can still admit a path, flagged as such
+        opts = cs.hop_options(1261, 1.0, el_tol=5.0)
+        best, alts = cs.choose_hops(opts)
+        self.assertTrue(best.within_tol and not best.fits)
+        self.assertEqual(cs.choose_hops(cs.hop_options(1261, 80.0)), (None, []))
+
+    def test_identify_reports_the_hop_count(self):
+        cands = cs.candidates(self.stations, self.rx)
+        ident = cs.identify(-92.0, 23.0, cands, self.rx)
+        scci = ident.matches[0]
+        self.assertEqual((scci.config.code, scci.hops, scci.layer), ("SCCI", 1, "F"))
+        self.assertTrue(any(" 1F " in line for line in cs.describe(ident)))
+        lines = cs.hop_table("SCCI", 23.0, self.stations, receiver="lwasv")
+        self.assertIn("chosen", lines[2])
 
     def test_builtin_table_and_merging(self):
         builtin = cs.load_tables()                              # no paths: the table shipped with the code
         self.assertGreater(len(builtin), 200)
+        # stations HFRnet lists without a waveform (-9999) stay in the table but are never candidates
+        every = cs.load_tables(keep_unknown=True)
+        unknown = [c for c in every if None in (c.frequency_hz, c.bandwidth_hz, c.sweep_rate_hz)]
+        self.assertTrue(unknown and len(every) == len(builtin) + len(unknown))
+        out = Path(self.tmp.name) / "roundtrip.csv"
+        cs.write_table(unknown, str(out))
+        self.assertEqual(len(cs.load_tables([str(out)], keep_unknown=True)), len(unknown))
+        self.assertEqual(cs.load_tables([str(out)]), [])
         rx = cs.Receiver(*LWASV, 13.5e6, 100e3, 2.0, -99.259377e3, date(2023, 12, 9))
         cands = cs.candidates(builtin, rx)
-        self.assertEqual(cs.identify(-84.0, 19.0, cands, rx).label, "SLO: ARG1/DCSR/ESTR/FBK1/LUIS/PTC1")
-        self.assertEqual(cs.identify(-92.0, 23.0, cands, rx).label, "USC: SCCI/SCDH")
+        # the 2023-11-21 list has the UCSB 13.5 MHz stations on -99.259 kHz too: from New Mexico they are
+        # 1-4 deg from the SLO ones, so direction alone cannot pick the network
+        west = cs.identify(-84.0, 19.0, cands, rx)
+        self.assertEqual(west.status, "ambiguous")
+        self.assertEqual({m.config.network for m in west.matches if m.passed}, {"SLO", "UCSB"})
+        self.assertEqual(cs.identify(-92.0, 23.0, cands, rx).matches[0].config.code, "SCCI")
         table = Path(self.tmp.name) / "merged.csv"
         before, after = cs.merge_into_builtin([str(Path(self.tmp.name) / "a.csv")], str(table))
-        self.assertEqual((before, after), (0, 8))
+        self.assertEqual((before, after), (0, 9))               # KAP's -9999 row is kept in the table
         before, after = cs.merge_into_builtin([str(Path(self.tmp.name) / "b.csv")], str(table))
-        self.assertEqual((before, after), (8, 9))               # ARG1's newer configuration is added
+        self.assertEqual((before, after), (9, 10))              # ARG1's newer configuration is added
         again = cs.merge_into_builtin([str(Path(self.tmp.name) / "b.csv")], str(table))
-        self.assertEqual(again, (9, 9))                         # merging is idempotent
+        self.assertEqual(again, (10, 10))                       # merging is idempotent
+        self.assertNotIn("KAP", {c.code for c in cs.load_tables([str(table)])})
         arg1 = [c for c in cs.load_tables([str(table)]) if c.code == "ARG1"]
         self.assertEqual(sorted(c.sources for c in arg1), [("a",), ("b",)])
         both = [c for c in cs.load_tables([str(table)]) if c.code == "PTC1"][0]
@@ -116,7 +167,7 @@ class StationTests(unittest.TestCase):
                                                              "--codar-stations"])
         self.assertEqual(bare.codar_stations, [])               # bare flag -> built-in table
         # the synthetic file has no UTC, so no date filter: NEW1 (added later) stays a candidate
-        self.assertEqual(annotations[0]["label"], "SLO: ARG1/NEW1/PTC1")
+        self.assertEqual(annotations[0][0]["label"], "SLO: ARG1/NEW1/PTC1")
         self.assertTrue(any("unknown date" in line for line in lines))
 
 

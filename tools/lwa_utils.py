@@ -1,4 +1,4 @@
-"""Everything specific to the LWA: station metadata (LWA-SV via LSL) and TBN recordings.
+"""Everything specific to the LWA: station metadata (via LSL; LWA1 by default) and TBN recordings.
 
 Station
     ``parse_stands``/``pol_indices``, antenna lookup by physical (stand, pol),
@@ -61,19 +61,56 @@ def pol_indices(pol):
     raise ValueError("--pol must be both, x/y, or 0/1")
 
 
-SSMIF_PATH = os.path.expanduser(os.environ["LWA_SSMIF"]) if os.environ.get("LWA_SSMIF") else None
+# Station descriptions bundled with LSL, by name. Anything else given to --ssmif or
+# $LWA_SSMIF is a path to an SSMIF file or an observation metadata tarball.
+BUNDLED_STATIONS = {"lwa1": "lwa1", "lwa-1": "lwa1", "lwasv": "lwasv", "lwa-sv": "lwasv"}
+DEFAULT_STATION = "lwa1"
+STATION_IDS = {"VL": "lwa1", "SV": "lwasv", "NA": "lwana"}       # SSMIF station ID -> name
+STATION_LOCATIONS = {                                             # GEO_N, GEO_E, GEO_EL from the SSMIFs
+    "lwa1": (34.068894, -107.628350, 2133.6),
+    "lwasv": (34.348358, -106.885783, 1477.8),
+}
+
+
+def _resolve_ssmif(value):
+    """None, a bundled station name ("lwa1", "lwasv"), or an expanded file path."""
+    if value is None or not str(value).strip():
+        return None
+    key = str(value).strip().lower()
+    return BUNDLED_STATIONS[key] if key in BUNDLED_STATIONS else os.path.expanduser(str(value))
+
+
+SSMIF_PATH = _resolve_ssmif(os.environ.get("LWA_SSMIF"))
 
 
 def use_ssmif(path):
-    """Use this station description instead of LSL's bundled LWA-SV one.
+    """Use this station description instead of LSL's bundled LWA1 one.
 
-    ``path`` may be an SSMIF file or an observation metadata tarball (.tgz).
-    The SSMIF must match the observation date: digitizer wiring, cable lengths
-    and stand status change over time.
+    ``path`` may be an SSMIF file, an observation metadata tarball (.tgz), or the
+    name of a station bundled with LSL ("lwa1", "lwasv"). A file must match the
+    observation date: digitizer wiring, cable lengths and stand status change over
+    time, so a dated SSMIF is better than the bundled one whenever it exists.
     """
     global SSMIF_PATH
-    SSMIF_PATH = None if path is None else os.path.expanduser(path)
+    SSMIF_PATH = _resolve_ssmif(path)
     _station.cache_clear()
+
+
+def station_description():
+    """The station description in use, as recorded in file metadata."""
+    if SSMIF_PATH is None or SSMIF_PATH in STATION_LOCATIONS:
+        name = SSMIF_PATH or DEFAULT_STATION
+        return f"LSL bundled {'LWA1' if name == 'lwa1' else 'LWA-SV'}"
+    return SSMIF_PATH
+
+
+def station_name():
+    """'lwa1' or 'lwasv' (from the SSMIF's station ID when a file is in use)."""
+    if SSMIF_PATH is None or SSMIF_PATH in STATION_LOCATIONS:
+        return SSMIF_PATH or DEFAULT_STATION
+    st = _station()
+    sid = str(getattr(st, "id", "") or "").strip().upper()
+    return STATION_IDS.get(sid, str(getattr(st, "name", "") or sid or "unknown").lower())
 
 
 @functools.lru_cache(maxsize=1)
@@ -81,9 +118,9 @@ def _station():
     try:
         from lsl.common import stations
     except ImportError as exc:
-        raise ImportError("LWA-SV station metadata requires LSL; run in your LSL environment") from exc
-    if SSMIF_PATH is None:
-        return stations.lwasv
+        raise ImportError("LWA station metadata requires LSL; run in your LSL environment") from exc
+    if SSMIF_PATH is None or SSMIF_PATH in STATION_LOCATIONS:
+        return getattr(stations, SSMIF_PATH or DEFAULT_STATION)
     if not os.path.isfile(SSMIF_PATH):
         raise FileNotFoundError(f"Station description not found: {SSMIF_PATH} (from --ssmif or $LWA_SSMIF)")
     if SSMIF_PATH.endswith((".tgz", ".tar.gz", ".tar")):
@@ -92,38 +129,37 @@ def _station():
     return stations.parse_ssmif(SSMIF_PATH)
 
 
-def lwasv_antennas():
-    """Map (stand, pol) -> LSL Antenna for LWA-SV (bundled SSMIF unless ``use_ssmif`` was called)."""
+def station_antennas():
+    """Map (stand, pol) -> LSL Antenna for the station in use (LSL's bundled LWA1 unless ``use_ssmif`` was called)."""
     result = {}
     for antenna in _station().antennas:
         key = (int(antenna.stand.id), int(antenna.pol))
         if key in result:
-            raise ValueError(f"Duplicate LWA-SV antenna mapping: {key}")
+            raise ValueError(f"Duplicate antenna mapping in the station description: {key}")
         result[key] = antenna
     return result
 
 
-LWASV_LOCATION = (34.348358, -106.885783, 1477.8)   # GEO_N, GEO_E, GEO_EL of the bundled SSMIF
-
-
 def station_location():
-    """(latitude [deg N], longitude [deg E], elevation [m]) of the station from the SSMIF in use."""
+    """(latitude [deg N], longitude [deg E], elevation [m]) of the station in use."""
+    if SSMIF_PATH is None or SSMIF_PATH in STATION_LOCATIONS:
+        return STATION_LOCATIONS[SSMIF_PATH or DEFAULT_STATION]
     st = _station()
     if all(hasattr(st, k) for k in ("lat", "long", "elev")):
         return float(np.degrees(st.lat)), float(np.degrees(st.long)), float(st.elev)
-    return LWASV_LOCATION
+    return STATION_LOCATIONS[station_name()] if station_name() in STATION_LOCATIONS else STATION_LOCATIONS[DEFAULT_STATION]
 
 
 def station_stands():
-    return sorted({stand for stand, _ in lwasv_antennas()})
+    return sorted({stand for stand, _ in station_antennas()})
 
 
 def selected_antennas(stands, pols):
-    lookup = lwasv_antennas()
+    lookup = station_antennas()
     keys = [(int(s), int(p)) for s, p in zip(stands, pols)]
     missing = [k for k in keys if k not in lookup]
     if missing:
-        raise ValueError(f"Missing LWA-SV antenna mappings: {missing}")
+        raise ValueError(f"Missing antenna mappings in the station description: {missing}")
     return [lookup[k] for k in keys]
 
 
@@ -137,13 +173,13 @@ def tbn_stream_indices(stands, pol):
     channel_pols = [p for _ in stands for p in pol_indices(pol)]
     rows = [int(a.digitizer) - 1 for a in selected_antennas(channel_stands, channel_pols)]
     if any(r < 0 for r in rows) or len(set(rows)) != len(rows):
-        raise ValueError("Selected LWA-SV antennas have invalid or duplicate digitizer mappings")
+        raise ValueError("Selected antennas have invalid or duplicate digitizer mappings")
     return np.asarray(rows, int), np.asarray(channel_stands, int), np.asarray(channel_pols, int)
 
 
 def ids_from_digitizers(digitizers):
     """Physical (stands, pols) for TBN digitizer numbers under the current station description."""
-    by_digitizer = {int(a.digitizer): a for a in lwasv_antennas().values() if a.digitizer > 0}
+    by_digitizer = {int(a.digitizer): a for a in station_antennas().values() if a.digitizer > 0}
     missing = sorted(set(int(d) for d in digitizers) - set(by_digitizer))
     if missing:
         raise ValueError(f"Digitizers absent from the station description: {missing}")
@@ -158,11 +194,11 @@ def resolve_legacy_channel_ids(stands, pols, metadata):
         return np.asarray(stands, int), np.asarray(pols, int)
     if kind != "legacy_input_pair":
         raise ValueError(f"Unknown channel ID convention: {kind}")
-    by_digitizer = {int(a.digitizer): a for a in lwasv_antennas().values() if a.digitizer > 0}
+    by_digitizer = {int(a.digitizer): a for a in station_antennas().values() if a.digitizer > 0}
     digitizers = [2 * (int(s) - 1) + int(p) + 1 for s, p in zip(stands, pols)]
     missing = sorted(set(digitizers) - set(by_digitizer))
     if missing:
-        raise ValueError(f"Legacy cache digitizers absent from LWA-SV metadata: {missing}")
+        raise ValueError(f"Legacy cache digitizers absent from the station description: {missing}")
     antennas = [by_digitizer[d] for d in digitizers]
     metadata["channel_id_kind"] = "physical_stand"
     metadata["channel_digitizers"] = digitizers
@@ -172,7 +208,7 @@ def resolve_legacy_channel_ids(stands, pols, metadata):
 def stand_positions(stands):
     """(N, 3) east/north/up positions in metres and a mask of stands that were found."""
     by_stand = {}
-    for antenna in lwasv_antennas().values():
+    for antenna in station_antennas().values():
         by_stand[int(antenna.stand.id)] = (float(antenna.stand.x), float(antenna.stand.y), float(antenna.stand.z))
     found = np.array([int(s) in by_stand for s in stands], bool)
     positions = np.array([by_stand[int(s)] for s, ok in zip(stands, found) if ok], float).reshape(-1, 3)

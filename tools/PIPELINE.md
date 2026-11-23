@@ -6,7 +6,7 @@ raw WAV (mono real / stereo I/Q) ───────────────�
                                              ▼
                                    export_rdc0.py   RDC0  (adc, pulses, channels)      raw sweeps
                                              ▼
-                                   export_rdc1.py   RDC1  (delay, pulses, channels)    dechirp + range FFT
+                                   export_rdc1.py   RDC1  (delay, pulses, channels)    matched filter (or dechirp + FFT)
                                     ┌────────┴─────────┐
                   export_rdc2.py    ▼                  ▼   export_rdc2p.py
       RDC2 (frames, delay, doppler, channels)     RDC2P (delay, estimates, channels)
@@ -45,30 +45,44 @@ path.
 
 | Module | Contents |
 | --- | --- |
-| `lfm_utils.py` | Maths only: reference chirp and windows, dechirp/range FFT, delay axis, Doppler FFT, pulse-pair (phase) Doppler, sweep alignment, STFT, LFM estimation from a spectrogram |
-| `lwa_utils.py` | Everything LWA-specific: LWA-SV stand positions, cable delays and phase factors, digitizer mapping, bad stands (SSMIF status), legacy channel labels; TBN frame-header scan, quality summary, `TBNReader` (samples placed by timetag, gaps as NaN, exact 196 MHz timestamps; LSL is used only for station metadata) and trimming for `preprocess_tbn.py` |
+| `lfm_utils.py` | Maths only: reference chirp and windows, range compression (circular matched filter, or dechirp + FFT), delay axis, Doppler FFT, pulse-pair (phase) Doppler, sweep alignment, STFT, LFM estimation from a spectrogram, waveform-scan kernels (lag-product spectrum, compression profiles) |
+| `lwa_utils.py` | Everything LWA-specific: the station description (LSL's bundled LWA1 by default, `--ssmif` for a dated file or `lwasv`), stand positions, cable delays and phase factors, digitizer mapping, bad stands (SSMIF status), legacy channel labels; TBN frame-header scan, quality summary, `TBNReader` (samples placed by timetag, gaps as NaN, exact 196 MHz timestamps; LSL is used only for station metadata) and trimming for `preprocess_tbn.py` |
 | `wav_utils.py` | WAV only: info, block reader, UTC parsing |
 | `rdc_io.py` | HDF5 layout: `RDCFile` reader (all stages, legacy formats), `StageWriter`, metadata/history, atomic output |
 | `rdc_utils.py` | Stage-to-stage processing: channel selection, sweep packing, `RDCView` (brings any stored stage to the product a plot needs), exports, array processing (`ArrayProcessor`, covariance, steering, angle spectra, beam pattern), plot reductions |
 | `calibration_utils.py` | Array self-calibration: plane-wave fit, phase-gain estimation (alternating fit, ramp kept out), held-out validation, the calibration file (`ArrayCalibration`) |
-| `wavefront.py` | Wavefront tracking: reference plane, per-stand unwrapping in time, plane fits per frame, static/dynamic residuals, `EchoTracker` (follows one echo through the frames) |
-| `codar_stations.py` | HF radar source identification: the built-in HFRnet station table (`hfrnet_stations.csv`, updated with `--add`), bearings and sky-wave geometry from the station, waveform/band/date filters, the labelling rule |
+| `codar_stations.py` | HF radar source identification: the built-in HFRnet station table (`resources/hfrnet_stations.csv`, updated with `--add`), bearings and sky-wave geometry from the station, waveform/band/date filters, the labelling rule, hop count from elevation (`--hops CODE ELEV`) |
+| `summary_utils.py` | The shared processing summary: the findings log (`processing_summary.csv` next to the plots) and its merge into one row per signal (`processing_summary_merged.csv`) |
+| `map_utils.py` | Maps without a mapping library: the shipped outline file (`resources/map_outlines.npz`, Natural Earth; rebuilt with `--build`), Lambert conformal projection, great-circle and n-hop reflection points |
 | `plotting_utils.py` | Figures only (arrays → PNG) and video assembly |
 | `cli.py` | Shared command-line flag groups and the export command line |
+
+
+Files the scripts read are in `tools/resources/`, so copying `tools/` is all a
+machine needs:
+
+| File | Used by | What |
+| --- | --- | --- |
+| `hfrnet_stations.csv` | codar_stations, scan_lfm, sky maps, station map | HFRnet station table (`codar_stations.py --add` merges new exports) |
+| `map_outlines.npz` | station map | Natural Earth coastlines, borders, states (`map_utils.py --build`) |
+| `giro_stations.txt` | station map | GIRO ionosonde list (DIDBase Fast Station List) |
+| `giro/<URSI>_<date>.txt` | station map, `ionosonde.py` | GIRO FastChar characteristics for the hop-count estimates |
+| `ssmif/LD021_0001.tgz` | every LWA command (`$LWA_SSMIF`) | station description for 2023-12-09 |
 
 ## Commands and the inputs they accept
 
 | Command | RDC0 | RDC1 | RDC2 | RDC2P | RDC3 |
 | --- | :-: | :-: | :-: | :-: | :-: |
 | `plot_spectrogram.py` (`--average` for a mean spectrum) | ✓ | | | | |
-| `plot_dechirp.py` (delay vs time) | ✓ | ✓ | ✓ * | | |
-| `plot_power_delay.py` | ✓ | ✓ | ✓ * | | |
+| `plot_power_delay_profile.py` (delay vs time, plus its time average) | ✓ | ✓ | ✓ * | | |
 | `plot_delay_doppler.py` / `sliding_delay_doppler.py` | ✓ | ✓ | ✓ | | ✓ |
 | `plot_doppler_time.py` | ✓ | ✓ | ✓ * | | |
 | `plot_phase_doppler.py` (`--kind delay-time` or `doppler-time`) / `sliding_phase_doppler.py` | ✓ | ✓ | ✓ * | ✓ | |
 | `calibrate_array.py` | ✓ | ✓ | ✓ | | |
 | `check_array_calibration.py` | ✓ | ✓ | ✓ | | |
-| `plot_wavefront.py` | ✓ | ✓ | ✓ | | |
+| `scan_lfm.py` (which chirp bandwidths and sweep rates compress) | ✓ | | | | |
+
+`plot_station_map.py` (receiver, stations, paths, midpoints and reflection points) needs no recording.
 
 \* uses the RDC1 retained inside the RDC2 file.
 
@@ -99,18 +113,42 @@ same data export an RDC1 once.
     `--beam-pattern-output`) defaults to all stands, x pol, and drops SSMIF-flagged stands.
     With `--calibration CAL.h5` it also drops the stands that calibration flagged.
 * **Station description.** Stand identities (via TBN digitizer), positions,
-  cable delays and status come from LSL's bundled LWA-SV SSMIF unless
+  cable delays and status come from LSL's bundled LWA1 SSMIF unless
   `--ssmif FILE` (an SSMIF or an observation metadata `.tgz`) or `$LWA_SSMIF`
-  gives one for the observation date. Files store each channel's digitizer, so
-  a dated SSMIF re-derives stand identities without re-exporting.
+  gives one for the observation date; `--ssmif lwasv` uses LSL's bundled LWA-SV
+  file (e.g. for the 2019 Santa Fe recordings, which are LWA-SV). The 2023-12-09
+  CODAR session (LD021) is LWA1: its `LD021_0001.tgz` SSMIF is station `VL` at
+  34.0689 N, 107.6284 W. Still use the dated file: the bundled one is not specific
+  to the observation date. Files store each channel's digitizer, so a dated SSMIF
+  re-derives stand identities without re-exporting, and files made before LWA1
+  became the default (they record "LSL bundled LWA-SV" or nothing) are re-labelled
+  from their digitizers when read.
+* **Power scale.** Plots are relative, as in Peter's `lwa_radar.py`: delay-Doppler maps,
+  power-delay profiles, Doppler-time and phase-Doppler plots in dB above their own median
+  (the noise floor; colour range 0 dB to the map's peak, at least 10 dB), spectrograms
+  and spectra in dB below their peak (−40 to 0 dB), sky maps in dB below their peak.
+  `--vmin/--vmax` are on those scales. The absolute numbers (counts² times processing gains)
+  change with every setting, so they are not drawn; SNRs in the summary are unaffected.
 * **Delay window.** The default is ±1.5 ms around the strongest delay in a
   preview; `--d-min/--d-max` set it explicitly and `--full-delay` shows
   everything stored. Delays are relative to the sweep reference timing, not
   physical ranges.
-* **Sweep offset.** With the echo far into the sweep (e.g. 218 ms of 500 ms) and
-  |B| ≠ fs, dechirping leaves a weaker copy at +(fs−|B|)/|k| and loses about 3 dB.
-  Export with `--offset` ≈ observed delay − a few ms to put echoes near 0 ms.
-  The offset is recorded in the metadata.
+* **Range compression.** By default (`--range-method matched`, since 2026-11-21) each
+  whole sweep is correlated circularly with the reference chirp. A CODAR sawtooth
+  repeats every sweep, so a received sweep is the reference rotated by the echo delay
+  and every delay from 0 to one period compresses fully, also when |B| > fs. The
+  reference is zeroed where its instantaneous frequency is outside ±0.98·fs/2 (TBN has
+  filtered that part away), and `--dechirp-window` (default Hann) spans only the
+  in-band part (all of the sweep at 99.26 kHz; 87.5–412.5 ms of 500 ms at 150.7 kHz).
+  Delay bins are 1/fs (10 µs) apart. This is the matched filter of Peter's
+  `lwa_radar.py` (same output, up to scale).
+  `--range-method dechirp` is the older stretch processing (multiply by the reference,
+  FFT). With the echo far into the sweep (e.g. 218 ms of 500 ms) and |B| ≠ fs it loses
+  up to ~4 dB and leaves a copy at +(fs−|B|)/|k|; with |B| > fs some delays are not
+  reachable at all. Files made before 2026-11-21 are dechirped (no `range_method` in
+  their metadata); commands keep the method a file was made with.
+* **Sweep offset.** `--offset` moves the sweep grid (e.g. to put echoes near 0 ms). It
+  is only needed with `--range-method dechirp`. The offset is recorded in the metadata.
 
 ## Array calibration
 
@@ -170,7 +208,8 @@ LWA_SSMIF=/path/to/LD021_0001.tgz python tools/...   # or for one command
 python tools/... --ssmif /path/to/LD021_0001.tgz     # or as a flag
 ```
 
-The value is an SSMIF text file or an observation metadata `.tgz`. Exports need it
+The value is an SSMIF text file, an observation metadata `.tgz`, or `lwa1`/`lwasv`
+for the files bundled with LSL (default `lwa1`). Exports need it
 to map digitizers to stands and to apply `--bad-stands status`. Array commands
 need it for positions and cable delays. Files store each channel's digitizer, so
 setting it later still re-labels the stands correctly.
@@ -191,12 +230,108 @@ the previous tuning.
 python tools/export_rdc0.py raw.dat --sweep-frequency 2 --bandwidth=-99.259377e3 \
     --stands 10 --tend 30 --output test_rdc0.h5
 python tools/plot_spectrogram.py test_rdc0.h5 --overlay-lfm --output spec.png
-python tools/plot_power_delay.py test_rdc0.h5 --full-delay --output pdp.png
+python tools/plot_power_delay_profile.py test_rdc0.h5 --full-delay --output pdp.png
 ```
 
-The spectrogram estimate confirms the sweep rate and bandwidth. The full-delay
-profile shows where the echoes are. Then choose `--d-min/--d-max`, and
-`--offset` if the echoes sit far into the sweep (see "Sweep offset").
+The spectrogram estimate confirms the sweep rate and bandwidth of the strongest
+ridge. It cannot see a weaker transmitter on the same frequency (24.55 MHz on
+2023-12-09 carries a -150.727 kHz and a -99.259 kHz waveform), so scan for every
+waveform that compresses:
+
+```bash
+python tools/scan_lfm.py raw.dat --stands 1,2,20,60,100,150,200,250 --pol x --duration 20 \
+    --output scan.png --json scan.json
+```
+
+Station-table waveforms come first; a waveform is worked out blind only when
+nothing in the table fits.
+
+1. **Lag-product spectrum (blind).** The lag product x(t)·x*(t−lag) of a chirp is a
+   tone at the chirp rate k = bandwidth × sweep rate, so its peaks fix k but not
+   the sweep rate. CODARs are gated (FMICW: on about half of every ~0.5–1 ms), and
+   the tone only appears while the transmitter is on at both t and t−lag. At some
+   lags that overlap is poor and the power moves to sidelines at k ± n·f_gate/lag
+   (on 060287_010275465 the 10 ms lag missed PCYC's −301.4 kHz/s entirely). The
+   sidelines move with the lag and k does not, so the spectrum is taken at 5, 7,
+   11, 13 and 17 ms (`--lags`; no common factor, so sidelines of different lags
+   rarely coincide) and the median over lags is kept.
+2. **Sweep rate from the resets.** For each lag peak the scan dechirps with a
+   continuous chirp at k and follows the beat in 25 ms windows. The beat holds
+   steady through a sweep and jumps when the transmitter resets; the coherence of
+   the reset times over trial rates of 0.2–5 Hz picks the period (the lowest rate
+   within 80% of the best, since multiples line up too), and a line fit of reset
+   time against sweep number gives the rate and its error.
+3. **Match to the station table.** The HFRnet stations active on the date whose
+   sweep overlaps the band (and any `--candidates`) are matched to each peak by
+   chirp rate (within 0.3% or 3 lag bins, `--match-tolerance`). A match is used
+   exactly as documented: bandwidth and sweep rate. Its bandwidth is still
+   scanned ±100 Hz once it is found, but only as a check drawn in the plot (on
+   060287_010274515 both scans peak at the table value). The reset measurement is
+   then a consistency check, reported in the summary. When documented waveforms
+   of different sweep rates share the chirp rate (−99.26 kHz at 2 Hz and
+   −49.63 kHz at 4 Hz), the measured rate picks between them, or the dechirped
+   test when the resets cannot be measured. Documented waveforms that match no
+   lag peak are dechirped too, in case the lag spectrum missed a weak transmitter.
+4. **Not in the table.** A lag peak with no match takes its measured sweep rate,
+   snapped to a CODAR rate within 3σ and 2% (the rare 2.007735 Hz of the OSU
+   12.2 MHz stations only when 2 Hz does not fit), or the dechirped test if the
+   resets cannot be measured. Its bandwidth is then scanned ±100 Hz on whole
+   sweeps (`--fine-span`), since the lag peak fixes it only to some tens of Hz and
+   whole sweeps need it to ~1 Hz. These are flagged "not in table".
+5. **Present or not.** Each waveform is dechirped on 10 s of whole sweeps. It is
+   present when the delay profile peaks (contrast ≥ `--min-contrast-db`) and the
+   peak needs that bandwidth: the contrast must drop ≥ 3 dB at ±50 Hz. That
+   rejects profiles whose floor alone gives a high contrast.
+
+The dechirped test: when the sweep is wider than the 100 kHz band, the same chirp
+rate also compresses at other sweep rates with the bandwidth scaled to keep k.
+On 25 ms pieces tiling a sweep, the true rate puts every piece's echo in one
+delay bin; a wrong rate splits it between delays. Its result for every rate is
+printed as the "cross-check" line of each waveform and kept in the JSON.
+
+The plot has four panels: the lag-product spectrum (waveforms found in colour,
+table waveforms dotted, lag peaks as triangles), the reset coherence against trial
+sweep rate, the bandwidth scan, and the delay profile (echo delays labelled,
+copies x).
+
+On 060287_010274515 (13.5 MHz) the two lag peaks match the table: −99.259 kHz at
+2 Hz (ARG1/DCSR/ESTR/…; resets 1.998 ± 0.002 Hz) and −51.468 kHz at 2 Hz (BML1,
+GCVE, PPNS, PREY, SLID; resets 1.98 ± 0.01 Hz). The other two lag peaks and the
+seven table waveforms with no lag peak do not compress. Use the bandwidths it
+reports for `--bandwidth`.
+
+The whole-sweep profiles use the matched filter, so every delay is reachable. (The
+25 ms pieces of the rate test are dechirped, which is what that test needs.)
+
+Copies are not echoes. The compressed delay profile has weaker copies of each
+echo at the same Doppler: gating sidebands in symmetric pairs at ±s around it
+(±5.18 ms for the 13.5 MHz CODARs, ±10.31 ms for BML), and, in dechirped data only,
+the sweep-wrap replica at +(fs−|B|)/|k| when |B| ≠ fs. The scan marks them with an x, lists
+them under their echo, and does not count them as echoes; plot_delay_doppler
+does the same with the strongest cells, and the summary folds any that slip
+through into the echo's `copies` column.
+
+`scan_lfm.py` removes the comb from its delay profiles by default (the same CLEAN on the
+whole-sweep matched filter, every order that fits in half a sweep; `--keep-sidebands` turns it
+off). The plot draws the profile before the CLEAN faintly behind it, and marks with x only the
+copies still in the profile. The comb spacing is measured to a fraction of a lag bin (a parabola
+through each first-order peak), so the predicted position of order n stays on its peak; Peter's
+`detect_comb` keeps whole bins, which puts the higher orders a few bins off.
+
+To remove the gating comb instead of only labelling it, add `--suppress-sidebands` when
+exporting RDC1 from the raw file (a port of `detect_comb` and the adaptive `sideband_clean`
+in Peter's `lwa_radar.py`; matched filter only). The first 32 sweeps of 8 channels find the
+strongest echo (or the one near `--sideband-echo MS`), the comb spacing from the symmetric
+pair around it (1.5–40 ms), and each order's level and coherence. Then, per block of
+`--sideband-block` sweeps (default 20) and per channel, every sideband bin's complex ratio to
+the echo is measured and the echo times that ratio is subtracted. Only what moves exactly with
+that echo goes: another echo at a sideband delay with a different Doppler decorrelates over
+the block and stays, one with the same Doppler would be partly removed. An echo exactly n
+comb spacings from the cleaned one also loses r(n)·r(−n) of its amplitude (its own copy sits
+on the cleaned echo; about −0.9 dB when the orders are 10 dB down). One echo's comb is
+removed per export; the comb found is recorded in `sideband_suppression` in the metadata.
+
+The full-delay profile shows where the echoes are. Then choose `--d-min/--d-max`.
 
 ### 3. Export the session (RDC1)
 
@@ -248,8 +383,7 @@ the export stops with an error if they do.
 the first stand. `--pol x|y|both` selects polarizations.
 
 ```bash
-python tools/plot_dechirp.py s13p5_rdc1.h5 --stands all --navg 4 --output dechirp.png        # delay vs time
-python tools/plot_power_delay.py s13p5_rdc1.h5 --stands all --output pdp.png
+python tools/plot_power_delay_profile.py s13p5_rdc1.h5 --stands all --navg 4 --output pdp.png  # delay vs time + mean
 python tools/plot_doppler_time.py s13p5_rdc1.h5 --stands all --integration-time 60 --hop-time 10 --output dt.png
 python tools/plot_delay_doppler.py s13p5_rdc1.h5 --stands all --tstart 0 --tend 120 --output dd.png
 python tools/sliding_delay_doppler.py s13p5_rdc1.h5 --stands all --integration-time 120 --hop-time 30 \
@@ -301,7 +435,7 @@ python tools/export_rdc3.py s13p5_rdc1.h5 --pol x --calibration cal_s13p5_x.h5 -
 
 **Naming the HF radar behind a peak.** Add `--codar-stations` to any sky-map
 command. It uses the HFRnet station table that ships with the code
-(`tools/hfrnet_stations.csv`); give CSV paths after the flag to use other tables
+(`tools/resources/hfrnet_stations.csv`); give CSV paths after the flag to use other tables
 instead. The sky map then makes room for a panel on the right that lists, for
 each peak, the candidate stations with their bearing, azimuth error and
 distance, and the sky-wave path that fits the elevation. Peaks that can be named
@@ -334,6 +468,74 @@ How a station is chosen:
    peak's azimuth, and the peak's elevation fits a 1–3 hop path reflecting at
    90–450 km.
 
+**Hop count.** For each candidate the panel shows the hop count and virtual
+height the measured elevation implies (mirror model, spherical Earth), e.g.
+`1F 257km or 2E`. More hops mean a lower reflection, so the choice is the hop
+count whose height is plausible: F region (180–450 km) first, then E / low F1
+(90–180 km), then either only within the elevation tolerance (marked `?`).
+Other hop counts that also fit are listed after "or": elevation alone cannot
+tell one F hop from two E hops, and the group delays of the alternatives differ
+by only ~0.1 ms. For any station and elevation:
+
+```bash
+python tools/codar_stations.py --hops FOCF 10.3        # 1 hop needs 560 km -> 2 F hops at 212 km
+```
+
+**Map of the paths.** `plot_station_map.py` draws the receiver (LWA1 by default),
+the stations, their great-circle paths, the one-hop midpoints, and the sky
+reflection points and ground bounces of n-hop paths. With `--from-summary` the
+stations and their elevations come from the processing summary: every signal that
+array processing gave an azimuth/elevation (sky-map peaks, or the beam look
+direction) is matched to the stations whose waveform, band and date fit its file
+and whose bearing and a 1–3 hop path fit its direction (the same test as the sky
+maps), and each is drawn with the hop count its elevation gives. Paths are
+coloured per network and hop count, with the elevation range and number of
+signals in the legend. Run it after the delay-Doppler jobs; `--files 4515` and
+`--min-snr` narrow it down. Stations can also be given by hand (`CODE@ELEV` or
+`CODE:HOPS`):
+
+```bash
+python tools/plot_station_map.py --from-summary --min-snr 10 \
+    --output ../plots/paths.png --csv ../plots/paths.csv
+python tools/plot_station_map.py --from-summary --files 5465 --band 24.55 --bandwidth -150727.2 \
+    --sweep-rate 2 --date 2023-12-09 --output ../plots/paths_5465.png    # plus every matching station, in grey
+```
+
+**Ionosondes (GIRO).** The GIRO ionosondes inside the map are drawn as stars, from
+`tools/resources/giro_stations.txt` (the DIDBase Fast Station List). With GIRO
+FastChar files in `tools/resources/giro/` (the default `--iono-data`), the hop count comes from
+the measured ionosphere instead of a fixed range of layer heights. Each file is one
+station and day, saved as `<URSI>_<date>.txt` from
+
+    https://lgdc.uml.edu/fastchar/getbest?ursiCode=BC840&charName=foF2,foF1,foE,foEs,MUF%28D%29,M%28D%29,hmF2,hmF1,hmE,B0,B1&DMUF=3000&fromDate=2023%2F12%2F09+15%3A30%3A00&toDate=2023%2F12%2F09+19%3A00%3A00
+
+For each path and hop count, `tools/ionosonde.py`:
+
+1. takes the ionosonde nearest any of the hop's reflection points (within 1500 km)
+   at the recording's time, interpolated between its 5-minute soundings, dropping
+   low-confidence and mis-scaled rows;
+2. builds an electron-density profile from its characteristics: a Chapman E layer,
+   an F1 parabola, and the IRI F2 bottomside from hmF2, B0 and B1 (no magnetic field);
+3. finds the mirror heights where the virtual height of the equivalent vertical
+   frequency f·cos(φ) equals the reflection height (secant law with Martyn's theorem,
+   spherical Earth). Per layer there is a low ray and a high ray, and none above
+   that hop's MUF.
+
+The hop count drawn is the one whose predicted elevation is within 5° of the
+measured one, closest first. Without an ionosonde near the path, or when nothing fits,
+the fixed-height mirror model is used and the path table says so. The table and the
+summary note name the ionosonde used, which is needed for the acknowledgement GIRO's
+CC-BY-NC-SA 4.0 terms require. On 2023-12-09 only Boulder (BC840) and Austin
+(AU930) have data, about 950–1250 km from most reflection points, so the profiles
+are representative rather than local. Run `python tools/ionosonde.py --data
+tools/resources/giro --path RXLAT,RXLON,TXLAT,TXLON --freq 13.5 --time 2023-12-09T16:00Z
+--elevation 21` for one path's options.
+
+Coastlines, borders and states come from `tools/resources/map_outlines.npz` (Natural
+Earth 1:50m, public domain, cut to North America). To rebuild or widen it from
+the Natural Earth downloads: `python tools/map_utils.py --build ne_50m_coastline.zip
+ne_50m_admin_0_boundary_lines_land.zip ne_50m_admin_1_states_provinces_lines.zip`.
+
 A label is given only when every other candidate fits at least 3° worse in
 azimuth. The label is one station, or one network when several of its
 GPS-synchronised stations fit equally well. Anything else is listed as
@@ -356,62 +558,116 @@ Auto-aimed videos write `look_directions.csv` (az/el per frame) into the
 `--output` directory. Sky maps are in dB relative to their own peak
 (`--angle-range-db`).
 
-### 7. Wavefront tracking (TIDs)
+## Everything for every file (cluster)
 
-A TID is hundreds of km long, so across the 100 m array it does not make
-fringes. It tilts the wavefront, and the arrival direction wanders slowly.
-`plot_wavefront.py` follows one echo through the Doppler frames and measures
-that tilt from the per-stand phases:
+`slurm/slurm_all.sh` reruns the standard plots for all ten 2023-12-09 files, one
+after another, in one job: `sbatch slurm_all.sh`. Its log is
+`slurm/out/slurm_all.out` and is replaced on each run. Create `slurm/out` once:
+SLURM does not create the folder, and a job whose log can't be opened fails without
+output. Per file:
 
-```bash
-python tools/plot_wavefront.py s13p5_rdc1.h5 --pol x --calibration cal_s13p5_x.h5 \
-    --d-min 3.5 --d-max 6 --echo-delay 4.37 --echo-doppler -0.4 \
-    --integration-time 2 --hop-time 0.5 --output wf.png \
-    --maps-output wf_maps.png --surface-output wf_3d/ --csv wf.csv --npz wf.npz
+1. spectrogram of the first 5 s;
+2. `scan_lfm` (with `--json`);
+3. for each strong waveform (best echo SNR ≥ 15 dB, at most 3 per file, picked by
+   `tools/strong_waveforms.py`): an RDC1 holding only the delays around its echoes,
+   named by its waveform (`<file>_rdc1_bw99p259_fsweep2.h5`); the PDP; Doppler vs
+   time; the x-pol calibration (`<file>_x_cal_<tag>.h5`); and the sliding array
+   delay-Doppler video with sky maps and station identification.
+
+Then it redraws the station maps (all files, and one per file) from the array
+directions in the summary, and prints the merged summary. Steps that finished in
+an earlier run are skipped, so a job that hits its time limit can simply be
+submitted again. To redo steps or run a subset:
+
+    sbatch --export=ALL,SKIP_EXISTING=0 slurm_all.sh
+    sbatch --export=ALL,FILES="060287_010274515 060287_010275465" slurm_all.sh
+
+A failed step is reported, the steps that need its output are skipped, and the rest
+carry on.
+
+Existing files are reused (`REUSE=0` turns this off). An RDC1, or an RDC2 that kept
+its RDC1, already in `../data` is used instead of a new export when it matches. To
+match, it must be the same recording with the same bandwidth (within 1 Hz) and sweep
+rate, cover the waveform's delays, hold x-pol channels and the whole file (no time
+cut), and have been made with the same station description. A file's existing
+`<file>_x_cal.h5` is used for every waveform of that file, because the stand gains
+do not depend on the waveform. `python tools/rdc_info.py ../data/*.h5` lists what
+each file holds (stages, bandwidth, sweep rate, delays, channels, station
+description), and `--full` adds every metadata key and the processing history:
+
+    python tools/rdc_info.py ../data/*.h5
+    python tools/rdc_info.py --find ../data --file 060287_010274515 --bandwidth -99259.377 \
+        --sweep-rate 2 --d-min 12.7 --d-max 22.1 --verbose    # what would be reused, and why not
+
+Outputs (`/project/6003738/onohlson/`):
+
+```
+plots/2023-12-09/
+  processing_summary.csv, processing_summary_merged.csv   every finding / one row per signal
+  station_map_all.png, station_map_all.csv                paths of every file's signals
+  .done/                                                  markers of finished steps
+  <file>/                                                 e.g. 060287_010274515/
+    <file>_spectrogram.png
+    <file>_lfm_scan.png, <file>_lfm_scan.json             waveforms, echoes, SNR
+    <file>_pdp_<tag>.png                                  one per strong waveform (tag: bw99p259_fsweep2)
+    <file>_doppler_time_<tag>.png
+    <file>_x_ADD_mvdr_<tag>/                              sliding array delay-Doppler
+      delay_doppler.mp4, look_directions.csv
+      angle_plot/angle_maps.mp4                           sky maps
+    <file>_station_map.png, <file>_station_map.csv
+data/
+  <file>_rdc1_<tag>.h5                                    RDC1 of one waveform, delays around its echoes
+  <file>_x_cal_<tag>.h5, <file>_x_cal_<tag>.csv           x-pol calibration
+slurm/out/slurm_all.out                                   the job's log
 ```
 
-How it works (details in `wavefront.py`):
+## Processing summary
 
-1. **Reference plane.** Every channel is divided by a fixed plane wave from the
-   session's median direction (or `--reference-az/--reference-el`). It is also
-   divided by the phase of the beam toward that direction, which removes the
-   common Doppler rotation and frame timing.
-2. **Unwrap in time, per stand, never across stands.** Neighbouring stands can
-   differ by more than π at 13–25 MHz and low elevation, and spatial unwrapping
-   is path dependent: one bad stand spreads its error to the stands reached
-   through it. Between frames 0.5 s apart, a stand's referenced phase barely
-   moves. Each increment is taken on the 2π branch nearest a plane fitted to
-   all increments, so fast-moving edge stands are followed too.
-3. **Remove each stand's time mean.** This removes every fixed per-stand error,
-   so the *changes* do not depend on the calibration. The mean minus its best
-   plane is the **static residual**: the error the calibration left, shown as
-   the first map.
-4. **Fit a plane every frame.** Its tilt gives az(t) and el(t). What is left is
-   the **residual**: non-planar structure, multipath and noise.
+`scan_lfm.py`, `plot_delay_doppler.py` / `sliding_delay_doppler.py` and
+`plot_station_map.py` add what they find to `processing_summary.csv` in the folder
+of their `--output` (the parent folder for videos), so every plot written to one
+folder shares one summary. `--summary PATH` or `$LFM_SUMMARY` pick another file,
+`--summary none` skips it. Re-running a command with the same input and output
+replaces its earlier rows; several jobs can write at once.
 
-Outputs:
+The log has a few rows per file and command:
 
-* `--output`: az/el from the phase planes, with the coarse grid fit of each
-  frame as grey dots; echo Doppler, delay and SNR; residual rms; and the
-  arrival-direction track in direction cosines.
-* `--maps-output`: the phase change (or `--map-quantity residual`) on the
-  ground at `--maps` times.
-* `--surface-output`: a 3D view (east, north, phase change) with the fitted
-  plane. It is coloured by `--surface-color residual|change|amplitude`. Give a
-  PNG for one frame (default: the largest tilt) or a directory for a video.
-* `--csv` and `--npz`: every per-frame number and array.
+| kind | from | what |
+| --- | --- | --- |
+| `waveform` | scan_lfm | bandwidth, sweep rate (measured, with how), echo delay and SNR, its copies, HFRnet stations with that waveform in the band |
+| `echo` | delay-Doppler, sky maps | one row per echo for the whole run: median delay, Doppler (with its range), SNR, direction (sky-map peaks, or the beam look direction) with its spread, the station named most often, `n_frames` |
+| `path` | station map | station, coordinates, distance, bearing, hop count, virtual height, reflection points |
 
-Without `--echo-delay/--echo-doppler`, the track starts at the strongest
-delay-localised echo. After that it follows the strongest cell within
-`--track-delay-bins/--track-doppler-bins` of the last one. Frames with an echo
-weaker than `--min-snr-db` are skipped. Stands whose residual does not stay put
-are dropped (`--min-consistency`).
+SNR (`snr_db`; merged: `scan_snr_db`, `dd_snr_db`) is 10·log10((P − N)/N): P the
+echo's power (its delay-profile bin, or its delay-Doppler cell) and N the mean
+noise power per bin, taken from the bins within ±25 ms of delay of the echo,
+leaving out ±1 ms around every echo and copy and anything above 10× their median.
+N is local because the profile's floor follows the receive filter and varies by
+several dB across the sweep. The scan's contrast (peak over the profile median) is
+kept in its notes.
 
-The frame scatter in the table shows the noise floor of the measurement. A TID
-should appear as a slow swing well above it, with a period of minutes. To get
-its horizontal wavelength and velocity, compare echoes that reflect at
-different points: different CODAR stations (`--codar-stations` names them),
-or LWA-1 together with LWA-SV.
+A delay-Doppler run collects the 3 strongest cells and the sky-map peaks of every
+frame, then consolidates them before writing: gating/sweep-wrap copies are
+removed frame by frame, cells within 0.5 ms of delay are one echo whatever the
+frame (the exact time in the file is not kept, only the first and last frame),
+echoes seen in fewer than 20% of the frames are dropped, and at most 5 are kept
+per file and waveform. Logs written before this are compacted the next time
+anything records into them.
+
+After each write the log is merged into `processing_summary_merged.csv`: one row
+per signal (file, bandwidth, sweep rate, echo delay within 1 ms mod the sweep),
+with the scan contrast, the median delay-Doppler peak, Doppler, the median
+direction and its spread over frames, the station and its path. Delays are put
+on the UTC-aligned sweep grid (the export `--offset` is added back), so scan and
+delay-Doppler delays agree. Mapped stations not tied to a recording get their
+own rows. Gating and sweep-wrap copies (a weaker row at the same Doppler, at a
+pair offset ±s or at the wrap offset from a stronger echo of the same waveform)
+are folded into that echo's row and listed in its `copies` column rather than
+kept as signals of their own. To read it:
+
+```bash
+python tools/summary_utils.py ../plots/processing_summary.csv --min-db 15
+```
 
 ## Examples
 
@@ -430,7 +686,7 @@ python tools/plot_delay_doppler.py clean_rdc2.h5 --integration-time 30 --output 
 python tools/export_rdc3.py clean_rdc2.h5 --look 166,58 --output clean_rdc3.h5
 python tools/check_array_calibration.py clean_rdc2.h5 --pol x
 
-export LWA_SSMIF=data/LD021_0001.tgz      # station description for 2023-12-09
+export LWA_SSMIF=tools/resources/ssmif/LD021_0001.tgz      # station description for 2023-12-09
 python tools/calibrate_array.py clean_rdc2.h5 --output cal_13p5.h5 --csv cal_13p5.csv
 python tools/plot_delay_doppler.py clean_rdc2.h5 --beamformer conventional \
   --calibration cal_13p5.h5 --angle-output sky_cal.png --output dd_cal.png
@@ -445,7 +701,8 @@ soundfile; LSL is not needed, because a fake station and synthetic TBN bytes are
 | --- | --- |
 | `splitTBNfix.py` | `preprocess_tbn.py`. It scans frame headers without LSL and finds captures by timetag (frame order inside a capture varies, and late frames can arrive after the next capture). It reports complete, partial, missing and late captures and gaps (`--report-only`), and cuts time ranges (`--tend` is an end time, `-r/-d` became `--chunk`). Trimming is no longer needed before export: exports read raw TBN with their own reader and place every frame by its timetag. |
 | `rdc_export.py --stage N`, `tbn_export_rdcN.py` | `export_rdc0.py`, `export_rdc1.py`, `export_rdc2.py`, new `export_rdc2p.py`, `export_rdc3.py` |
-| `dechirp_plot.py`, `plot_filter_output.py`, `doppler_time_plot.py`, `spectrogram.py` | `plot_dechirp.py`, `plot_power_delay.py`, `plot_doppler_time.py`, `plot_spectrogram.py` |
+| `dechirp_plot.py`, `plot_filter_output.py` (and the interim `plot_dechirp.py`, `plot_power_delay.py`) | `plot_power_delay_profile.py`: one figure with delay vs time and the time-averaged profile |
+| `doppler_time_plot.py`, `spectrogram.py` | `plot_doppler_time.py`, `plot_spectrogram.py` |
 | `phase_doppler_plot.py`, `phase_doppler_time_plot.py` | `plot_phase_doppler.py --kind delay-time / doppler-time` |
 | `array_delay_doppler.py`, `sliding_array_delay_doppler.py` | `plot_delay_doppler.py`, `sliding_delay_doppler.py` with `--beamformer` |
 | `rdc_cache.py`, `rdc_plot.py`, `rdc_plot_input.py`, `wav_rdc.py` | `rdc_io.py`, `rdc_utils.RDCView`, `wav_utils.py` |

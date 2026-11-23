@@ -7,7 +7,7 @@ same names with the same meaning. ``view_from_args`` opens an input as an
 
 import argparse
 
-from lfm_utils import WINDOW_CHOICES
+from lfm_utils import DEFAULT_RANGE_METHOD, RANGE_METHODS, WINDOW_CHOICES
 
 
 def parser(description):
@@ -65,8 +65,10 @@ def add_plot_output(p, video=False):
     else:
         g.add_argument("--output", required=True, help="Output PNG")
     g.add_argument("--title", default=None)
-    g.add_argument("--vmin", type=float, default=None, help="Colour/axis minimum [dB]")
-    g.add_argument("--vmax", type=float, default=None, help="Colour/axis maximum [dB]")
+    g.add_argument("--vmin", type=float, default=None,
+                   help="Colour/axis minimum [dB above the map's median; spectra: dB re peak] (default 0; -40)")
+    g.add_argument("--vmax", type=float, default=None,
+                   help="Colour/axis maximum, same scale (default: the peak, at least 10 dB; spectra 0)")
 
 
 def add_selection(p, array=False, default_stands="all"):
@@ -85,8 +87,8 @@ def add_selection(p, array=False, default_stands="all"):
     g.add_argument("--gap-fill", choices=["nan", "zero"], default=None,
                    help="Default: the policy stored in the input")
     g.add_argument("--ssmif", default=None,
-                   help="LWA station description (SSMIF or observation metadata .tgz) for the observation date; "
-                        "default: LSL's bundled LWA-SV file (or $LWA_SSMIF)")
+                   help="LWA station description for the observation date: an SSMIF, an observation metadata .tgz, "
+                        "or lwa1/lwasv for the file bundled with LSL (default: $LWA_SSMIF, else lwa1)")
 
 
 def add_delay(p):
@@ -107,7 +109,19 @@ def add_range_processing(p):
     g = p.add_argument_group("range processing (applies only when the input is raw or RDC0)")
     g.add_argument("--bandwidth", type=float, default=None,
                    help="Chirp bandwidth [Hz], negative for down-chirps (default: stored value)")
-    g.add_argument("--dechirp-window", choices=WINDOW_CHOICES, default=None, help="Default: stored value, else hann")
+    g.add_argument("--range-method", choices=RANGE_METHODS, default=None,
+                   help="matched: circular matched filter against the whole sweep (every delay compresses fully); "
+                        "dechirp: multiply by the reference and FFT (older files). "
+                        f"Default: stored value, else {DEFAULT_RANGE_METHOD}")
+    g.add_argument("--dechirp-window", choices=WINDOW_CHOICES, default=None,
+                   help="Fast-time window (for the matched filter: over the in-band part of the reference). "
+                        "Default: stored value, else hann")
+    g.add_argument("--suppress-sidebands", action="store_true",
+                   help="Raw input only: remove the gating-sideband comb of one echo while exporting RDC1 "
+                        "(detect_comb + CLEAN, as in Peter's lwa_radar.py; needs --range-method matched)")
+    g.add_argument("--sideband-echo", type=float, default=None, metavar="MS",
+                   help="Delay of the echo whose comb is removed (default: the strongest in the first 16 s)")
+    g.add_argument("--sideband-block", type=int, default=20, help="Sweeps per CLEAN block")
     g.add_argument("--reference-gate", default=None, metavar="FREQ[,DUTY[,PHASE]]",
                    help="Gate the reference chirp: frequency [Hz], duty (0-1), phase [s]")
 
@@ -123,7 +137,8 @@ def add_doppler_processing(p, defaults_from_file=True):
 def add_phase(p):
     g = p.add_argument_group("phase-derived Doppler")
     g.add_argument("--estimator-sweeps", type=int, default=1, help="Sweep pairs averaged per estimate")
-    g.add_argument("--power-floor-db", type=float, default=None, help="Hide estimates weaker than this")
+    g.add_argument("--power-floor-db", type=float, default=None,
+                   help="Hide estimates weaker than this [dB above the median power]")
 
 
 def add_array(p):
@@ -133,6 +148,10 @@ def add_array(p):
     g.add_argument("--combine", choices=["sum", "mean", "max"], default="sum",
                    help="How --beamformer incoherent combines channel powers")
     g.add_argument("--look-az", type=float, default=None, help="Beam azimuth [deg]; omit both to auto-select")
+    g.add_argument("--looks", type=int, default=1,
+                   help="Auto-selected look directions: N > 1 steers one beam at each of the N strongest peaks "
+                        "of the frame's sky map (all cells, --angle-method, within --angle-peak-db) and plots one "
+                        "delay-Doppler panel per beam, so separate arrivals are all seen")
     g.add_argument("--look-el", type=float, default=None, help="Beam elevation [deg]")
     g.add_argument("--carrier-frequency", type=float, default=None, help="Default: stored tuning frequency")
     g.add_argument("--cable-correction", choices=["auto", "on", "off"], default="auto",
@@ -142,9 +161,14 @@ def add_array(p):
     g.add_argument("--angle-output", default=None,
                    help="Also write angle (sky) maps: a PNG, or a directory for sliding videos")
     g.add_argument("--angle-cells", type=int, default=0,
-                   help="0 = one map from the whole delay-Doppler window; N = maps for the N strongest cells")
+                   help="0 = one map from every cell of the plotted delay-Doppler window (after --d-min/--d-max "
+                        "and any trimming done at export); N = maps for the N strongest cells")
     g.add_argument("--angle-method", choices=["conventional", "mvdr"], default="conventional")
     g.add_argument("--angle-step", type=float, default=2.0, help="Sky-map grid step [deg]")
+    g.add_argument("--angle-peaks", type=int, default=1,
+                   help="Sky-map peaks marked, named and recorded per map (strongest first)")
+    g.add_argument("--angle-peak-db", type=float, default=10.0,
+                   help="Further peaks (--angle-peaks, --looks) count only within this of the strongest [dB]")
     g.add_argument("--angle-range-db", type=float, default=30.0, help="Sky-map colour range below its peak")
     g.add_argument("--beam-pattern-output", default=None, help="PNG of the array beam pattern for the look direction")
     g.add_argument("--codar-stations", nargs="*", default=None, metavar="CSV",
@@ -152,6 +176,12 @@ def add_array(p):
                         "station table (or the CSV tables given; see codar_stations.py)")
     g.add_argument("--station-az-tol", type=float, default=4.0,
                    help="Largest azimuth error [deg] for a station to explain a sky-map peak")
+
+
+def add_summary(p):
+    p.add_argument("--summary", default=None, metavar="CSV",
+                   help="Processing-summary log to add this run's findings to (default: $LFM_SUMMARY, else "
+                        "processing_summary.csv next to --output; 'none' to skip). See summary_utils.py")
 
 
 def add_calibration(g):
@@ -191,8 +221,20 @@ def validate(p, args):
             p.error(f"--{name.replace('_', '-')} must be positive")
     if (getattr(args, "look_az", None) is None) != (getattr(args, "look_el", None) is None):
         p.error("Give both --look-az and --look-el, or neither")
+    for name in ("looks", "angle_peaks"):
+        if getattr(args, name, 1) < 1:
+            p.error(f"--{name.replace('_', '-')} must be at least 1")
+    if getattr(args, "looks", 1) > 1:
+        if getattr(args, "look_az", None) is not None:
+            p.error("--looks picks the directions itself: leave out --look-az/--look-el")
+        if getattr(args, "beamformer", "incoherent") == "incoherent":
+            p.error("--looks needs --beamformer conventional or mvdr")
     if getattr(args, "d_min", None) is not None and getattr(args, "d_max", None) is not None and args.d_min >= args.d_max:
         p.error("--d-min must be below --d-max")
+    if getattr(args, "suppress_sidebands", False) and hasattr(args, "input") and not is_raw(args.input):
+        p.error("--suppress-sidebands applies when exporting from a raw TBN/WAV recording")
+    if getattr(args, "sideband_block", None) is not None and args.sideband_block < 2:
+        p.error("--sideband-block must be at least 2 sweeps")
     check_raw_flags(p, args)
 
 
@@ -209,10 +251,12 @@ def view_from_args(args, raw_stage="rdc1"):
     apply_ssmif(args)
     if is_raw(args.input):
         return _view_from_raw(args, raw_stage)
+    if getattr(args, "suppress_sidebands", False):
+        raise ValueError("--suppress-sidebands applies when exporting from a raw TBN/WAV recording")
     return RDCView(args.input, stands=args.stands, pol=args.pol, bad_stands=args.bad_stands,
                    tstart=args.tstart, tend=args.tend, gap_fill=args.gap_fill,
                    bandwidth=getattr(args, "bandwidth", None), dechirp_window=getattr(args, "dechirp_window", None),
-                   reference_gate=getattr(args, "reference_gate", None))
+                   reference_gate=getattr(args, "reference_gate", None), range_method=getattr(args, "range_method", None))
 
 
 def _view_from_raw(args, stage):
@@ -225,7 +269,8 @@ def _view_from_raw(args, stage):
         raise FileNotFoundError(f"Raw recording not found: {path}")
     wav = path.lower().endswith(".wav")
     sweep_frequency, align = args.sweep_frequency, not args.no_timestamp_align
-    if stage == "rdc0" and sweep_frequency is None:
+    placeholder = stage == "rdc0" and sweep_frequency is None
+    if placeholder:
         # Spectra only need contiguous samples: cut 1 s blocks from the first sample
         if args.offset or args.adc_start or args.adc_count:
             raise ValueError("--offset/--adc-* need --sweep-frequency")
@@ -238,7 +283,9 @@ def _view_from_raw(args, stage):
         stands="all" if wav else (args.stands or "all"), pol="both" if wav else (args.pol or "both"),
         bad_stands="none" if wav else (args.bad_stands or "none"), gap_fill=args.gap_fill,
         bandwidth=getattr(args, "bandwidth", None), dechirp_window=getattr(args, "dechirp_window", None),
-        reference_gate=getattr(args, "reference_gate", None),
+        reference_gate=getattr(args, "reference_gate", None), range_method=getattr(args, "range_method", None),
+        suppress_sidebands=getattr(args, "suppress_sidebands", False),
+        sideband_echo_ms=getattr(args, "sideband_echo", None), sideband_block=getattr(args, "sideband_block", 20),
         d_min=-math.inf if full else getattr(args, "d_min", None),
         d_max=math.inf if full else getattr(args, "d_max", None),
         dtype="float16" if stage == "rdc0" and not wav else "float32",       # exact for 8-bit TBN samples
@@ -249,8 +296,10 @@ def _view_from_raw(args, stage):
     (export_rdc0 if stage == "rdc0" else export_rdc1_from_raw)(path, out, s, tool="plot (raw input)", temporary=True)
     # Selection and time range were applied while cutting; the temporary file's t = 0 is its first sweep
     view = RDCView(out, stands="all", pol="both", bad_stands="none", gap_fill=args.gap_fill,
-                   bandwidth=s.bandwidth, dechirp_window=s.dechirp_window, reference_gate=s.reference_gate)
+                   bandwidth=s.bandwidth, dechirp_window=s.dechirp_window, reference_gate=s.reference_gate,
+                   range_method=s.range_method)
     view.path = path
+    view.prf_known = not placeholder     # 1 s blocks are not a sweep rate: plots leave the row out
     view._tmpdir = tmp          # deleted when the view is
     return view
 
@@ -276,7 +325,8 @@ def run(main):
 
 EXPORT_HELP = {
     "rdc0": "Cut a raw TBN/WAV recording into sweeps: RDC0 (adc, pulses, channels).",
-    "rdc1": "Dechirp + range FFT: RDC1 (delay, pulses, channels). Input: raw recording or RDC0.",
+    "rdc1": "Range compression (circular matched filter by default): RDC1 (delay, pulses, channels). "
+            "Input: raw recording or RDC0.",
     "rdc2": "Doppler FFT: RDC2 (frames, delay, doppler, channels), keeping the RDC1 it came from. "
             "Optional: plots and calibration compute frames from RDC1 with any integration/hop, so the "
             "stored frames are only a cache of one setting (overlapping frames multiply the size). "
@@ -319,6 +369,9 @@ def export_main(stage, argv=None):
         adc_count=args.adc_count, tstart=args.tstart, tend=args.tend, stands=args.stands, pol=args.pol,
         bad_stands=args.bad_stands, gap_fill=args.gap_fill, bandwidth=args.bandwidth,
         dechirp_window=getattr(args, "dechirp_window", None), reference_gate=getattr(args, "reference_gate", None),
+        range_method=getattr(args, "range_method", None),
+        suppress_sidebands=getattr(args, "suppress_sidebands", False),
+        sideband_echo_ms=getattr(args, "sideband_echo", None), sideband_block=getattr(args, "sideband_block", 20),
         d_min=None if getattr(args, "full_delay", False) else getattr(args, "d_min", None),
         d_max=None if getattr(args, "full_delay", False) else getattr(args, "d_max", None),
         integration_time=getattr(args, "integration_time", None), hop_time=getattr(args, "hop_time", None),

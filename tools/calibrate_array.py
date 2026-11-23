@@ -27,9 +27,9 @@ is indistinguishable from a different arrival direction and is kept out of the
 gains, so absolute directions still come from the SSMIF geometry.
 
 Example:
-    python tools/calibrate_array.py clean_rdc2.h5 --ssmif data/LD021_0001.tgz \
+    python tools/calibrate_array.py clean_rdc2.h5 --ssmif tools/resources/ssmif/LD021_0001.tgz \
         --output cal_20231209_13p5.h5 --csv cal_stands.csv
-    python tools/plot_delay_doppler.py clean_rdc2.h5 --ssmif data/LD021_0001.tgz \
+    python tools/plot_delay_doppler.py clean_rdc2.h5 --ssmif tools/resources/ssmif/LD021_0001.tgz \
         --beamformer conventional --calibration cal_20231209_13p5.h5 --output dd.png
 """
 
@@ -109,7 +109,7 @@ def main(argv=None):
     split = "alternate frames" if groups is not None else "alternate cells"
 
     print(f"Input {args.input}: {len(frames)} frame(s), {len(processor.stands)} stands, pol "
-          f"{'xy'[int(processor.pols[0])]}, {fc / 1e6:.6f} MHz, station {lwa.SSMIF_PATH or 'LSL bundled LWA-SV'}")
+          f"{'xy'[int(processor.pols[0])]}, {fc / 1e6:.6f} MHz, station {lwa.station_description()}")
     print(f"Using {len(cells)} echo cells, {cells[-1]['snr_db']:.1f}-{cells[0]['snr_db']:.1f} dB above the median "
           f"cell; validation by {split}")
     res = cu.calibrate(X, processor.positions, fc, power_db, groups, args.max_power_db)
@@ -121,7 +121,7 @@ def main(argv=None):
         c.update(az=float(az), el=float(el), eta_after=float(eta), class_b=bool(b))
         c.pop("x")
     meta = dict(kind="array_calibration", created_utc=cu.now_utc(), tool="calibrate_array",
-                input=os.path.abspath(args.input), ssmif=lwa.SSMIF_PATH, frequency_hz=fc,
+                input=os.path.abspath(args.input), ssmif=lwa.station_description(), frequency_hz=fc,
                 pol=int(pols[0]), cable_correction=processor.cable_note, phase_only=True,
                 n_cells=len(cells), min_snr_db=args.min_snr_db, max_power_db=args.max_power_db,
                 consistency_threshold=res["consistency_threshold"], iterations=res["iterations"],

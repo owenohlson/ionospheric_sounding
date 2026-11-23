@@ -232,7 +232,7 @@ def main():
     p.add_argument("--top-cells", type=int, default=20)
     p.add_argument("--carrier-frequency", type=float, default=None)
     p.add_argument("--csv", default=None, help="Optional per-stand residual CSV")
-    p.add_argument("--ssmif", default=None, help="SSMIF or metadata .tgz for the observation date")
+    p.add_argument("--ssmif", default=None, help="SSMIF, metadata .tgz, or lwa1/lwasv (LSL bundled; default lwa1 or $LWA_SSMIF)")
     p.add_argument("--calibration", default=None, help="Self-calibration file to test as the 'selfcal' variant "
                    "(use cells it was not fitted on, e.g. another --frame-index or time range, for a fair test)")
     args = p.parse_args()
@@ -251,7 +251,7 @@ def main():
     if args.calibration:
         from calibration_utils import ArrayCalibration
         cal = ArrayCalibration.load(args.calibration)
-        cal.check_station(lwa_utils.SSMIF_PATH)
+        cal.check_station(lwa_utils.station_description())
         selfcal, ok = cal.factors(stands, pols, fc)
         print(f"Self-calibration {args.calibration}: leaving out {int((~ok).sum())} flagged/uncovered stand(s)")
         rdc2, stands, pols, positions, selfcal = rdc2[..., ok], stands[ok], pols[ok], positions[ok], selfcal[ok]
@@ -261,7 +261,7 @@ def main():
     results, per_stand = calibration_report(rdc2, positions, fc, delays, stands, n_cells=args.top_cells,
                                             selfcal=selfcal)
     print(f"File {args.input}, frame {args.frame_index} ({frame['t0']:.3f}-{frame['t1']:.3f} s), "
-          f"fc {fc / 1e6:.6f} MHz, cube {rdc2.shape}, station {lwa_utils.SSMIF_PATH or 'LSL bundled LWA-SV'}")
+          f"fc {fc / 1e6:.6f} MHz, cube {rdc2.shape}, station {lwa_utils.station_description()}")
     print_report(results, per_stand, rdc2.shape[2])
     sig = [r["cell"] for r in results[("signal", "lsl")][:5]]
     noi = [r["cell"] for r in results[("noise", "lsl")][:5]]

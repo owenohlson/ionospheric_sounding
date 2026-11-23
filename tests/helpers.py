@@ -1,4 +1,4 @@
-"""Shared fixtures: synthetic recordings and a fake LWA-SV station (no LSL needed)."""
+"""Shared fixtures: synthetic recordings and a fake LWA station (no LSL needed)."""
 
 import os
 import sys
@@ -38,7 +38,7 @@ def write_wav(path, fs=2000, sweep_frequency=2.0, bandwidth=-1985.1875, sweeps=4
 
 
 class FakeStation:
-    """Patch lwa_utils.lwasv_antennas with a small random array."""
+    """Patch lwa_utils.station_antennas with a small random array."""
 
     def __init__(self, n=24, seed=5, bad_status=()):
         rng = np.random.default_rng(seed)
@@ -58,4 +58,4 @@ class FakeStation:
 
     def patch(self):
         import lwa_utils
-        return patch.object(lwa_utils, "lwasv_antennas", return_value=self.lookup)
+        return patch.object(lwa_utils, "station_antennas", return_value=self.lookup)

@@ -1,4 +1,4 @@
-"""Synthetic LWA-SV RDC2 (frames, delay, doppler, channels) with moving targets and stored truth.
+"""Synthetic LWA RDC2 (frames, delay, doppler, channels) with moving targets and stored truth.
 
 Note: targets are injected with the same steering_vector the processing uses, so
 this tests the plotting/tracking chain, not the steering convention itself
@@ -12,10 +12,10 @@ import os
 import numpy as np
 
 from rdc_utils import polarization_summary as polarization_metadata, steering_vector
-from lwa_utils import bad_stand_mask, cable_phase_factors, parse_stands, stand_positions as lookup_positions
+from lwa_utils import bad_stand_mask, cable_phase_factors, parse_stands, station_name, stand_positions as lookup_positions
 
 
-def get_lwasv_stand_positions():
+def get_station_stand_positions():
     positions, found = lookup_positions(range(1, 257))
     return {s: tuple(p) for s, p in zip(np.arange(1, 257)[found], positions)}
 
@@ -128,7 +128,7 @@ def target_state(name, frame_idx, n_frames, scenario, delay_min, delay_max, fd_m
 
 
 def select_stands(stand_spec, max_channels, bad_stands="status"):
-    stand_positions = get_lwasv_stand_positions()
+    stand_positions = get_station_stand_positions()
     stands = [stand for stand in parse_stands(stand_spec) if int(stand) in stand_positions]
     if bad_stands != "none" and stands:
         bad = bad_stand_mask(stands, [0] * len(stands), bad_stands)
@@ -209,7 +209,7 @@ def main():
     parser.add_argument("--bandwidth", type=float, default=-99.259377e3)
 
     parser.add_argument("--inject-cable-delays", action="store_true",
-                        help="Inject LSL LWA-SV RF-center cable phase for correction tests")
+                        help="Inject the station description's RF-center cable phase for correction tests")
     parser.add_argument("--gain-jitter-db", type=float, default=0.0,
                         help="Per-channel fixed gain error standard deviation")
     parser.add_argument("--phase-jitter-deg", type=float, default=0.0,
@@ -240,7 +240,7 @@ def main():
 
     channel_stands = np.repeat(np.asarray(stands, dtype=np.int32), len(pols))
     channel_pols = np.tile(np.asarray(pols, dtype=np.int32), len(stands))
-    stand_positions = get_lwasv_stand_positions()
+    stand_positions = get_station_stand_positions()
     positions = np.asarray([stand_positions[int(stand)] for stand in stands], dtype=np.float64)
     channel_positions = np.repeat(positions, len(pols), axis=0)
     n_channels = channel_stands.size
@@ -368,7 +368,7 @@ def main():
         h5.attrs["metadata_json"] = metadata_json(
             rdc_stage=2,
             synthetic=True,
-            station="lwasv",
+            station=station_name(),
             channel_id_kind="physical_stand",
             cable_phase_corrected=False,
             cable_delays_injected=bool(args.inject_cable_delays),

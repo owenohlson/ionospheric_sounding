@@ -201,7 +201,14 @@ class RDCFile:
                 digs = np.asarray(self.meta["channel_digitizers"])
             if digs is not None:
                 import lwa_utils
-                if lwa_utils.SSMIF_PATH is not None:      # re-derive identities under a dated SSMIF
+                # Digitizers are what the recording stores; stand identities depend on the
+                # station description. Re-derive them when one is given explicitly, and for files
+                # made under the old default (LSL's bundled LWA-SV, recorded as such or not at all)
+                # now that the default is LWA1. Otherwise the stored identities stand.
+                made = self.meta.get("ssmif")
+                old_default = made in (None, "LSL bundled LWA-SV") and \
+                    lwa_utils.station_description() != "LSL bundled LWA-SV"
+                if lwa_utils.SSMIF_PATH is not None or old_default:
                     stands, pols = lwa_utils.ids_from_digitizers(digs)
                 self._digitizers[s] = np.asarray(digs, int)
             self._ids[s] = (np.asarray(stands, int), np.asarray(pols, int))

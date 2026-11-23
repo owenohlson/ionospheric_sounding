@@ -20,7 +20,7 @@ def phase_products(args):
     delay = view.select_delay(args.d_min, args.d_max, args.full_delay, stage=stage)
     pp = view.rdc2p(args.estimator_sweeps)
     fd = lfm.phase_doppler_hz(np.sum(pp["lag1"], axis=2), view.prf).T            # (est, delay)
-    power_db = ru.to_db(np.nanmean(pp["power"], axis=2)).T
+    power_db = plots.above_median_db(ru.to_db(np.nanmean(pp["power"], axis=2)).T)       # dB above the median
     if args.power_floor_db is not None:
         fd[power_db < args.power_floor_db] = np.nan
     lim = (max(args.fd_min if args.fd_min is not None else -view.prf / 2, -view.prf / 2),
@@ -28,7 +28,7 @@ def phase_products(args):
     rows = [("Estimator", "sweep-to-sweep phase"), ("Estimator sweeps", str(args.estimator_sweeps)),
             ("Unambiguous fd", f"+/-{view.prf / 2:g} Hz")]
     if args.power_floor_db is not None:
-        rows.append(("Power floor", f"{args.power_floor_db:g} dB"))
+        rows.append(("Power floor", f"{args.power_floor_db:g} dB above median"))
     return view, delay, pp, fd, power_db, lim, rows
 
 

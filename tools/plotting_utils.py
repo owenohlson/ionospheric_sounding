@@ -15,10 +15,12 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.lines import Line2D
 
 PLOT_RECT = [0.34, 0.12, 0.58, 0.80]
 INFO_RECT = [0.015, 0.12, 0.216, 0.80]
 LFM_OVERLAY_COLOR = "#18d7ff"
+SIDE_PANEL_CHARS = 64        # width of the sky map's station panel; longer lines wrap, so the layout never moves
 
 
 # ---------------------------------------------------------------------------
@@ -30,15 +32,17 @@ def new_figure(figsize=(14, 6)):
     return fig, fig.add_axes(PLOT_RECT)
 
 
-def add_info_panel(fig, info_rows=None, notes=None, footer=None):
-    """Parameter table on the left. ``notes`` are extra "key: value" lines under "Analysis"."""
+def add_info_panel(fig, info_rows=None, notes=None, footer=None, rect=None):
+    """Parameter table on the left. ``notes`` are extra "key: value" lines under "Analysis".
+    ``rect`` (figure fractions) overrides INFO_RECT."""
+    rect = list(rect or INFO_RECT)
     rows = list(info_rows or [])
     if notes:
         rows.append(("Analysis", ""))
         for line in str(notes).splitlines():
             key, _, value = line.partition(":")
             rows.append((key.strip(), value.strip()) if value else ("", line.strip()))
-    ax = fig.add_axes(INFO_RECT)
+    ax = fig.add_axes(rect)
     ax.axis("off")
     if rows:
         cells = [[str(k), ""] if v == "" else ["\n".join(textwrap.wrap(str(k), 13) or [""]),
@@ -62,11 +66,11 @@ def add_info_panel(fig, info_rows=None, notes=None, footer=None):
         if footer:
             fig.canvas.draw()
             box = table.get_window_extent(fig.canvas.get_renderer()).transformed(fig.transFigure.inverted())
-            fig.text(INFO_RECT[0], max(0.015, box.y0 - 0.012), "\n".join(textwrap.wrap(str(footer), 48)),
+            fig.text(rect[0], max(0.015, box.y0 - 0.012), "\n".join(textwrap.wrap(str(footer), 48)),
                      ha="left", va="top", fontsize=size,
                      bbox={"facecolor": "white", "alpha": 0.72, "edgecolor": "none", "pad": 3})
     elif footer:
-        fig.text(INFO_RECT[0], INFO_RECT[1] + INFO_RECT[3], "\n".join(textwrap.wrap(str(footer), 48)),
+        fig.text(rect[0], rect[1] + rect[3], "\n".join(textwrap.wrap(str(footer), 48)),
                  ha="left", va="top", fontsize=7.5)
 
 
@@ -96,6 +100,48 @@ def delay_peaks_note(delays_ms):
 
 
 # ---------------------------------------------------------------------------
+# Power scales (as in Peter Driessen's lwa_radar.py)
+# ---------------------------------------------------------------------------
+# Absolute dB of the processed data are counts^2 times processing gains (sweep length,
+# sweeps per frame, channels summed), so they change with every setting. Maps and
+# profiles are therefore drawn in dB above their own median (the noise floor for
+# sparse echoes), colour range 0 dB to the map's peak (at least 10 dB; Peter used the 99.99th
+# percentile, which clips to the noise when an echo covers only a few cells);
+# spectra and spectrograms in dB below their peak, -40 to 0 dB. --vmin/--vmax are
+# on these scales. Only the drawing changes: findings and SNRs use the data.
+
+MEDIAN_LABEL = "Power above map median [dB]"
+PEAK_LABEL = "Power re peak [dB]"          # callers say whose peak
+
+
+def above_median_db(power_db):
+    """dB above the median of the finite values (10 log10(P / median P))."""
+    p = np.array(power_db, dtype=float)
+    finite = np.isfinite(p)
+    if finite.any():
+        p -= float(np.median(p[finite]))
+    return p
+
+
+def re_peak_db(power_db):
+    """dB relative to the largest finite value."""
+    p = np.array(power_db, dtype=float)
+    finite = np.isfinite(p)
+    if finite.any():
+        p -= float(np.max(p[finite]))
+    return p
+
+
+def median_limits(arrays, vmin=None, vmax=None):
+    """Colour range of maps above their median: 0 dB to max(10 dB, the peak) unless given."""
+    vmin = 0.0 if vmin is None else float(vmin)
+    if vmax is None:
+        tops = [float(np.nanmax(a)) for a in arrays if a is not None and np.any(np.isfinite(a))]
+        vmax = max([vmin + 10.0] + tops)
+    return vmin, float(vmax)
+
+
+# ---------------------------------------------------------------------------
 # Plots
 # ---------------------------------------------------------------------------
 
@@ -103,9 +149,11 @@ def plot_spectrogram(freq_hz, time_s, power_db, title, output=None, vmin=None, v
                      info_rows=None, notes=None, footer=None, lfm_overlay=None):
     """Frequency (x, kHz) vs time (y). ``lfm_overlay``: dict with sweep_period_s, f_start_hz, f_end_hz, first_sweep_start_s."""
     fig, ax = new_figure()
-    pcm = ax.pcolormesh(freq_hz / 1e3, time_s, power_db.T, shading="gouraud", cmap="inferno", vmin=vmin, vmax=vmax)
+    power_db = re_peak_db(power_db)
+    vmin, vmax = (-40.0 if vmin is None else vmin), (0.0 if vmax is None else vmax)
+    pcm = ax.pcolormesh(freq_hz / 1e3, time_s, power_db.T, shading="gouraud", cmap="viridis", vmin=vmin, vmax=vmax)
     ax.set(xlabel="Frequency [kHz]", ylabel="Time [s]")
-    colorbar(fig, pcm, ax, "Power [dB]", pad=0.02)
+    colorbar(fig, pcm, ax, "Power re spectrogram peak [dB]", pad=0.02)
     if lfm_overlay and lfm_overlay.get("sweep_period_s"):
         period, off = lfm_overlay["sweep_period_s"], lfm_overlay.get("first_sweep_start_s") or 0.0
         t0, t1 = float(time_s[0]), float(time_s[-1])
@@ -118,48 +166,234 @@ def plot_spectrogram(freq_hz, time_s, power_db, title, output=None, vmin=None, v
 
 def plot_average_spectrum(freq_hz, power_db, title, output=None, vmin=None, vmax=None, info_rows=None, footer=None):
     fig, ax = new_figure()
-    ax.plot(freq_hz / 1e3, power_db)
-    ax.set(xlabel="Frequency [kHz]", ylabel="Power [dB/RBW]", ylim=(vmin, vmax))
+    ax.plot(freq_hz / 1e3, re_peak_db(power_db))
+    ax.set(xlabel="Frequency [kHz]", ylabel="Power re spectrum peak [dB]", ylim=(vmin, vmax))
     ax.grid(True, alpha=0.3)
     return _finish(fig, ax, title, output, info_rows, None, footer)
 
 
-def plot_delay_time(time_s, delay_ms, power_db, title, output=None, vmin=None, vmax=None,
-                    info_rows=None, notes=None, footer=None):
-    """Range-time intensity: time (x) vs delay (y); ``power_db`` is (time, delay)."""
-    fig, ax = new_figure()
-    pcm = ax.pcolormesh(time_s, delay_ms, power_db.T, shading="nearest", cmap="inferno", vmin=vmin, vmax=vmax)
+def plot_power_delay_profile(time_s, delay_ms, power_db, mean_db, title, output=None, vmin=None, vmax=None,
+                             info_rows=None, notes=None, footer=None, mean_label="Time average"):
+    """Power vs time (x) and delay (y), with the time-averaged profile beside it on the same delay axis.
+
+    ``power_db`` is (time, delay); ``mean_db`` is (delay,). Both are drawn in dB above the median
+    of the image, so they read on one scale; ``vmin``/``vmax`` (on that scale) set the colour range
+    and the profile's power axis."""
+    ref = float(np.nanmedian(power_db)) if np.any(np.isfinite(power_db)) else 0.0
+    power_db, mean_db = np.asarray(power_db, float) - ref, np.asarray(mean_db, float) - ref
+    vmin, vmax = median_limits([power_db], vmin, vmax)
+    fig = plt.figure(figsize=(14, 6))
+    x0, y0, w, h = PLOT_RECT
+    ax = fig.add_axes([x0, y0, 0.66 * w, h])
+    cax = fig.add_axes([x0 + 0.675 * w, y0, 0.012, h])
+    prof = fig.add_axes([x0 + 0.83 * w, y0, 0.17 * w, h], sharey=ax)
+    pcm = ax.pcolormesh(time_s, delay_ms, power_db.T, shading="nearest", cmap="viridis", vmin=vmin, vmax=vmax)
     ax.set(xlabel="Time [s]", ylabel="Delay [ms]")
-    colorbar(fig, pcm, ax, "Power [dB]")
+    fig.colorbar(pcm, cax=cax).set_label("Power above image median [dB]")
+    prof.plot(mean_db, delay_ms, lw=1.2, color="#1f5fa8")
+    prof.set_xlim(vmin, max(vmax, float(np.nanmax(mean_db)) + 1.0) if np.any(np.isfinite(mean_db)) else vmax)
+    prof.set_xlabel("Mean power [dB]\nabove image median")
+    prof.set_title(mean_label, fontsize=9)
+    prof.tick_params(labelleft=False)
+    prof.grid(True, alpha=0.3)
     return _finish(fig, ax, title, output, info_rows, notes, footer)
 
 
-def plot_power_delay(delay_ms, power_db, title, output=None, vmin=None, vmax=None, info_rows=None, notes=None, footer=None):
-    fig, ax = new_figure(figsize=(14, 4.8))
-    ax.plot(delay_ms, power_db)
-    ax.set(xlabel="Delay [ms]", ylabel="Mean power [dB]")
-    ax.set_ylim(bottom=vmin, top=vmax)
-    ax.grid(True)
-    return _finish(fig, ax, title, output, info_rows, notes, footer)
+def plot_lfm_scan(lag_k, lag_power, lag_peaks, table_marks, found, title, output=None, info_rows=None,
+                  notes=None, footer=None, measurements=()):
+    """Waveform scan (scan_lfm.py): lag-product spectrum; sweep rate from the resets; bandwidth scan;
+    delay profiles.
+
+    ``found``: scan_lfm.Candidate objects. ``table_marks``: [dict(label, k)] chirp rates of the station-table
+    waveforms in the band (dotted). ``measurements`` (lfm.measure_sweep_rate results of the lag peaks) is
+    accepted but not used: the lag spectrum is always drawn against chirp rate (bandwidth x sweep rate),
+    which it measures before any sweep rate is chosen."""
+    fig = plt.figure(figsize=(16, 10.5))
+    x0, y0, w, h = PLOT_RECT[0], 0.055, PLOT_RECT[2], 0.86
+    gap = 0.075
+    ph = (h - 2 * gap) / 3
+    half = (w - 0.06) / 2
+    ax_lag = fig.add_axes([x0, y0 + 2 * (ph + gap), w, ph])
+    ax_reset = fig.add_axes([x0, y0 + ph + gap, half, ph])
+    ax_fine = fig.add_axes([x0 + half + 0.06, y0 + ph + gap, half, ph])
+    ax_prof = fig.add_axes([x0, y0, w, ph])
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    col = {id(c): colors[i % len(colors)] for i, c in enumerate(found)}
+
+    def who(c):
+        codes = [x for s in c.sources if s.startswith("table") for x in s[6:].split("/") if x and x != "..."]
+        if c.kind == "not in table":
+            return "not in table"
+        out = "/".join(codes[:3]) + ("/..." if len(codes) > 3 else "") if codes else "documented"
+        return out + (", table sign flipped" if c.kind == "table, sign flipped" else "")
+
+    if lag_k is not None:
+        scale = 1.0                                               # x = chirp rate (no sweep rate assumed yet)
+        med = np.median(lag_power[lag_power > 0]) if np.any(lag_power > 0) else 1.0
+        ax_lag.plot(lag_k / scale / 1e3, 10 * np.log10(np.maximum(lag_power, 1e-30) / med), lw=0.6, color="#555555")
+        lo, hi = ax_lag.get_ylim()
+        for m in {round(m["k"]): m for m in table_marks}.values():
+            if lag_k[0] <= m["k"] <= lag_k[-1]:
+                ax_lag.axvline(m["k"] / scale / 1e3, color="#9a9a9a", lw=0.6, ls=":")
+        for k, db in lag_peaks:
+            ax_lag.plot(k / scale / 1e3, db, "v", color="#555555", ms=5)
+        handles = [Line2D([], [], color="#9a9a9a", lw=0.8, ls=":", label="station-table waveforms")]
+        if len(lag_peaks):
+            handles.append(Line2D([], [], marker="v", ls="", color="#555555", ms=5,
+                                  label="spectrum peaks: candidate chirp rates, each tested"))
+        for i, c in enumerate(found):
+            xb = c.chirp_rate / scale / 1e3
+            ax_lag.axvline(xb, color=col[id(c)], lw=1.2, alpha=0.7)
+            ax_lag.annotate(f"#{i + 1}", (xb, 1.0), xycoords=ax_lag.get_xaxis_transform(), xytext=(3, -10),
+                            textcoords="offset points", fontsize=8, color=col[id(c)], fontweight="bold")
+            handles.insert(i, Line2D([], [], color=col[id(c)], lw=1.2,
+                                     label=f"#{i + 1} {c.best_bandwidth / 1e3:+.3f} kHz, {c.rate:g} Hz ({who(c)})"))
+        ax_lag.legend(handles=handles, loc="upper right", fontsize=7.5, framealpha=0.9)
+        ax_lag.set_ylim(lo, hi + 0.3 * (hi - lo))                   # room for the legend
+        ks = [abs(k) for k, _ in lag_peaks] + [abs(c.chirp_rate) for c in found]
+        if ks:
+            lim = min(1.4 * max(ks), abs(lag_k).max()) / scale / 1e3
+            ax_lag.set_xlim(-lim, lim)
+        ax_lag.set_xlabel("Chirp rate [kHz/s]")
+        ax_lag.set_ylabel("Power re spectrum median [dB]")
+        ax_lag.set_title("Lag-product spectrum", fontsize=10)
+    else:
+        ax_lag.text(0.5, 0.5, "Lag-product spectrum skipped (--no-blind)", ha="center", va="center",
+                    transform=ax_lag.transAxes)
+        ax_lag.set_axis_off()
+
+    copy_marks = residual_marks = cleaned_any = False
+    for i, c in enumerate(found):
+        tag = f"#{i + 1}"
+        if c.fine is not None:
+            ax_fine.plot(c.bandwidth + c.fine[0] - c.best_bandwidth, c.fine[1], color=col[id(c)], lw=1, label=tag)
+        m = c.rate_measurement
+        if m is not None and len(m.get("rates", [])):
+            ax_reset.plot(m["rates"], m["coherence_curve"], color=col[id(c)], lw=1,
+                          label=f"{tag} {m['rate_hz']:.3f} Hz" if m.get("rate_hz") else f"{tag} not measured")
+        d = np.asarray(c.delay_ms, float)
+        y = 10 * np.log10(np.maximum(c.profile, 1e-30) / np.median(c.profile))
+        step = np.median(np.diff(d)) if d.size > 1 else 0
+        cut = np.flatnonzero(np.diff(d) > 5 * step) + 1          # delays the chirp band does not reach
+        raw = getattr(c, "raw_profile", None)
+        if raw is not None and (getattr(c, "comb", None) or {}).get("detected"):
+            cleaned_any = True                                   # before the sideband CLEAN, same reference
+            yr = 10 * np.log10(np.maximum(raw, 1e-30) / np.median(c.profile))
+            ax_prof.plot(np.insert(d, cut, np.nan), np.insert(yr, cut, np.nan), color=col[id(c)], lw=0.5,
+                         alpha=0.3)
+        ax_prof.plot(np.insert(d, cut, np.nan), np.insert(y, cut, np.nan), color=col[id(c)], lw=0.7,
+                     label=f"{tag} {c.label()}")
+        for dd, _ in c.echoes:
+            j = int(np.argmin(np.abs(d - dd)))
+            ax_prof.annotate(f"{dd:.1f}", (dd, y[j]), xytext=(0, 4), textcoords="offset points", ha="center",
+                             fontsize=7, color=col[id(c)])
+        cps = [cp for cp in getattr(c, "copies", []) if not cp.get("suppressed")]
+        res = [cp for cp in getattr(c, "copies", []) if cp.get("suppressed")]
+        if cps:
+            copy_marks = True
+            ax_prof.plot([cp["delay_ms"] for cp in cps], [cp["db"] + 1.5 for cp in cps], "x", color=col[id(c)],
+                         ms=4, mew=1)
+        if res:
+            residual_marks = True
+            ax_prof.plot([cp["delay_ms"] for cp in res], [cp["db"] + 1.5 for cp in res], "o", mfc="none",
+                         color=col[id(c)], ms=4, mew=0.8)
+    ax_fine.set(xlabel="Bandwidth offset [Hz]", ylabel="Contrast: peak re profile median [dB]")
+    ax_fine.set_title("Bandwidth scan", fontsize=10)
+    ax_reset.set_xscale("log")
+    ax_reset.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
+    ax_reset.set_xticks([0.25, 0.5, 1, 2, 4])
+    ax_reset.set_xticklabels(["0.25", "0.5", "1", "2", "4"])
+    ax_reset.set(xlabel="Trial sweep rate [Hz]", ylabel="Reset coherence", ylim=(0, 1.05))
+    ax_reset.set_title("Sweep rate from the transmitter resets", fontsize=10)
+    ax_prof.set(xlabel="Delay mod sweep [ms]", ylabel="Power re profile median [dB]")
+    ax_prof.set_title("Delay profile, gating sidebands removed (faint: before)" if cleaned_any else "Delay profile",
+                      fontsize=10)
+    for ax in (ax_fine, ax_reset, ax_prof, ax_lag):
+        ax.grid(True, alpha=0.3)
+    if found:
+        ax_fine.legend(fontsize=8, loc="lower center")
+        handles, labels = ax_prof.get_legend_handles_labels()
+        if cleaned_any:
+            handles.append(Line2D([], [], color="#555555", lw=0.5, alpha=0.3))
+            labels.append("before the sideband CLEAN")
+        if residual_marks:
+            handles.append(Line2D([], [], marker="o", ls="", mfc="none", color="#555555", ms=4, mew=0.8))
+            labels.append("suppressed copies (residual after the CLEAN)")
+        if copy_marks:
+            handles.append(Line2D([], [], marker="x", ls="", color="#555555", ms=4, mew=1))
+            labels.append("copies not removed (gating / sweep wrap)" if cleaned_any
+                          else "copies (gating / sweep wrap)")
+        ax_prof.legend(handles, labels, fontsize=8, loc="upper right")
+        ax_reset.legend(fontsize=8, loc="upper left")
+    else:
+        for ax in (ax_reset, ax_fine, ax_prof):
+            ax.text(0.5, 0.5, "No waveform compressed", ha="center", va="center", transform=ax.transAxes)
+    fig.suptitle(title, x=x0 + w / 2, y=0.995, fontsize=12)
+    add_info_panel(fig, info_rows, notes, footer)
+    return save(fig, output) if output else plt.show()
 
 
 def plot_delay_doppler(doppler_hz, delay_ms, power_db, title, output=None, vmin=None, vmax=None,
                        info_rows=None, notes=None, footer=None):
-    """Doppler (x) vs delay (y); ``power_db`` is (delay, doppler)."""
+    """Doppler (x) vs delay (y); ``power_db`` is (delay, doppler), drawn in dB above its median."""
     fig, ax = new_figure()
-    pcm = ax.pcolormesh(doppler_hz, delay_ms, power_db, shading="nearest", cmap="inferno", vmin=vmin, vmax=vmax)
+    power_db = above_median_db(power_db)
+    vmin, vmax = median_limits([power_db], vmin, vmax)
+    pcm = ax.pcolormesh(doppler_hz, delay_ms, power_db, shading="nearest", cmap="viridis", vmin=vmin, vmax=vmax)
     ax.set(xlabel="Doppler Frequency [Hz]", ylabel="Delay [ms]")
-    colorbar(fig, pcm, ax, "Power [dB]")
+    colorbar(fig, pcm, ax, MEDIAN_LABEL)
     return _finish(fig, ax, title, output, info_rows, notes, footer)
+
+
+def plot_delay_doppler_beams(doppler_hz, delay_ms, panels, title, output=None, vmin=None, vmax=None,
+                             info_rows=None, notes=None, footer=None):
+    """One delay-Doppler panel per beam, side by side, sharing axes and colour scale.
+
+    ``panels``: [(power_db or None, label)]; None draws an empty panel with the label as its text.
+    Each panel is drawn in dB above its own median; the colour range is common to all panels."""
+    n = len(panels)
+    margin, table_in, panel_in, gap_in, lead_in, cb_in = 0.2, 3.9, 4.2, 0.35, 0.9, 1.2
+    fig_w = margin + table_in + lead_in + n * panel_in + (n - 1) * gap_in + cb_in + margin
+    fig_h = 6.0
+    fig = plt.figure(figsize=(fig_w, fig_h))
+    fx = lambda inches: inches / fig_w                    # noqa: E731
+    bottom, height = PLOT_RECT[1], PLOT_RECT[3] - 0.06
+    panels = [(None if p is None else above_median_db(p), label) for p, label in panels]
+    vmin, vmax = median_limits([p for p, _ in panels], vmin, vmax)
+    pcm, axes = None, []
+    for j, (pdb, label) in enumerate(panels):
+        x = margin + table_in + lead_in + j * (panel_in + gap_in)
+        ax = fig.add_axes([fx(x), bottom, fx(panel_in), height], sharey=axes[0] if axes else None)
+        axes.append(ax)
+        if pdb is None:
+            ax.text(0.5, 0.5, "\n".join(textwrap.wrap(label, 30)), ha="center", va="center", transform=ax.transAxes,
+                    fontsize=9, color="#666666")
+            ax.set_xlim(doppler_hz[0], doppler_hz[-1])
+        else:
+            pcm = ax.pcolormesh(doppler_hz, delay_ms, pdb, shading="nearest", cmap="viridis", vmin=vmin, vmax=vmax)
+            ax.set_title(label, fontsize=9.5)
+        ax.set_xlabel("Doppler Frequency [Hz]")
+        if j == 0:
+            ax.set_ylabel("Delay [ms]")
+        else:
+            ax.tick_params(labelleft=False)
+    if pcm is not None:
+        cb = fig.colorbar(pcm, cax=fig.add_axes([fx(fig_w - margin - cb_in + 0.25), bottom, fx(0.14), height]))
+        cb.set_label("Power above each panel's median [dB]")
+    fig.suptitle(title, x=fx(margin + table_in + lead_in + (n * panel_in + (n - 1) * gap_in) / 2), y=0.97)
+    add_info_panel(fig, info_rows, notes, footer, rect=[fx(margin), INFO_RECT[1], fx(table_in), INFO_RECT[3]])
+    return save(fig, output) if output else plt.show()
 
 
 def plot_doppler_time(time_s, doppler_hz, power_db, title, output=None, vmin=None, vmax=None,
                       info_rows=None, notes=None, footer=None):
-    """Time (x) vs Doppler (y); ``power_db`` is (time, doppler)."""
+    """Time (x) vs Doppler (y); ``power_db`` is (time, doppler), drawn in dB above its median."""
     fig, ax = new_figure()
-    pcm = ax.pcolormesh(time_s, doppler_hz, power_db.T, shading="nearest", cmap="inferno", vmin=vmin, vmax=vmax)
+    power_db = above_median_db(power_db)
+    vmin, vmax = median_limits([power_db], vmin, vmax)
+    pcm = ax.pcolormesh(time_s, doppler_hz, power_db.T, shading="nearest", cmap="viridis", vmin=vmin, vmax=vmax)
     ax.set(xlabel="Time [s]", ylabel="Doppler Frequency [Hz]")
-    colorbar(fig, pcm, ax, "Power [dB]")
+    colorbar(fig, pcm, ax, MEDIAN_LABEL)
     return _finish(fig, ax, title, output, info_rows, notes, footer)
 
 
@@ -182,12 +416,12 @@ def plot_phase_doppler_time(time_s, fd_centers, power_db, title, output=None, vm
     """Time (x) vs phase-derived Doppler bins (y); ``power_db`` is (time, bins)."""
     fig, ax = new_figure()
     ax.set_facecolor("#050505")
-    cmap = plt.get_cmap("inferno").copy()
+    cmap = plt.get_cmap("viridis").copy()
     cmap.set_bad("#050505")
     pcm = ax.pcolormesh(time_s, fd_centers, np.ma.masked_invalid(power_db.T), shading="nearest", cmap=cmap,
                         vmin=vmin, vmax=vmax)
     ax.set(xlabel="Time [s]", ylabel="Phase-derived Doppler [Hz]")
-    colorbar(fig, pcm, ax, "Power [dB]")
+    colorbar(fig, pcm, ax, "Power above median of all estimates [dB]")
     return _finish(fig, ax, title, output, info_rows, notes, footer)
 
 
@@ -198,8 +432,8 @@ def plot_phase_doppler_frame(fd_hz, delay_ms, power_db, fd_lim, title, output=No
     ax.set_facecolor("#050505")
     ok = np.isfinite(fd_hz) & np.isfinite(power_db)
     if ok.any():
-        sc = ax.scatter(fd_hz[ok], delay_ms[ok], c=power_db[ok], s=18, cmap="inferno", vmin=vmin, vmax=vmax, linewidths=0)
-        colorbar(fig, sc, ax, "Power [dB]")
+        sc = ax.scatter(fd_hz[ok], delay_ms[ok], c=power_db[ok], s=18, cmap="viridis", vmin=vmin, vmax=vmax, linewidths=0)
+        colorbar(fig, sc, ax, "Power above median of all estimates [dB]")
     else:
         ax.text(0.5, 0.5, "No valid phase-Doppler estimates", transform=ax.transAxes, ha="center", color="white")
     ax.set(xlim=fd_lim, ylim=(float(np.min(delay_ms)), float(np.max(delay_ms))),
@@ -207,15 +441,30 @@ def plot_phase_doppler_frame(fd_hz, delay_ms, power_db, fd_lim, title, output=No
     return _finish(fig, ax, title, output, info_rows, notes, footer)
 
 
+def wrap_side_lines(lines, width=SIDE_PANEL_CHARS):
+    """Wrap panel lines to ``width`` characters; a continuation is indented 2 past its line's own indent."""
+    out = []
+    for line in lines:
+        if len(line) <= width:
+            out.append(line)
+            continue
+        indent = " " * (len(line) - len(line.lstrip()) + 2)
+        out += textwrap.wrap(line, width, subsequent_indent=indent) or [""]
+    return out
+
+
 def plot_angle_maps(maps, az_deg, el_deg, labels, title, output, range_db=30.0,
                     info_rows=None, notes=None, footer=None, markers=None, annotations=None, side_lines=None):
     """Polar sky maps (north up, east right, zenith at centre), each normalised to its own peak.
 
     ``maps`` is a list of (el, az) linear power arrays. ``markers`` optionally gives
-    one (az, el) refined peak per map, drawn as a cross. ``annotations`` optionally
-    gives per map ``None`` or ``dict(label=str, points=[(az, el), ...])``: the label
-    is written at the cross and the points (e.g. station bearings) are drawn as
-    small triangles. ``side_lines`` adds a text panel on the right.
+    per map one (az, el) refined peak, or a list of them (strongest first), drawn as
+    numbered crosses. ``annotations`` optionally gives per map ``None``, a
+    ``dict(label=str, points=[(az, el), ...])``, or a list of those (one per peak):
+    the label is written at its cross and the points (e.g. station bearings) are
+    drawn as small triangles. ``side_lines`` adds a text panel on the right, always
+    SIDE_PANEL_CHARS wide (longer lines are wrapped), so frames of a video keep one layout
+    whatever the text; pass an empty list to keep the panel's room with nothing in it.
     """
     az_deg = np.asarray(az_deg, float)
     el_deg = np.asarray(el_deg, float)
@@ -226,27 +475,55 @@ def plot_angle_maps(maps, az_deg, el_deg, labels, title, output, range_db=30.0,
     n = len(maps)
     cols = min(3, n)
     rows_n = int(np.ceil(n / cols))
-    fig = plt.figure(figsize=(18 if side_lines else 14, max(5.2, 4.3 * rows_n)))
-    left, bottom, width, height = [0.255, PLOT_RECT[1], 0.46, PLOT_RECT[3]] if side_lines else PLOT_RECT
-    w = (width - 0.08 * (cols - 1)) / cols
-    h = (height - 0.09 * (rows_n - 1)) / rows_n
+    # Laid out in inches, left to right: parameter table, maps, colour bar, station panel; the figure
+    # is as wide as that needs, so nothing floats in empty space whatever the number of maps.
+    margin, table_in, map_in, map_gap = 0.2, 3.9, 4.0 if n == 1 else 3.6, 0.95
+    lead_in = 0.75                                        # left of a map: its 270 deg label
+    cb_gap, cb_w, cb_label = 0.5, 0.14, 0.75              # right of a map: its 90 deg label; colour bar
+    if side_lines is not None:
+        side_lines = wrap_side_lines(side_lines)
+    side_in = (0.3 + 0.058 * SIDE_PANEL_CHARS) if side_lines is not None else 0.0   # 6.6 pt monospace
+    label_in = 0.85 if labels and any(labels) else 0.45   # map labels need room above the 0 deg mark
+    under_in, top_in, bottom_in = 0.35, 0.6, 0.35
+    row_in = map_in + label_in + under_in
+    fig_h = max(5.2, bottom_in + rows_n * row_in + top_in)
+    maps_x = margin + table_in + lead_in
+    cb_x = maps_x + cols * map_in + (cols - 1) * map_gap + cb_gap
+    fig_w = cb_x + cb_w + cb_label + side_in + margin
+    fig = plt.figure(figsize=(fig_w, fig_h))
+    fx = lambda inches: inches / fig_w                    # noqa: E731
+    left, w = fx(maps_x), fx(map_in)
+    width = fx(cols * map_in + (cols - 1) * map_gap)
+    bottom = (bottom_in + under_in) / fig_h
+    cell, h = row_in / fig_h, map_in / fig_h
+    height = (rows_n - 1) * cell + h                       # bottom of the lowest map to top of the highest
     pcm = None
     for i, m in enumerate(maps):
         r, c = divmod(i, cols)
-        ax = fig.add_axes([left + c * (w + 0.08), bottom + (rows_n - 1 - r) * (h + 0.09), w, h], projection="polar")
+        ax = fig.add_axes([left + c * fx(map_in + map_gap), bottom + (rows_n - 1 - r) * cell, w, h], projection="polar")
         peak = np.nanmax(m)
         db = 10 * np.log10(np.maximum(m / peak, 1e-30)) if np.isfinite(peak) and peak > 0 else np.full(m.shape, np.nan)
-        pcm = ax.pcolormesh(theta, radius, db[::-1], shading="auto", cmap="inferno", vmin=-abs(range_db), vmax=0)
-        if markers is not None and markers[i] is not None:
-            ax.plot(np.deg2rad(markers[i][0]), 90 - markers[i][1], "c+", ms=10, mew=1.5)
-        note = annotations[i] if annotations is not None and i < len(annotations) else None
-        if note:
-            for paz, pel in note.get("points", []):
-                ax.plot(np.deg2rad(paz), 90 - pel, marker="^", ms=4, color="white", mec="black", mew=0.4, ls="none")
-            if markers is not None and markers[i] is not None and note.get("label"):
-                ax.annotate("\n".join(textwrap.wrap(note["label"], 22)), (np.deg2rad(markers[i][0]), 90 - markers[i][1]),
-                            xytext=(8, 8), textcoords="offset points", fontsize=7, color="white",
-                            bbox={"facecolor": "black", "alpha": 0.6, "edgecolor": "none", "pad": 1.5})
+        pcm = ax.pcolormesh(theta, radius, db[::-1], shading="auto", cmap="viridis", vmin=-abs(range_db), vmax=0)
+        peaks = markers[i] if markers is not None and i < len(markers) and markers[i] is not None else []
+        if peaks and np.isscalar(peaks[0]):
+            peaks = [peaks]
+        notes_i = annotations[i] if annotations is not None and i < len(annotations) else None
+        if isinstance(notes_i, dict) or notes_i is None:
+            notes_i = [notes_i]
+        for j, (paz, pel) in enumerate(peaks):
+            ax.plot(np.deg2rad(paz), 90 - pel, "c+", ms=10, mew=1.5)
+            if len(peaks) > 1:
+                ax.annotate(str(j + 1), (np.deg2rad(paz), 90 - pel), xytext=(-9, -11), textcoords="offset points",
+                            fontsize=7.5, color="cyan", fontweight="bold")
+            note = notes_i[j] if j < len(notes_i) else None
+            if note:
+                for qaz, qel in note.get("points", []):
+                    ax.plot(np.deg2rad(qaz), 90 - qel, marker="^", ms=4, color="white", mec="black", mew=0.4,
+                            ls="none")
+                if note.get("label"):
+                    ax.annotate("\n".join(textwrap.wrap(note["label"], 22)), (np.deg2rad(paz), 90 - pel),
+                                xytext=(8, 8), textcoords="offset points", fontsize=7, color="white",
+                                bbox={"facecolor": "black", "alpha": 0.6, "edgecolor": "none", "pad": 1.5})
         ax.set_theta_zero_location("N")
         ax.set_theta_direction(-1)
         ax.set_rlim(0, 90)
@@ -255,164 +532,19 @@ def plot_angle_maps(maps, az_deg, el_deg, labels, title, output, range_db=30.0,
         ax.set_rlabel_position(135)
         ax.grid(color="white", alpha=0.28, lw=0.6)
         ax.tick_params(labelsize=8.5, pad=1)
-        ax.set_title(labels[i] if labels else "", fontsize=9)
+        if labels and labels[i]:
+            ax.set_title(labels[i], fontsize=9, pad=14)          # clear of the 0 deg label
     if pcm is not None:
-        if side_lines:
-            cb = fig.colorbar(pcm, cax=fig.add_axes([left + width + 0.02, bottom, 0.01, height]))
-        else:
-            cb = fig.colorbar(pcm, ax=fig.axes, pad=0.08)
+        cb = fig.colorbar(pcm, cax=fig.add_axes([fx(cb_x), bottom, fx(cb_w), height]))
         cb.set_label("Power relative to map peak [dB]")
+    top = bottom + height + (label_in - 0.15) / fig_h      # top of the highest map label
     if side_lines:
-        fig.text(left + width + 0.075, bottom + height, "\n".join(side_lines), ha="left", va="top",
+        fig.text(fx(cb_x + cb_w + cb_label + 0.3), top, "\n".join(side_lines), ha="left", va="top",
                  fontsize=6.6, family="monospace")
-    fig.suptitle(title)
-    add_info_panel(fig, info_rows, notes, footer)
+    fig.suptitle(title, x=left + width / 2, y=1 - 0.2 / fig_h, va="top")
+    add_info_panel(fig, info_rows, notes, footer,
+                   rect=[fx(margin), bottom_in / fig_h, fx(table_in), 1 - (bottom_in + top_in) / fig_h])
     return save(fig, output)
-
-
-# ---------------------------------------------------------------------------
-# Wavefront tracking (plot_wavefront.py)
-# ---------------------------------------------------------------------------
-
-def plot_wavefront_summary(t_s, series, uv, title, output, info_rows=None, notes=None, footer=None):
-    """Stacked time series sharing one time axis, plus the arrival-direction track.
-
-    ``series``: list of (label, y, extra) where extra is an optional
-    (label, y) drawn as grey dots on the same axis (e.g. the coarse grid fit).
-    ``uv``: (u, v, u_ref, v_ref) direction cosines (east, north) for the track panel.
-    """
-    t_s = np.asarray(t_s, float)
-    fig = plt.figure(figsize=(18, max(8.0, 1.55 * len(series) + 1.5)))
-    left, bottom, width, height = 0.30, PLOT_RECT[1], 0.40, PLOT_RECT[3]
-    gap = 0.012
-    h = (height - gap * (len(series) - 1)) / len(series)
-    axes = []
-    for i, (label, y, extra) in enumerate(series):
-        ax = fig.add_axes([left, bottom + (len(series) - 1 - i) * (h + gap), width, h],
-                          sharex=axes[0] if axes else None)
-        if extra is not None:
-            ax.plot(t_s, extra[1], ".", ms=3, color="#9a9a9a", label=extra[0])
-        ax.plot(t_s, y, "-", lw=1.4, color="#1f5fa8", label=label if extra is not None else None)
-        ax.set_ylabel(label, fontsize=8.5)
-        ax.grid(alpha=0.25, lw=0.6)
-        ax.tick_params(labelsize=8)
-        if extra is not None:
-            ax.legend(fontsize=7, loc="upper right", frameon=False)
-        if i < len(series) - 1:
-            ax.tick_params(labelbottom=False)
-        axes.append(ax)
-    axes[-1].set_xlabel("Time [s]")
-    axes[0].set_title(title)
-    u, v, u_ref, v_ref = uv
-    ax = fig.add_axes([0.76, bottom + 0.22, 0.19, 0.45])
-    ok = np.isfinite(u) & np.isfinite(v)
-    sc = ax.scatter(np.asarray(u)[ok] - u_ref, np.asarray(v)[ok] - v_ref, c=t_s[ok], s=9, cmap="viridis")
-    ax.plot(np.asarray(u)[ok] - u_ref, np.asarray(v)[ok] - v_ref, "-", lw=0.6, color="#777777", alpha=0.6)
-    ax.plot(0, 0, "+", color="black", ms=10, mew=1.2)
-    ax.set_aspect("equal", adjustable="datalim")
-    ax.set(xlabel="East direction cosine change", ylabel="North direction cosine change")
-    ax.set_title("Arrival-direction track\n(+ = session mean)", fontsize=9)
-    ax.ticklabel_format(style="sci", scilimits=(-2, 2))
-    ax.tick_params(labelsize=7.5)
-    ax.grid(alpha=0.25, lw=0.6)
-    cb = fig.colorbar(sc, ax=ax, pad=0.04, fraction=0.06)
-    cb.set_label("Time [s]", fontsize=8)
-    add_info_panel(fig, info_rows, notes, footer)
-    return save(fig, output)
-
-
-def _stand_map(ax, xy, values, vmax, cmap="RdBu_r", size=22):
-    ok = np.isfinite(values)
-    ax.scatter(xy[~ok, 0], xy[~ok, 1], s=size * 0.6, facecolors="none", edgecolors="#b5b5b5", lw=0.6)
-    sc = ax.scatter(xy[ok, 0], xy[ok, 1], c=values[ok], s=size, cmap=cmap, vmin=-vmax, vmax=vmax,
-                    edgecolors="#555555", linewidths=0.3)
-    ax.set_aspect("equal")
-    ax.tick_params(labelsize=7)
-    ax.grid(alpha=0.2, lw=0.5)
-    return sc
-
-
-def plot_phase_maps(xy, maps, labels, title, output, static=None, unit="rad", vmax=None,
-                    info_rows=None, notes=None, footer=None):
-    """Small multiples of per-stand phase on the ground (x east, y north [m]).
-
-    ``maps``: list of (N,) arrays sharing one diverging colour scale (symmetric,
-    ``vmax`` or the 99th percentile). ``static``: optional (N,) map drawn first
-    with its own scale (the per-stand error left after calibration). Hollow
-    circles are stands without a value."""
-    xy = np.asarray(xy, float)
-    panels = ([("static", static)] if static is not None else []) + list(zip(labels, maps))
-    cols = min(4, len(panels))
-    rows_n = int(np.ceil(len(panels) / cols))
-    fig = plt.figure(figsize=(18, max(5.5, 3.9 * rows_n + 1.0)))
-    left, bottom, width, height = 0.29, PLOT_RECT[1], 0.62, PLOT_RECT[3]
-    w = (width - 0.035 * (cols - 1)) / cols
-    h = (height - 0.07 * (rows_n - 1)) / rows_n
-    allv = np.concatenate([np.ravel(m) for m in maps]) if maps else np.array([np.nan])
-    scale = vmax or (np.nanpercentile(np.abs(allv), 99) if np.isfinite(allv).any() else 1.0) or 1.0
-    shared = None
-    for i, (label, values) in enumerate(panels):
-        r, c = divmod(i, cols)
-        ax = fig.add_axes([left + c * (w + 0.035), bottom + (rows_n - 1 - r) * (h + 0.07), w, h])
-        values = np.asarray(values, float)
-        if label == "static" and static is not None:
-            s_scale = np.nanpercentile(np.abs(values), 99) if np.isfinite(values).any() else 1.0
-            sc = _stand_map(ax, xy, values, s_scale or 1.0)
-            ax.set_title("Static residual (time mean minus its plane):\nper-stand error left after calibration",
-                         fontsize=8)
-            cb = fig.colorbar(sc, ax=ax, orientation="horizontal", fraction=0.05, pad=0.16 if r == rows_n - 1 else 0.06)
-            cb.set_label(f"Static residual [{unit}]", fontsize=7.5)
-            cb.ax.tick_params(labelsize=7)
-        else:
-            shared = _stand_map(ax, xy, values, scale)
-            ax.set_title(label, fontsize=8.5)
-        if r == rows_n - 1:
-            ax.set_xlabel("East [m]", fontsize=8)
-        if c == 0:
-            ax.set_ylabel("North [m]", fontsize=8)
-    if shared is not None:
-        cb = fig.colorbar(shared, cax=fig.add_axes([left + width + 0.012, bottom, 0.009, height]))
-        cb.set_label(f"Phase [{unit}]")
-    fig.suptitle(title)
-    add_info_panel(fig, info_rows, notes, footer)
-    return save(fig, output)
-
-
-def plot_phase_surface(xy, z, color, plane, title, output, zlim, clim, color_label, info_rows=None,
-                       notes=None, footer=None, cmap="RdBu_r"):
-    """3D view: stands at (east, north) [m], height ``z`` [rad], coloured by ``color``.
-
-    ``plane``: (du_term_e, du_term_n, offset) so the fitted plane is
-    offset + a*x + b*y [rad], drawn as a translucent sheet."""
-    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers the projection)
-    xy = np.asarray(xy, float)
-    fig = plt.figure(figsize=(16, 8))
-    ax = fig.add_axes([0.28, 0.06, 0.62, 0.86], projection="3d")
-    ok = np.isfinite(z)
-    if plane is not None and all(np.isfinite(plane)):
-        gx = np.linspace(xy[:, 0].min(), xy[:, 0].max(), 12)
-        gy = np.linspace(xy[:, 1].min(), xy[:, 1].max(), 12)
-        GX, GY = np.meshgrid(gx, gy)
-        GZ = plane[2] + plane[0] * GX + plane[1] * GY
-        GZ = np.where((GZ >= zlim[0]) & (GZ <= zlim[1]), GZ, np.nan)      # keep the sheet inside the box
-        ax.plot_surface(GX, GY, GZ, color="#7d7d7d", alpha=0.18,
-                        linewidth=0, antialiased=True)
-    if ok.any():
-        for x, y, h in zip(xy[ok, 0], xy[ok, 1], np.asarray(z)[ok]):
-            ax.plot([x, x], [y, y], [zlim[0], h], color="#c4c4c4", lw=0.4)
-        cvals = np.asarray(color)[ok]
-        sc = ax.scatter(xy[ok, 0], xy[ok, 1], np.asarray(z)[ok], c=cvals, cmap=cmap, vmin=clim[0], vmax=clim[1],
-                        s=26, edgecolors="#444444", linewidths=0.3, depthshade=False)
-        cb = fig.colorbar(sc, ax=ax, shrink=0.6, pad=0.08)
-        cb.set_label(color_label)
-    ax.set_zlim(*zlim)
-    ax.set_xlabel("East [m]")
-    ax.set_ylabel("North [m]")
-    ax.set_zlabel("Phase change [rad]")
-    ax.view_init(elev=24, azim=-58)
-    ax.set_title(title)
-    add_info_panel(fig, info_rows, notes, footer)
-    return save(fig, output, dpi=160)
 
 
 def _edges(centers):

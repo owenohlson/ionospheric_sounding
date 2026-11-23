@@ -151,6 +151,33 @@ class ArrayTests(unittest.TestCase):
         quiet(plot_delay_doppler.run, args)
         self.assertTrue((self.d / "b.png").exists())
 
+    def test_one_beam_per_sky_map_peak(self):
+        """--looks 2 with MVDR: both arrivals found on the sky map, a beam (panel) each, two DoA rows."""
+        import plot_delay_doppler
+        import summary_utils as su
+        x = (received(self.station.positions, 137.0, 31.0, 0.00437, self.cable, sweeps=16)
+             + received(self.station.positions, 250.0, 55.0, 0.0052, self.cable, fd=-0.4, sweeps=16, seed=4))
+        write_rdc0(self.d / "two.h5", x, self.stands, np.zeros(24, int))
+        log = self.d / "log.csv"
+        args = plot_delay_doppler.build_parser().parse_args([
+            str(self.d / "two.h5"), "--output", str(self.d / "dd2.png"), "--beamformer", "mvdr", "--looks", "2",
+            "--angle-method", "mvdr", "--angle-peaks", "2", "--angle-step", "2", "--d-min", "3.5", "--d-max", "5.5",
+            "--angle-output", str(self.d / "sky2.png"), "--summary", str(log)])
+        quiet(plot_delay_doppler.run, args)
+        self.assertTrue((self.d / "dd2.png").exists() and (self.d / "sky2.png").exists())
+        rows = [r for r in su.read_log(str(log)) if r["az_deg"]]        # signals with a direction
+        got = sorted((float(r["az_deg"]) % 360, float(r["delay_ms"])) for r in rows)
+        self.assertEqual(len(got), 2)
+        self.assertAlmostEqual(got[0][0], 137.0, delta=3)
+        self.assertAlmostEqual(got[0][1], 4.37, delta=0.1)       # each at its own beam's echo
+        self.assertAlmostEqual(got[1][0], 250.0, delta=3)
+        self.assertAlmostEqual(got[1][1], 5.2, delta=0.1)
+        import cli
+        p = plot_delay_doppler.build_parser()
+        a = p.parse_args([str(self.d / "two.h5"), "--output", "x.png", "--looks", "2"])
+        with self.assertRaises(SystemExit):
+            quiet(cli.validate, p, a)                            # --looks needs a steered beamformer
+
     def test_calibration_check_flags_a_bad_stand(self):
         import check_array_calibration as cac
         cable = self.cable.copy()
@@ -173,7 +200,7 @@ class ForwardModelSignTests(unittest.TestCase):
     """Sweep-wrap replica: an echo far into the sweep leaves a copy at +(fs-|B|)/|k|."""
 
     def test_wrap_replica(self):
-        cfg = lfm.LFMWaveform(BW, SF, FS)
+        cfg = lfm.LFMWaveform(BW, SF, FS, range_method="dechirp")
         offset_ms = (FS - abs(BW)) / abs(cfg.chirp_rate) * 1e3
         pos = np.zeros((1, 3))
         for tau, expect in ((0.21835, True), (0.002, False)):
@@ -185,6 +212,43 @@ class ForwardModelSignTests(unittest.TestCase):
             copy = p[np.argmin(np.abs(delay - (tau * 1e3 + offset_ms)))]
             rel = 10 * np.log10(copy / main)
             self.assertGreater(rel, -10) if expect else self.assertLess(rel, -60)
+
+    def test_matched_filter_compresses_every_delay(self):
+        """Circular matched filter: no wrap copy and the same peak at 2 ms and 218 ms, for |B| < fs and |B| > fs."""
+        pos = np.zeros((1, 3))
+        for bw in (BW, -150727.2):
+            cfg = lfm.LFMWaveform(bw, SF, FS)
+            self.assertEqual(cfg.range_method, "matched")
+            offset_ms = (FS - abs(bw)) / abs(cfg.chirp_rate) * 1e3
+            delay, order = lfm.delay_axis_ms(cfg)
+            peaks = []
+            for tau in (0.002, 0.21835, 0.25):
+                t = np.arange(int(FS / SF) * 3 * 8) / (8 * FS)            # 8x oversampled, so nothing aliases
+                x = helpers.lfm_periodic(t - tau, bw, 1 / SF)
+                spec = np.fft.fft(x)                                   # keep only the receive band, as TBN does
+                f = np.fft.fftfreq(x.size, 1 / (8 * FS))
+                x = np.fft.ifft(np.where(np.abs(f) < 0.95 * FS / 2, spec, 0))[::8]
+                rdc0 = x.reshape(1, 3, -1).transpose(2, 1, 0)
+                p = np.abs(lfm.range_compress(rdc0, cfg, "hann", 0, order)[:, 1, 0]) ** 2
+                i = int(np.argmax(p))
+                self.assertAlmostEqual(delay[i], tau * 1e3, delta=0.011)
+                far = np.abs(((delay - tau * 1e3 + 250) % 500) - 250) > 0.5
+                self.assertLess(10 * np.log10(p[far].max() / p[i]), -40)
+                copy = p[np.argmin(np.abs(delay - (tau * 1e3 + offset_ms) % 500))]
+                self.assertLess(10 * np.log10(copy / p[i]), -40)
+                peaks.append(p[i])
+            self.assertLess(abs(10 * np.log10(max(peaks) / min(peaks))), 0.3)
+
+    def test_matched_filter_absolute_scale(self):
+        """A unit echo peaks at the number of in-band reference samples (= the sweep length, less 0.6%,
+        at 99.26 kHz, the same scale as the normalised dechirp; 65% of it at 150.7 kHz), at any delay."""
+        t = np.arange(int(FS / SF)) / FS
+        for bw in (BW, -150727.2):
+            cfg = lfm.LFMWaveform(bw, SF, FS)
+            for tau in (0.002, 0.21835):
+                x = helpers.lfm_periodic(t - tau, bw, 1 / SF)[:, None, None].astype(np.complex64)
+                peak = np.abs(lfm.range_compress(x, cfg, "hann")).max()
+                self.assertLess(abs(20 * np.log10(peak / cfg.inband_mask().sum())), 0.1)
 
 
 if __name__ == "__main__":

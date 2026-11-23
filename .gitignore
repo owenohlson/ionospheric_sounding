@@ -5,3 +5,9 @@ code_graveyard/
 lwa_env/
 figures/
 data/
+Claude outputs/
+peters_scripts/
+# large data products of check runs (GitHub refuses files over 100 MB)
+calib_checks/*.dat
+calib_checks/*.h5
+calib_checks/*.npz

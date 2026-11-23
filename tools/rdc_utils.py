@@ -146,10 +146,10 @@ def open_raw_source(path, sweep_frequency, tstart=None, tend=None, offset=0.0, t
     frac = reader.fractional_second_at(tstart) if timestamp_align else None
     skip = lfm.sweep_alignment_samples(frac, sweep_frequency, fs, offset)
     first_utc = reader.utc_at(tstart + skip / fs)
-    meta = dict(source_format="tbn", station="lwasv", channel_id_kind="physical_stand",
+    meta = dict(source_format="tbn", station=lwa.station_name(), channel_id_kind="physical_stand",
                 channel_digitizers=(rows + 1).tolist(), tuning_frequency_hz=info["tuning_frequency_hz"],
                 sample_rate_hz=fs, source_tstart_s=float(tstart), first_sweep_utc=first_utc, tbn_reader="native",
-                ssmif=lwa.SSMIF_PATH or "LSL bundled LWA-SV")
+                ssmif=lwa.station_description())
     blocks = reader.read_blocks(rows, tstart, tend - tstart)
     return RawSource(blocks, fs, skip, ch_stands, ch_pols, int(round((tend - tstart) * fs)), meta)
 
@@ -171,12 +171,13 @@ class RDCView:
     """
 
     def __init__(self, path, stands="all", pol="both", bad_stands="none", tstart=None, tend=None,
-                 bandwidth=None, dechirp_window=None, reference_gate=None, gap_fill=None):
+                 bandwidth=None, dechirp_window=None, reference_gate=None, gap_fill=None, range_method=None):
         self.file = rdc_io.RDCFile(path)
         self.path = self.file.path
         self.meta = self.file.meta
         m = self.meta
         self.prf = float(m["sweep_frequency_hz"])
+        self.prf_known = True           # False for a raw read cut in 1 s blocks with no sweep rate given
         self.fs = float(m["sample_rate_hz"]) if m.get("sample_rate_hz") else None
         self.fc = m.get("tuning_frequency_hz") or m.get("carrier_frequency_hz") or m.get("freq1_hz")
         self.receiver = self.file.is_receiver
@@ -185,6 +186,9 @@ class RDCView:
         self.bandwidth = _fixed(bandwidth, m.get("bandwidth_hz"), "bandwidth", float)
         self.dechirp_window = _fixed(dechirp_window, m.get("dechirp_window"), "dechirp-window", str,
                                      fixed=processed and not self.file.has("rdc0")) or "hann"
+        stored_method = m.get("range_method") or ("dechirp" if processed else None)   # files before 2026-11-21
+        self.range_method = _fixed(range_method, stored_method, "range-method", str,
+                                   fixed=processed and not self.file.has("rdc0")) or lfm.DEFAULT_RANGE_METHOD
         gate = lfm.parse_reference_gate(reference_gate) if reference_gate else None
         stored_gate = m.get("reference_gate_frequency")
         if gate and processed and not self.file.has("rdc0") and (stored_gate is None or not np.isclose(gate[0], stored_gate)):
@@ -194,7 +198,7 @@ class RDCView:
         self.lfm = None
         if self.bandwidth and self.fs:
             g = self.gate or (None, 0.5, 0.0)
-            self.lfm = lfm.LFMWaveform(self.bandwidth, self.prf, self.fs, g[0], g[1], g[2])
+            self.lfm = lfm.LFMWaveform(self.bandwidth, self.prf, self.fs, g[0], g[1], g[2], self.range_method)
         self.selection = dict(stands=stands, pol=pol, bad_stands=bad_stands)
         per_channel = [s for s in self.file.stages if s != "rdc3"]
         self.channels = {s: select_channels(*self.file.channel_ids(s), stands, pol, bad_stands, self.receiver)
@@ -260,7 +264,7 @@ class RDCView:
         if d_max is not None:
             mask &= delay <= d_max
         if not mask.any():
-            raise ValueError(f"No delay bins in the requested band; available {delay.min():.3f}-{delay.max():.3f} ms")
+            raise lfm.no_delay_bins(delay, d_min, d_max)
         if d_min is not None or d_max is not None:
             clipped = (d_min is not None and d_min < delay.min() - 1e-9) or (d_max is not None and d_max > delay.max() + 1e-9)
             print(f"Delay window: {delay[mask][0]:.3f}-{delay[mask][-1]:.3f} ms ({int(mask.sum())} bins; "
@@ -326,7 +330,7 @@ class RDCView:
                     nonfinite.append(np.count_nonzero(bad, axis=0))
                     if self.gap_fill == "zero" and bad.any():
                         raw[bad] = 0
-                    parts.append(lfm.dechirp_range_fft(raw, self.lfm, self.dechirp_window, adc_start, bins))
+                    parts.append(lfm.range_compress(raw, self.lfm, self.dechirp_window, adc_start, bins))
                 block, nonfinite = np.concatenate(parts, axis=1), np.concatenate(nonfinite, axis=0)
             invalid = nonfinite if invalid is None else np.maximum(invalid, nonfinite)
             yield start, stop, block, invalid
@@ -560,12 +564,19 @@ class RDCView:
             rows.append(("Plot span", f"{t0:.3f}-{t1:.3f} s"))
         if self.fs:
             rows.append(("Sample rate", f"{self.fs / 1e3:.3f} kHz"))
-        rows.append(("Sweep freq", f"{self.prf:.8g} Hz"))
+        if self.prf_known:
+            rows.append(("Sweep freq", f"{self.prf:.8g} Hz"))
         if self.bandwidth:
             rows.append(("Bandwidth", f"{self.bandwidth / 1e3:.6g} kHz"))
         if self.gate:
             rows.append(("Ref. gate", f"{self.gate[0]:.6g} Hz, duty {self.gate[1] * 100:.0f}%, phase {self.gate[2] * 1e3:.2f} ms"))
-        rows.append(("Dechirp window", self.dechirp_window))
+        rows.append(("Range compression", "matched filter, in-band reference" if self.range_method == "matched"
+                     else "dechirp + FFT"))
+        rows.append(("Range window", self.dechirp_window))
+        sb = m.get("sideband_suppression")
+        if sb:
+            rows.append(("Sidebands", f"CLEAN: {sb['spacing_ms']:.3f} ms comb of the {sb['main_ms']:.3f} ms echo"
+                         if sb.get("detected") else "CLEAN requested, no comb found"))
         if m.get("sweep_offset_s") not in (None, 0, 0.0):
             rows.append(("Sweep offset", f"{float(m['sweep_offset_s']) * 1e3:.3f} ms"))
         rows.append(("Gap fill", self.gap_fill))
@@ -622,6 +633,10 @@ class ExportSettings:
     # range processing
     bandwidth: float = None
     dechirp_window: str = None
+    range_method: str = None          # None: lfm_utils.DEFAULT_RANGE_METHOD for raw input, stored value otherwise
+    suppress_sidebands: bool = False  # raw -> RDC1 only: CLEAN the gating comb of one echo
+    sideband_echo_ms: float = None    # that echo's delay (default: the strongest)
+    sideband_block: int = 20          # sweeps per CLEAN block
     reference_gate: str = None
     d_min: float = None
     d_max: float = None
@@ -647,6 +662,9 @@ def export(input_path, target, output, s, tool=None):
     if os.path.realpath(input_path) == os.path.realpath(os.path.expanduser(output)):
         raise ValueError("The output must not overwrite the input")
     tool = tool or f"export_{target}"
+    if s.suppress_sidebands and input_path.lower().endswith((".h5", ".hdf5")):
+        raise ValueError("--suppress-sidebands works while exporting from a raw recording (it needs the whole "
+                         "lag axis); re-export the RDC1 from the TBN/WAV file")
     if not input_path.lower().endswith((".h5", ".hdf5")):
         if target == "rdc0":
             return export_rdc0(input_path, output, s, tool)
@@ -660,14 +678,14 @@ def export(input_path, target, output, s, tool=None):
             temp = os.path.join(tmp, "rdc1.h5")
             export_rdc1_from_raw(input_path, temp, dataclasses.replace(s, compression="lzf"), tool, temporary=True)
             chained = dataclasses.replace(s, tstart=None, tend=None, stands="all", pol="both", bad_stands="none",
-                                          d_min=None, d_max=None)
+                                          d_min=None, d_max=None, suppress_sidebands=False)
             return export(temp, target, output, chained, tool)
     if target == "rdc0":
         raise ValueError("RDC0 is made from a raw TBN/WAV recording")
     if target == "rdc3":
         raise ValueError("Use export_rdc3.py (array settings) for RDC3")
     view = RDCView(input_path, s.stands, s.pol, s.bad_stands, s.tstart, s.tend,
-                   s.bandwidth, s.dechirp_window, s.reference_gate, s.gap_fill)
+                   s.bandwidth, s.dechirp_window, s.reference_gate, s.gap_fill, range_method=s.range_method)
     if view.pulse_source() is None:
         raise ValueError(f"{target.upper()} needs per-sweep data (RDC0 or RDC1) in the input")
     view.select_delay(s.d_min, s.d_max, full=s.d_min is None and s.d_max is None)
@@ -765,8 +783,11 @@ def export_rdc1_from_raw(raw_path, output, s, tool="export_rdc1", temporary=Fals
             raise ValueError("The selection does not contain one complete sweep after alignment")
         gate = lfm.parse_reference_gate(s.reference_gate) if s.reference_gate else None
         g = gate or (None, 0.5, 0.0)
-        wave = lfm.LFMWaveform(s.bandwidth, prf, fs, g[0], g[1], g[2])
+        wave = lfm.LFMWaveform(s.bandwidth, prf, fs, g[0], g[1], g[2], s.range_method or lfm.DEFAULT_RANGE_METHOD)
         window = s.dechirp_window or "hann"
+        if wave.range_method == "matched" and (s.adc_start or adc_count != sweep):
+            raise ValueError("The matched filter needs whole sweeps; --adc-start/--adc-count need "
+                             "--range-method dechirp")
         gap_fill = s.gap_fill or "nan"
         n_ch = len(src.channel_stands)
         d_min, d_max = s.d_min, s.d_max
@@ -782,6 +803,16 @@ def export_rdc1_from_raw(raw_path, output, s, tool="export_rdc1", temporary=Fals
               f"{n_ch} channels; {n_delay * n_pulses * n_ch * item / 1e9:.2f} GB uncompressed", flush=True)
         if s.dry_run:
             return None
+        cleaner = sidebands = None
+        if s.suppress_sidebands:
+            if wave.range_method != "matched":
+                raise ValueError("--suppress-sidebands needs --range-method matched")
+            comb = _preview_comb(open_args, sweep, wave, window, s)
+            sidebands = lfm.comb_summary(comb, int(s.sideband_block))
+            print(("Sideband CLEAN: " if comb.get("detected") else "Sideband CLEAN skipped: ") + lfm.comb_text(comb),
+                  flush=True)
+            if comb.get("detected"):
+                cleaner = _SidebandCleaner(comb, bins, sweep, fs, int(s.sideband_block))
         buf_n = int(max(1, min(n_pulses, 256, RDC1_BUFFER_BYTES // max(n_delay * n_ch * 8, 1))))
         chunks = (min(32, n_delay), buf_n, min(8, n_ch))
         with rdc_io.atomic_output(output) as tmp:
@@ -792,10 +823,10 @@ def export_rdc1_from_raw(raw_path, output, s, tool="export_rdc1", temporary=Fals
                 buf = np.empty((n_delay, buf_n, n_ch), np.complex64)
                 bad = np.empty((buf_n, n_ch), np.int64)
                 filled = start = 0
-                for p, sweep_block, invalid in pack_sweeps(src.blocks, sweep, src.skip_samples, s.adc_start,
-                                                           adc_count, n_pulses, gap_fill):
-                    buf[:, filled] = lfm.dechirp_range_fft(sweep_block[:, None, :], wave, window, s.adc_start,
-                                                           bins)[:, 0, :]
+
+                def emit(column, invalid):
+                    nonlocal filled, start
+                    buf[:, filled] = column
                     bad[filled] = invalid
                     filled += 1
                     if filled == buf_n:
@@ -804,6 +835,19 @@ def export_rdc1_from_raw(raw_path, output, s, tool="export_rdc1", temporary=Fals
                         start, filled = start + filled, 0
                         if not temporary:
                             print(f"  RDC1 sweep {start}/{n_pulses}", flush=True)
+
+                for p, sweep_block, invalid in pack_sweeps(src.blocks, sweep, src.skip_samples, s.adc_start,
+                                                           adc_count, n_pulses, gap_fill):
+                    if cleaner is None:
+                        emit(lfm.range_compress(sweep_block[:, None, :], wave, window, s.adc_start, bins)[:, 0, :],
+                             invalid)
+                    else:
+                        lagged = lfm.range_compress(sweep_block[:, None, :], wave, window, 0, cleaner.keep)[:, 0, :]
+                        for column, bad_count in cleaner.push(lagged, invalid):
+                            emit(column, bad_count)
+                if cleaner is not None:
+                    for column, bad_count in cleaner.flush():
+                        emit(column, bad_count)
                 if filled:
                     w.write((slice(None), slice(start, start + filled), slice(None)), buf[:, :filled])
                     inv[start:start + filled] = bad[:filled]
@@ -826,6 +870,7 @@ def export_rdc1_from_raw(raw_path, output, s, tool="export_rdc1", temporary=Fals
                     timestamp_aligned=bool(s.timestamp_align), gap_fill=gap_fill, tstart=0.0, tend=start / prf,
                     time_zero_utc=first.isoformat() if first else None, pulse0_utc=first.isoformat() if first else None,
                     source_file=os.path.basename(raw_path), n_channels=n_ch, dtype=s.dtype, dechirp_window=window,
+                    range_method=wave.range_method,
                     d_min_ms=float(delay_ms[0]), d_max_ms=float(delay_ms[-1]),
                     selected_stands=np.asarray(src.channel_stands).tolist(),
                     **polarization_summary(src.channel_pols),
@@ -835,10 +880,14 @@ def export_rdc1_from_raw(raw_path, output, s, tool="export_rdc1", temporary=Fals
                                                   adc_count=adc_count, streamed=True, **common),
                              rdc_io.history_entry(tool, stage="rdc1", source="raw (streamed)", source_stage="raw",
                                                   d_min_ms=float(delay_ms[0]), d_max_ms=float(delay_ms[-1]),
-                                                  dechirp_window=window, reference_gate=gate, **common)])
+                                                  dechirp_window=window, range_method=wave.range_method,
+                                                  reference_gate=gate, suppress_sidebands=bool(s.suppress_sidebands),
+                                                  **common)])
                 if gate:
                     meta.update(reference_gate_frequency=gate[0], reference_gate_duty=gate[1],
                                 reference_gate_phase=gate[2])
+                if sidebands:
+                    meta["sideband_suppression"] = sidebands
                 rdc_io.write_metadata(h5, meta)
     finally:
         if src.close:
@@ -846,6 +895,58 @@ def export_rdc1_from_raw(raw_path, output, s, tool="export_rdc1", temporary=Fals
     if not temporary:
         print(f"Wrote {output}", flush=True)
     return output
+
+
+class _SidebandCleaner:
+    """Collects matched-filter sweeps (only the output lags plus the echo's search region), CLEANs the
+    gating comb block by block (lfm_utils.clean_gating_comb) and hands back the output lags."""
+
+    def __init__(self, comb, out_bins, n_lags, sample_rate, block):
+        s = lfm._ms_bins(lfm.SIDEBAND_SEARCH_MS, sample_rate, 0)
+        region = (int(comb["peak_bin"]) + np.arange(-s, s + 1)) % int(n_lags)
+        self.keep = np.union1d(np.asarray(out_bins, int), region)
+        self.out = np.searchsorted(self.keep, np.asarray(out_bins, int))
+        self.comb, self.n_lags, self.fs, self.block = comb, int(n_lags), float(sample_rate), int(block)
+        self.columns, self.invalid = [], []
+
+    def push(self, column, invalid):
+        self.columns.append(column)
+        self.invalid.append(invalid)
+        if len(self.columns) == self.block:
+            yield from self._clean()
+
+    def flush(self):
+        if self.columns:
+            yield from self._clean()
+
+    def _clean(self):
+        Y = np.stack(self.columns, axis=1)                      # (kept lags, sweeps, channels)
+        Y, _ = lfm.clean_gating_comb(Y, self.comb, self.fs, n_lags=self.n_lags, lags=self.keep, block=Y.shape[1])
+        invalid, self.columns, self.invalid = self.invalid, [], []
+        for j in range(Y.shape[1]):
+            yield Y[self.out, j], invalid[j]
+
+
+def _preview_comb(open_args, sweep, wave, window, s, n_sweeps=32, n_channels=8, echo_half_width_ms=1.0):
+    """Gating comb of the strongest echo (or the one near ``s.sideband_echo_ms``) in the first sweeps."""
+    src = open_raw_source(*open_args, verbose=False)
+    try:
+        columns = [lfm.range_compress(block[:, None, :n_channels], wave, window)[:, 0, :]
+                   for _, block, _ in pack_sweeps(src.blocks, sweep, src.skip_samples, 0, sweep, n_sweeps, "zero")]
+    finally:
+        if src.close:
+            src.close()
+    if not columns:
+        raise ValueError("No complete sweep for the sideband preview")
+    Y = np.stack(columns, axis=1)
+    peak = None
+    if s.sideband_echo_ms is not None:
+        power = np.mean(np.sum(np.abs(Y) ** 2, axis=2), axis=1)
+        c = int(round(s.sideband_echo_ms * 1e-3 * wave.sample_rate))
+        idx = (c + np.arange(-lfm._ms_bins(echo_half_width_ms, wave.sample_rate),
+                             lfm._ms_bins(echo_half_width_ms, wave.sample_rate) + 1)) % sweep
+        peak = int(idx[np.argmax(power[idx])])
+    return lfm.detect_gating_comb(Y, wave.sample_rate, peak)
 
 
 def _raw_preview_window(open_args, sweep, adc_count, wave, window, s, gap_fill, n_sweeps=32, n_channels=16,
@@ -856,7 +957,7 @@ def _raw_preview_window(open_args, sweep, adc_count, wave, window, s, gap_fill, 
         delay, order = lfm.delay_axis_ms(wave, adc_count)
         power = np.zeros(delay.size)
         for _, block, _ in pack_sweeps(src.blocks, sweep, src.skip_samples, s.adc_start, adc_count, n_sweeps, "zero"):
-            spec = lfm.dechirp_range_fft(block[:, None, :n_channels], wave, window, s.adc_start, order)
+            spec = lfm.range_compress(block[:, None, :n_channels], wave, window, s.adc_start, order)
             power += np.sum(np.abs(spec[:, 0, :]) ** 2, axis=1)
     finally:
         if src.close:
@@ -952,7 +1053,7 @@ def _export_processed(view, target, output, s, tool):
             meta = dict(source_meta)
             meta.update(format_version=rdc_io.FORMAT_VERSION, rdc_stage=int(target[3]) if target != "rdc2p" else "2p",
                         bandwidth_hz=view.bandwidth,
-                        dechirp_window=view.dechirp_window, gap_fill=view.gap_fill,
+                        dechirp_window=view.dechirp_window, range_method=view.range_method, gap_fill=view.gap_fill,
                         d_min_ms=float(view.delay_ms[0]), d_max_ms=float(view.delay_ms[-1]),
                         tstart=t0, tend=t0 + n_pulses / prf, n_channels=n_ch,
                         selected_stands=stands.tolist(), dtype=s.dtype,
@@ -964,7 +1065,8 @@ def _export_processed(view, target, output, s, tool):
             params = dict(stage=target, source=os.path.basename(view.path), source_stage=stage,
                           tstart=t0, tend=t0 + n_pulses / prf, stands=s.stands, pol=s.pol,
                           bad_stands=s.bad_stands, d_min_ms=meta["d_min_ms"], d_max_ms=meta["d_max_ms"],
-                          dechirp_window=view.dechirp_window, reference_gate=view.gate, gap_fill=view.gap_fill)
+                          dechirp_window=view.dechirp_window, range_method=view.range_method,
+                          reference_gate=view.gate, gap_fill=view.gap_fill)
             for writer in (w1, w2, wp):
                 if writer is not None:
                     writer.channels(stands, pols, digs)
@@ -1024,7 +1126,7 @@ def export_rdc3(view, output, processor, looks=None, frame_settings=None, dtype=
                           looks="auto per frame" if looks is None else looks, cable_correction=processor.cable_note,
                           carrier_frequency_hz=processor.fc, diagonal_loading=processor.loading,
                           stands=processor.stands.tolist(), pol=int(processor.pols[0]),
-                          ssmif=lwa.SSMIF_PATH,
+                          ssmif=lwa.station_description(),
                           calibration=None if processor.calibration is None else processor.calibration.path,
                           d_min_ms=float(view.delay_ms[0]), d_max_ms=float(view.delay_ms[-1]),
                           integration_time_s=frames[0]["integration"], hop_time_s=frames[0]["hop"],
@@ -1105,6 +1207,57 @@ def peak_direction(R, positions_m, frequency_hz, method="conventional", step=2.0
     return float((az_f[ai] + 180) % 360 - 180), float(el_f[ei]), float(spec_f[ei, ai])
 
 
+def _angle_between_deg(az1, el1, az2, el2):
+    u, v = unit_vectors([az1], [el1]).reshape(3), unit_vectors([az2], [el2]).reshape(3)
+    return float(np.degrees(np.arccos(np.clip(u @ v, -1.0, 1.0))))
+
+
+def peak_directions(spec, az_grid, el_grid, R, positions_m, frequency_hz, method="conventional", n=3,
+                    min_db=10.0, min_separation_deg=None, fine=0.1):
+    """Up to ``n`` local maxima of a sky map ``spec`` (el, az; linear), strongest first, each within
+    ``min_db`` of the strongest and at least ``min_separation_deg`` (default: 3 grid steps, >= 5 deg)
+    from a stronger one, refined on a ``fine`` grid. Returns [(az, el, dB relative to the strongest)].
+
+    With MVDR, separate arrivals give separate sharp peaks, so this finds every transmitter (or mode)
+    in the window rather than only the strongest."""
+    az_grid, el_grid = np.asarray(az_grid, float), np.asarray(el_grid, float)
+    s = np.where(np.isfinite(spec), spec, -np.inf)
+    step = float(np.median(np.diff(az_grid))) if az_grid.size > 1 else 1.0
+    sep = min_separation_deg if min_separation_deg is not None else max(3 * step, 5.0)
+    wrap = az_grid.size > 1 and np.isclose(az_grid[-1] + step - az_grid[0], 360.0)
+    padded = np.pad(s, ((1, 1), (0, 0)), constant_values=-np.inf)
+    padded = np.pad(padded, ((0, 0), (1, 1)), mode="wrap" if wrap else "constant",
+                    **({} if wrap else {"constant_values": -np.inf}))
+    centre = padded[1:-1, 1:-1]
+    is_max = np.isfinite(centre)
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            if dr or dc:
+                is_max &= centre >= padded[1 + dr:padded.shape[0] - 1 + dr, 1 + dc:padded.shape[1] - 1 + dc]
+    ei, ai = np.nonzero(is_max)
+    order = np.argsort(centre[ei, ai])[::-1]
+    top = centre[ei[order[0]], ai[order[0]]] if order.size else None
+    picked = []
+    for k in order:
+        e, a = ei[k], ai[k]
+        if 10 * np.log10(centre[e, a] / top) < -abs(min_db):
+            break
+        if any(_angle_between_deg(az_grid[a], el_grid[e], p[0], p[1]) < sep for p in picked):
+            continue
+        az_f = np.arange(az_grid[a] - step, az_grid[a] + step + 1e-9, fine)
+        el_f = np.clip(np.arange(el_grid[e] - step, el_grid[e] + step + 1e-9, fine), el_grid.min(), el_grid.max())
+        sf = angle_spectrum(R, positions_m, frequency_hz, az_f, el_f, method)
+        fe, fa = np.unravel_index(np.argmax(sf), sf.shape)
+        picked.append((float((az_f[fa] + 180) % 360 - 180), float(el_f[fe]), float(sf[fe, fa])))
+        if len(picked) >= n:
+            break
+    if not picked:
+        return []
+    picked.sort(key=lambda p: -p[2])
+    best = picked[0][2]
+    return [(az, el, float(10 * np.log10(v / best))) for az, el, v in picked]
+
+
 def beam_weights(positions_m, frequency_hz, az_deg, el_deg, method="conventional", R=None):
     a = steering_matrix(positions_m, frequency_hz, [az_deg], [el_deg])[0]
     if method == "conventional":
@@ -1173,13 +1326,13 @@ class ArrayProcessor:
             self.cable_note = "already corrected" if corrected else ("ideal simulation" if ideal_sim else "off")
         else:
             self.cable = lwa.cable_phase_factors(self.stands, self.pols, self.fc)
-            self.cable_note = f"{os.path.basename(lwa.SSMIF_PATH) if lwa.SSMIF_PATH else 'LSL LWA-SV'} " \
+            self.cable_note = f"{os.path.basename(lwa.station_description())} " \
                               f"at {self.fc / 1e6:.6f} MHz"
         self.calibration = calibration
         self.station_note = self.cable_note
         self.calibration_note = None
         if calibration is not None:
-            calibration.check_station(lwa.SSMIF_PATH)
+            calibration.check_station(lwa.station_description())
             factors, ok = calibration.factors(self.stands, self.pols, self.fc)
             if not ok.all():
                 print(f"Self-calibration drops stands {self.stands[~ok].tolist()} (flagged or not calibrated)",
@@ -1209,11 +1362,17 @@ class ArrayProcessor:
         az, el, _ = peak_direction(self.signal_covariance(cube), self.positions, self.fc, "conventional", step)
         return az, el
 
-    def beamform(self, cube, az, el):
-        """cube (delay, doppler, channels) -> complex beam (delay, doppler)."""
-        R = None
-        if self.method == "mvdr":
-            R = spatial_covariance(cube.reshape(-1, cube.shape[-1]), self.loading, self.background_percentile)
+    def beam_covariance(self, cube):
+        """MVDR beam covariance (quietest cells; see background_percentile), or None for conventional."""
+        if self.method != "mvdr":
+            return None
+        return spatial_covariance(cube.reshape(-1, cube.shape[-1]), self.loading, self.background_percentile)
+
+    def beamform(self, cube, az, el, R=None):
+        """cube (delay, doppler, channels) -> complex beam (delay, doppler). ``R``: beam_covariance(cube),
+        to reuse it for several beams."""
+        if R is None:
+            R = self.beam_covariance(cube)
         w = beam_weights(self.positions, self.fc, az, el, self.method, R)
         return np.tensordot(cube, w.conj(), axes=([-1], [0]))
 

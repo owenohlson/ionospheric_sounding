@@ -381,12 +381,16 @@ class ArrayCalibration:
         name = os.path.basename(str(self.path)) if self.path else "in memory"
         return f"{name} ({int(np.sum(~self.flagged))} stands, {int(np.sum(self.flagged))} flagged)"
 
-    def check_station(self, ssmif_path):
-        """Warn when the file was made with a different station description."""
-        made = self.meta.get("ssmif")
-        if (made or None) != (ssmif_path or None) and os.path.basename(str(made)) != os.path.basename(str(ssmif_path)):
-            print(f"WARNING: calibration was made with station description {made or 'LSL bundled'}, "
-                  f"now using {ssmif_path or 'LSL bundled'}", flush=True)
+    def check_station(self, description):
+        """Warn when the file was made with a different station description.
+
+        ``description`` is ``lwa_utils.station_description()``. Files written before
+        LWA1 became the default store None for LSL's bundled file, which was LWA-SV then.
+        """
+        made = self.meta.get("ssmif") or "LSL bundled LWA-SV (old default)"
+        if os.path.basename(str(made)) != os.path.basename(str(description)):
+            print(f"WARNING: calibration was made with station description {made}, "
+                  f"now using {description}", flush=True)
 
 
 def _json_default(o):

@@ -162,5 +162,31 @@ class TBNScanTests(unittest.TestCase):
             self.assertAlmostEqual(frac % 0.5, 0.0, places=6)
 
 
+class StationDescriptionTests(unittest.TestCase):
+    """Default station and bundled names (no LSL needed: nothing here reads antennas)."""
+
+    def tearDown(self):
+        lwa_utils.use_ssmif(None)
+
+    def test_lwa1_is_the_default(self):
+        lwa_utils.use_ssmif(None)
+        self.assertEqual(lwa_utils.station_name(), "lwa1")
+        self.assertEqual(lwa_utils.station_description(), "LSL bundled LWA1")
+        lat, lon, _ = lwa_utils.station_location()
+        self.assertAlmostEqual(lat, 34.0689, places=3)
+        self.assertAlmostEqual(lon, -107.6284, places=3)
+
+    def test_bundled_names_and_paths(self):
+        lwa_utils.use_ssmif("LWA-SV")
+        self.assertEqual((lwa_utils.SSMIF_PATH, lwa_utils.station_name()), ("lwasv", "lwasv"))
+        self.assertEqual(lwa_utils.station_description(), "LSL bundled LWA-SV")
+        self.assertAlmostEqual(lwa_utils.station_location()[0], 34.3484, places=3)
+        lwa_utils.use_ssmif("lwa1")
+        self.assertEqual(lwa_utils.station_description(), "LSL bundled LWA1")
+        lwa_utils.use_ssmif("~/LD021_0001.tgz")
+        self.assertTrue(lwa_utils.station_description().endswith("LD021_0001.tgz"))
+        self.assertNotIn("~", lwa_utils.SSMIF_PATH)
+
+
 if __name__ == "__main__":
     unittest.main()
