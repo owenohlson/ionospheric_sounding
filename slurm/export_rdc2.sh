@@ -33,22 +33,13 @@ cd /project/6003738/onohlson/tools
 export LWA_SSMIF=$(pwd)/resources/ssmif/LD021_0001.tgz   # shipped in tools/resources
 
 # Run script
-python export_rdc2.py ../data/060287_010274515_preprocessed.dat --output ../data/060287_010274515_rdc2.h5 --sweep-frequency 2 --bandwidth=-99.259377e3 --pol both --bad-stands status --gap-fill zero --integration-time 120 --hop-time 30 
-
-python export_rdc2.py ../data/060287_010274635_preprocessed.dat --output=../data/060287_010274615_rdc2.h5 --sweep-frequency 2 --bandwidth=-99.259377e3 --pol both --bad-stands status --gap-fill zero --integration-time 120 --hop-time 30 
-
-python export_rdc2.py ../data/060287_010274747_preprocessed.dat --output=../data/060287_010274747_rdc2.h5 --sweep-frequency 2 --bandwidth=-99.259377e3 --pol both --bad-stands status --gap-fill zero --integration-time 120 --hop-time 30 
-
-python export_rdc2.py ../data/060287_010274866_preprocessed.dat --output=../data/060287_010274866_rdc2.h5 --sweep-frequency 2 --bandwidth=-150.727203e3 --pol both --bad-stands status --gap-fill zero --integration-time 120 --hop-time 30 
-
-python export_rdc2.py ../data/060287_010274978_preprocessed.dat --output=../data/060287_010274978_rdc2.h5 --sweep-frequency 4 --bandwidth=-220.57639848e3 --pol both --bad-stands status --gap-fill zero --integration-time 120 --hop-time 30 
-
-python export_rdc2.py ../data/060287_010275122_preprocessed.dat --output=../data/060287_010275122_rdc2.h5 --sweep-frequency 2 --bandwidth=-99.259377e3 --pol both --bad-stands status --gap-fill zero --integration-time 120 --hop-time 30 
-
-python export_rdc2.py ../data/060287_010275234_preprocessed.dat --output=../data/060287_010275234_rdc2.h5 --sweep-frequency 4 --bandwidth=-49.629688e3 --pol both --bad-stands status --gap-fill zero --integration-time 120 --hop-time 30 
-
-python export_rdc2.py ../data/060287_010275353_preprocessed.dat --output=../data/060287_010275353_rdc2.h5 --sweep-frequency 2 --bandwidth=-99.259377e3 --pol both --bad-stands status --gap-fill zero --integration-time 120 --hop-time 30 
-
-python export_rdc2.py ../data/060287_010275465_preprocessed.dat --output=../data/060287_010275465_rdc2.h5 --sweep-frequency 2 --bandwidth=-150.727203e3 --pol both --bad-stands status --gap-fill zero --integration-time 120 --hop-time 30 
-
-python export_rdc2.py ../data/060287_010275584_preprocessed.dat --output=../data/060287_010275584_rdc2.h5 --sweep-frequency 4 --bandwidth=-220.57639848e3 --pol both --bad-stands status --gap-fill zero --integration-time 120 --hop-time 30 
+python export_rdc2.py ../data/060287_010274515_preprocessed.dat --output ../data/060287_010274515_rdc2.h5 --sweep-frequency 2 --bandwidth=-99.259377e3 --pol both --bad-stands status --gap-fill zero --integration-time 120 --hop-time 30 --range-method matched --suppress-sidebands
+python export_rdc2.py ../data/060287_010274635_preprocessed.dat --output=../data/060287_010274615_rdc2.h5 --sweep-frequency 2 --bandwidth=-99.259377e3 --pol both --bad-stands status --gap-fill zero --integration-time 120 --hop-time 30 --range-method matched --suppress-sidebands
+python export_rdc2.py ../data/060287_010274747_preprocessed.dat --output=../data/060287_010274747_rdc2.h5 --sweep-frequency 2 --bandwidth=-99.259377e3 --pol both --bad-stands status --gap-fill zero --integration-time 120 --hop-time 30 --range-method matched --suppress-sidebands
+python export_rdc2.py ../data/060287_010274866_preprocessed.dat --output=../data/060287_010274866_rdc2.h5 --sweep-frequency 2 --bandwidth=-150.727203e3 --pol both --bad-stands status --gap-fill zero --integration-time 120 --hop-time 30 --range-method matched --suppress-sidebands
+python export_rdc2.py ../data/060287_010274978_preprocessed.dat --output=../data/060287_010274978_rdc2.h5 --sweep-frequency 4 --bandwidth=-220.57639848e3 --pol both --bad-stands status --gap-fill zero --integration-time 120 --hop-time 30 --range-method matched --suppress-sidebands
+python export_rdc2.py ../data/060287_010275122_preprocessed.dat --output=../data/060287_010275122_rdc2.h5 --sweep-frequency 2 --bandwidth=-99.259377e3 --pol both --bad-stands status --gap-fill zero --integration-time 120 --hop-time 30 --range-method matched --suppress-sidebands
+python export_rdc2.py ../data/060287_010275234_preprocessed.dat --output=../data/060287_010275234_rdc2.h5 --sweep-frequency 4 --bandwidth=-49.629688e3 --pol both --bad-stands status --gap-fill zero --integration-time 120 --hop-time 30 --range-method matched --suppress-sidebands
+python export_rdc2.py ../data/060287_010275353_preprocessed.dat --output=../data/060287_010275353_rdc2.h5 --sweep-frequency 2 --bandwidth=-99.259377e3 --pol both --bad-stands status --gap-fill zero --integration-time 120 --hop-time 30 --range-method matched --suppress-sidebands
+python export_rdc2.py ../data/060287_010275465_preprocessed.dat --output=../data/060287_010275465_rdc2.h5 --sweep-frequency 2 --bandwidth=-150.727203e3 --pol both --bad-stands status --gap-fill zero --integration-time 120 --hop-time 30 --range-method matched --suppress-sidebands
+python export_rdc2.py ../data/060287_010275584_preprocessed.dat --output=../data/060287_010275584_rdc2.h5 --sweep-frequency 4 --bandwidth=-220.57639848e3 --pol both --bad-stands status --gap-fill zero --integration-time 120 --hop-time 30 --range-method matched --suppress-sidebands

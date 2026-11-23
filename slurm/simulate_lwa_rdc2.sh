@@ -35,7 +35,7 @@ python simulate_lwa_rdc2.py \
   --scenario box \
   --frames 100 \
   --max-channels 0 \
-  --drop-bad-stands \
+  --bad-stands status \
   --pol=x
 
 python simulate_lwa_rdc2.py \
@@ -43,7 +43,7 @@ python simulate_lwa_rdc2.py \
   --scenario angle \
   --frames 100 \
   --max-channels 0 \
-  --drop-bad-stands \
+  --bad-stands status \
   --pol=x
 
 python simulate_lwa_rdc2.py \
@@ -51,7 +51,7 @@ python simulate_lwa_rdc2.py \
   --scenario multi \
   --frames 100 \
   --max-channels 0 \
-  --drop-bad-stands \
+  --bad-stands status \
   --pol=x
 
 python simulate_lwa_rdc2.py \
@@ -59,5 +59,5 @@ python simulate_lwa_rdc2.py \
   --scenario amplitude \
   --frames 100 \
   --max-channels 0 \
-  --drop-bad-stands \
+  --bad-stands status \
   --pol=x
